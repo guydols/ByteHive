@@ -1,0 +1,6 @@
+debug
+target/*
+**/*.rs.bk
+tarpaulin-report.html
+TODO.md
+bench_output/
