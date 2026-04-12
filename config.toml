@@ -1,0 +1,204 @@
+# =============================================================================
+# ByteHive — config.toml
+#
+# IMPORTANT: When the server is running, this file is managed automatically.
+# Any users, groups, or API keys you add/remove via the admin panel are
+# written back here immediately.  Edits to [framework] and [apps.*] are
+# preserved across those writes, but comments in the auth sections are lost.
+# =============================================================================
+
+[framework]
+
+# HTTP server bind address.
+# Portal: http://<host>:<port>/       (login required)
+# Ops:    http://<host>:<port>/admin  (admin group required)
+http_addr = "0.0.0.0:9000"
+
+# Optional static admin bearer token.  Prefer named [[api_keys]] instead —
+# they have per-key labels, optional expiry, and can be revoked individually.
+# Leave empty to disable static-token auth entirely.
+http_token = ""
+
+# Optional custom web root for static file serving (/web/*).
+# Leave empty to use the built-in portal.
+web_root = ""
+
+log_level = "debug"
+
+
+# =============================================================================
+# User accounts
+#
+# Access level is determined by group membership, not a role field.
+# Add users to the "admin" group for full access, "user" for standard access.
+#
+# password_hash — Argon2id PHC string.
+#   Each hash embeds its own random salt, so identical passwords produce
+#   different hashes and rainbow tables are useless.
+#
+# Generating a hash
+# ─────────────────
+#   Preferred: use the admin panel (Settings → Users → Add User).
+#   CLI:       bytehive hash-password <plaintext>
+#
+# The hash looks like:
+#   $argon2id$v=19$m=65536,t=3,p=4$<base64-salt>$<base64-hash>
+#
+# ⚠  If NO [[users]] blocks are present the server enters first-run setup
+#    mode: navigating to http://<host>:<port>/ will redirect to /setup where
+#    you set the admin password interactively.  No manual hash generation
+#    needed for the initial setup.
+#
+# ⚠  Legacy SHA-256 hashes (64 hex chars, no "$" prefix) are detected on
+#    login and rejected.  Affected users must reset their password.
+#
+# Add users here after the initial setup, or manage them entirely through
+# the admin panel — the file is rewritten automatically on every change.
+# =============================================================================
+
+# [[users]]  ← uncomment only if you prefer to provision users via config
+# username     = "alice"
+# display_name = "Alice"
+# password_hash = "$argon2id$v=19$m=65536,t=3,p=4$<salt>$<hash>"
+
+
+# =============================================================================
+# Groups
+#
+# "admin" and "user" are built-in and CANNOT be deleted.
+# They are created automatically if not present here.
+#
+#   admin  — full access: all app APIs, ops dashboard, user/group/key management
+#   user   — standard access: read/write app APIs
+#   (any other group) — app-defined semantics; can_write() returns false
+# =============================================================================
+
+[[users]]
+username = "admin"
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$Ly2cYeb0zPpAd3N0NzqI6A$nDRmVOpRVIUwqKEDJ6s2pH8V7wQNwo6nCwt/HGHcSYM"
+display_name = "Administrator"
+
+[[groups]]
+name = "admin"
+description = "Administrators — full access and ops dashboard"
+members = ["admin"]
+
+[[groups]]
+name = "user"
+description = "Standard users — read/write access to app APIs"
+members = ["admin"]
+
+[[api_keys]]
+name = "fssync"
+key = "e4796477-bb6b-4250-a8a2-2d757dacbceb"
+as_user = ""
+created_at = 1773176839540
+
+# Custom groups (optional):
+# [[groups]]
+# name        = "editors"
+# description = "Content editors"
+# members     = ["alice"]
+
+
+# =============================================================================
+# API Keys
+#
+# Named bearer tokens for programmatic / service access.
+# All API keys grant admin-equivalent access.
+# The `key` value is sent as:  Authorization: Bearer <key>
+#
+# Generate a key:  python3 -c "import uuid; print(uuid.uuid4())"
+#
+# Keys can be created and revoked at runtime via the admin panel.
+# The raw `key` value is shown ONCE on creation; store it securely.
+# =============================================================================
+
+# [[api_keys]]
+# name       = "ci-pipeline"
+# key        = "00000000-0000-0000-0000-000000000000"   # replace with real UUID
+# as_user    = "ci"                                      # label in audit logs
+# # expires_ms = 1999999999000                           # optional Unix-ms expiry
+
+# [[api_keys]]
+# name    = "backup-agent"
+# key     = "00000000-0000-0000-0000-000000000001"
+# as_user = "backup"
+
+
+# =============================================================================
+# Application configs
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# filesync — bidirectional TCP file sync
+#
+# Server mode
+# ───────────
+#   The server authenticates every client using the framework's UserStore —
+#   the same session tokens, named API keys, and static admin bearer token
+#   used by the HTTP portal.  No extra server-side config is required; just
+#   ensure clients supply a valid token in auth_token.
+#
+# Client mode
+# ───────────
+#   Set auth_token to a valid bearer token (session token, API key, or the
+#   static http_token).  Omit to connect without authentication (dev only).
+#
+# Exclusion rules
+# ───────────────
+#   Two complementary mechanisms, both matched against the relative path with
+#   forward-slash separators.  Any match → path is silently skipped.
+#
+#   exclude_patterns  Shell-style globs:
+#     *     matches any chars except '/'     ("*.log")
+#     **    matches across directories       ("build/**", "**/.cache/**")
+#     ?     matches one char except '/'      ("secret_?.txt")
+#
+#   exclude_regex     Full regular expressions:
+#     r".*\.(tmp|bak)$"    all .tmp and .bak files
+#     r"^private/"         anything under the private/ root directory
+#     r"node_modules"      any path containing node_modules
+#
+#   Both lists are OR-combined: a path is excluded when ANY rule matches.
+#   The built-in always-ignored list (.git, .DS_Store, .filesync_tmp, …)
+#   is applied before these rules and cannot be overridden.
+# -----------------------------------------------------------------------------
+
+[apps.filesync]
+root      = "/home/guy/Desktop/bytehive/server/"
+mode      = "server"
+bind_addr = "0.0.0.0:7878"
+
+# Authentication: server validates clients via the framework UserStore.
+# No extra config needed for the server.  Clients set auth_token below.
+
+# Example exclusion rules — uncomment and adapt as needed:
+# exclude_patterns = [
+#     "*.log",          # all log files at the root level
+#     "build/**",       # everything inside build/
+#     "**/.cache/**",   # any .cache directory anywhere in the tree
+#     "tmp_?.dat",      # single-char wildcard: tmp_a.dat, tmp_b.dat …
+# ]
+# exclude_regex = [
+#     '.*\.(tmp|bak|swp)$',   # temporary/swap files
+#     '^private/',             # private/ directory at root
+#     'node_modules',          # any node_modules path component
+# ]
+
+
+# Client example (separate machine or second instance):
+#
+# [apps.filesync]
+# root        = "/home/alice/cloud"
+# mode        = "client"
+# server_addr = "192.168.1.10:7878"
+# auth_token  = "00000000-0000-0000-0000-000000000001"  # API key or session token
+#
+# exclude_patterns = ["*.log", "build/**"]
+# exclude_regex    = ['.*\.(tmp|bak)$']
+
+
+[apps.filebrowser]
+max_upload_mb = 200
+allow_delete  = false

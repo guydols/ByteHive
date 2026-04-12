@@ -1,0 +1,43 @@
+[package]
+name    = "bytehive-filesync"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name      = "filesync-gui"
+path      = "src/bin/filesync_gui.rs"
+
+[[bin]]
+name      = "stress-bench"
+path      = "src/bin/stress_bench/main.rs"
+
+[dependencies]
+bytehive-core    = { path = "../../crates/core" }
+serde             = { workspace = true }
+serde_json        = { workspace = true }
+crossbeam-channel = { workspace = true }
+parking_lot       = { workspace = true }
+log               = { workspace = true }
+bincode           = "1"
+blake3            = "1"
+lz4_flex          = "0.11"
+rayon             = "1"
+walkdir           = "2"
+inotify           = "0.11.0"
+regex = "1.12.3"
+rustls  = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen   = { version = "0.13", default-features = false, features = ["ring"] }
+rustls-pki-types = "1"
+gtk = "0.18.2"
+rfd = "0.17.2"
+env_logger.workspace = true
+dirs = "6.0.0"
+toml.workspace = true
+tray-icon = "0.21.3"
+iced = { version = "0.14.0", features = ["tokio"] }
+glib = "0.21.5"
+
+clap        = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

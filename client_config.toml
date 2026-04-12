@@ -1,0 +1,76 @@
+[apps.filesync]
+root        = "/home/alice/cloud"
+mode        = "client"
+server_addr = "192.168.1.10:7878"
+auth_token  = "00000000-0000-0000-0000-000000000001"  # API key or session token
+
+exclude_patterns = [
+    # ── Python ────────────────────────────────────────────────
+    "**/venv/**",             # virtual environments
+    "**/.venv/**",
+    "**/env/**",
+    "**/__pycache__/**",      # bytecode cache
+    "**/*.pyc",
+    "**/*.pyo",
+    "**/*.pyd",
+    "**/.pytest_cache/**",
+    "**/*.egg-info/**",
+    "**/dist/**",             # built distributions
+    "**/.mypy_cache/**",
+    "**/.ruff_cache/**",
+
+    # ── C / C++ ───────────────────────────────────────────────
+    "**/build/**",            # CMake / Make build dirs
+    "**/cmake-build-*/**",    # CLion build dirs
+
+    # ── PlatformIO ────────────────────────────────────────────
+    "**/.pio/**",             # PlatformIO build & cache
+    "**/.pioenvs/**",
+    "**/.piolibdeps/**",
+
+    # ── Rust ──────────────────────────────────────────────────
+    "**/target/**",           # Cargo build output
+
+    # ── Node / JS (common in mixed projects) ──────────────────
+    "**/node_modules/**",
+
+    # ── General OS & editor noise ─────────────────────────────
+    "**/.DS_Store",           # macOS metadata
+    "**/Thumbs.db",           # Windows thumbnails
+    "**/*.tmp",
+    "**/*.bak",
+    "**/*.swp",               # Vim swap files
+    "**/*.swo",
+    "**/*~",                  # editor backup files
+    "**/.Trash-*/**",
+
+    # ── Logs & runtime artifacts ──────────────────────────────
+    "**/*.log",
+    "**/logs/**",
+    "**/tmp/**",
+    "**/temp/**",
+    "**/.cache/**",
+]
+
+exclude_regex = [
+    # Python compiled files anywhere in tree
+    r'.*\.pyc$',
+    r'.*\.pyo$',
+
+    # C/C++ object & dependency files
+    r'.*\.(o|d|elf|map)$',
+
+    # Rust: skip target/ but allow anything else
+    r'(^|/)target/',
+
+    # PlatformIO internals
+    r'(^|/)\.pio/',
+
+    # General temp/swap files
+    r'.*\.(tmp|bak|swp|swo)$',
+    r'.*~$',
+
+    # OS metadata
+    r'(^|/)\.DS_Store$',
+    r'(^|/)Thumbs\.db$',
+]

@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+        <title>Link Error — Bytehive</title>
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+        <link
+            href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500&family=Geist+Mono:wght@400;500&display=swap"
+            rel="stylesheet"
+        />
+        <style>
+            :root {
+                --slate-1: #111113;
+                --slate-2: #18191b;
+                --slate-6: #363a3f;
+                --slate-9: #696e77;
+                --slate-12: #edeef0;
+                --bh-hi: #ffac1c;
+                --bh-lo: #ff8a1c;
+                --bh-soft: #ffc266;
+                --grad-sun: linear-gradient(135deg, var(--bh-hi), var(--bh-lo));
+                --bg: var(--slate-1);
+                --sf: var(--slate-2);
+                --sf2: var(--slate-3);
+                --bd: var(--slate-6);
+                --text: var(--slate-12);
+                --muted: var(--slate-9);
+                --a: var(--bh-hi);
+                --sans: "Geist", system-ui, sans-serif;
+                --mono: "Geist Mono", ui-monospace, monospace;
+                --r: 0;
+                --r2: 0;
+            }
+            * {
+                box-sizing: border-box;
+                margin: 0;
+                padding: 0;
+            }
+            b,
+            strong {
+                font-weight: 500;
+            }
+            html,
+            body {
+                height: 100%;
+                background: var(--bg);
+                color: var(--text);
+                font-family: var(--sans);
+            }
+            body {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 1rem;
+            }
+            .card {
+                background: var(--sf);
+                border: 1px solid var(--bd);
+                border-radius: var(--r2);
+                padding: 0;
+                text-align: center;
+                max-width: 380px;
+                width: 100%;
+                overflow: hidden;
+            }
+            .card-top {
+                background: var(--sf2);
+                border-bottom: 1px solid var(--bd);
+                padding: 0.75rem 1rem;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                color: var(--bh-hi);
+            }
+            .card-top svg {
+                stroke: currentColor;
+            }
+            .card-body {
+                padding: 2rem 1.75rem 1.75rem;
+            }
+            .code {
+                font-family: var(--mono);
+                font-size: 2.2rem;
+                font-weight: 400;
+                color: var(--bh-hi);
+                margin-bottom: 0.3rem;
+            }
+            h2 {
+                font-size: 1rem;
+                font-weight: 500;
+                margin-bottom: 0.5rem;
+            }
+            .msg {
+                color: var(--muted);
+                font-size: 0.82rem;
+                margin-top: 0.4rem;
+                line-height: 1.6;
+            }
+            a {
+                color: var(--bh-hi);
+                text-decoration: none;
+                font-size: 0.8rem;
+                display: inline-block;
+                margin-top: 1.5rem;
+                border: 1px solid rgba(255, 172, 28, 0.4);
+                padding: 0.45rem 0.85rem;
+                border-radius: var(--r);
+                transition:
+                    border-color 0.11s,
+                    background 0.11s;
+                /* Touch-friendly */
+                min-height: 40px;
+                display: inline-flex;
+                align-items: center;
+            }
+            a:hover {
+                border-color: var(--bh-lo);
+                background: rgba(255, 172, 28, 0.08);
+            }
+
+            @media (max-width: 400px) {
+                .card-body {
+                    padding: 1.5rem 1.1rem 1.25rem;
+                }
+                .code {
+                    font-size: 1.75rem;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <div class="card-top">
+                <svg
+                    viewBox="0 0 24 24"
+                    width="20"
+                    height="20"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2.2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                >
+                    <path
+                        d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"
+                    />
+                    <line x1="12" y1="9" x2="12" y2="13" />
+                    <line x1="12" y1="17" x2="12.01" y2="17" />
+                </svg>
+            </div>
+            <div class="card-body">
+                <div class="code">⚠</div>
+                <h2>Link Error</h2>
+                <div class="msg">{msg}</div>
+                <a href="/">← Go home</a>
+            </div>
+        </div>
+    </body>
+</html>

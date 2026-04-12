@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+        <title>Bytehive — First Run Setup</title>
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+        <link
+            href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500&family=Geist+Mono:wght@400;500&display=swap"
+            rel="stylesheet"
+        />
+        <style>
+            :root {
+                --slate-1: #111113;
+                --slate-2: #18191b;
+                --slate-3: #212225;
+                --slate-4: #272a2d;
+                --slate-6: #363a3f;
+                --slate-7: #43484e;
+                --slate-9: #696e77;
+                --slate-11: #b0b4ba;
+                --slate-12: #edeef0;
+                --bh-hi: #ffac1c;
+                --bh-lo: #ff8a1c;
+                --bh-soft: #ffc266;
+                --bh-on-tint: #ffecd9;
+                --bh-wash: #2a1d12;
+                --bh-ring: #a65f24;
+                --tomato-9: #e54d2e;
+                --tomato-11: #ff977d;
+                --amber-11: #ffca16;
+                --grad-sun: linear-gradient(135deg, var(--bh-hi), var(--bh-lo));
+                --grad-sun-strong: linear-gradient(
+                    135deg,
+                    #ffc14d,
+                    var(--bh-hi),
+                    var(--bh-lo)
+                );
+                --bg: var(--slate-1);
+                --sf: var(--slate-2);
+                --sf2: var(--slate-3);
+                --bd: var(--slate-6);
+                --text: var(--slate-12);
+                --muted: var(--slate-9);
+                --lo: var(--slate-11);
+                --a: var(--bh-hi);
+                --danger: var(--tomato-9);
+                --warn: var(--amber-11);
+                --sans: "Geist", system-ui, sans-serif;
+                --mono: "Geist Mono", ui-monospace, monospace;
+                --r: 0;
+                --tr: 90ms ease;
+            }
+            * {
+                box-sizing: border-box;
+                margin: 0;
+                padding: 0;
+            }
+            b,
+            strong {
+                font-weight: 500;
+            }
+            html,
+            body {
+                min-height: 100%;
+                background: var(--bg);
+                color: var(--text);
+                font-family: var(--sans);
+            }
+            body::before {
+                content: "";
+                position: fixed;
+                inset: 0;
+                pointer-events: none;
+                background:
+                    radial-gradient(
+                        ellipse 60% 50% at 20% 20%,
+                        rgba(255, 172, 28, 0.07) 0%,
+                        transparent 60%
+                    ),
+                    radial-gradient(
+                        ellipse 50% 45% at 85% 80%,
+                        rgba(255, 138, 28, 0.06) 0%,
+                        transparent 60%
+                    );
+            }
+            body::after {
+                content: "";
+                position: fixed;
+                inset: 0;
+                pointer-events: none;
+                opacity: 0.03;
+                background-image:
+                    linear-gradient(var(--bd) 1px, transparent 1px),
+                    linear-gradient(90deg, var(--bd) 1px, transparent 1px);
+                background-size: 32px 32px;
+            }
+            @keyframes fadeUp {
+                from {
+                    opacity: 0;
+                    transform: translateY(7px);
+                }
+                to {
+                    opacity: 1;
+                    transform: translateY(0);
+                }
+            }
+
+            .wrap {
+                position: relative;
+                z-index: 1;
+                min-height: 100vh;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                padding: 2rem 1rem;
+            }
+
+            .card {
+                background: var(--sf);
+                border: 1px solid var(--bd);
+                border-radius: var(--r);
+                padding: 0;
+                width: 400px;
+                max-width: 100%;
+                box-shadow:
+                    0 0 0 1px rgba(255, 172, 28, 0.06),
+                    0 24px 64px rgba(0, 0, 0, 0.5);
+                animation: fadeUp 0.35s ease both;
+                overflow: hidden;
+            }
+            .card-head {
+                background: var(--sf2);
+                border-bottom: 1px solid var(--bd);
+                padding: 0.9rem 1.75rem;
+                display: flex;
+                align-items: center;
+                gap: 0.65rem;
+            }
+            .card-head .hdr-logo-img {
+                height: 1.25rem;
+                width: auto;
+                display: block;
+                flex-shrink: 0;
+            }
+            .card-head-title {
+                font-size: 1rem;
+                font-weight: 500;
+                letter-spacing: 0.04em;
+                text-transform: uppercase;
+                color: var(--text);
+            }
+            .card-body {
+                padding: 1.75rem 1.75rem 1.5rem;
+            }
+
+            .step-badge {
+                display: inline-flex;
+                align-items: center;
+                gap: 0.4rem;
+                font-size: 0.63rem;
+                font-family: var(--mono);
+                text-transform: uppercase;
+                letter-spacing: 0.09em;
+                color: var(--bh-hi);
+                background: rgba(255, 172, 28, 0.12);
+                border: 1px solid rgba(255, 172, 28, 0.35);
+                border-radius: var(--r);
+                padding: 0.22rem 0.55rem;
+                margin-bottom: 1rem;
+            }
+            .step-badge::before {
+                content: "";
+                width: 5px;
+                height: 5px;
+                border-radius: var(--r);
+                background: var(--grad-sun);
+                box-shadow: 0 0 8px rgba(255, 172, 28, 0.5);
+            }
+
+            h1 {
+                font-size: 1.1rem;
+                font-weight: 500;
+                margin-bottom: 0.35rem;
+            }
+            .subtitle {
+                font-size: 0.8rem;
+                color: var(--lo);
+                line-height: 1.55;
+                margin-bottom: 1.6rem;
+            }
+
+            .field {
+                margin-bottom: 1.05rem;
+            }
+            label {
+                display: block;
+                font-size: 0.63rem;
+                text-transform: uppercase;
+                letter-spacing: 0.09em;
+                color: var(--muted);
+                margin-bottom: 0.32rem;
+                font-family: var(--mono);
+            }
+            input[type="password"] {
+                width: 100%;
+                padding: 0.6rem 0.75rem;
+                background: var(--sf2);
+                border: 1px solid var(--bd);
+                color: var(--text);
+                border-radius: var(--r);
+                font-family: var(--mono);
+                font-size: 0.84rem;
+                transition:
+                    border-color var(--tr),
+                    background var(--tr);
+                /* Touch-friendly */
+                min-height: 42px;
+                -webkit-appearance: none;
+            }
+            input[type="password"]:focus {
+                outline: none;
+                border-color: var(--bh-ring);
+                background: var(--bh-wash);
+                box-shadow: inset 0 0 0 1px rgba(255, 172, 28, 0.28);
+            }
+            input::placeholder {
+                color: var(--muted);
+            }
+
+            .strength-wrap {
+                margin-top: 0.4rem;
+                height: 3px;
+                background: var(--sf2);
+                border-radius: var(--r);
+                overflow: hidden;
+            }
+            .strength-bar {
+                height: 100%;
+                width: 0;
+                border-radius: var(--r);
+                transition:
+                    width 0.25s ease,
+                    background 0.25s ease;
+            }
+            .strength-label {
+                font-size: 0.62rem;
+                font-family: var(--mono);
+                color: var(--muted);
+                margin-top: 0.3rem;
+                min-height: 0.9rem;
+                transition: color 0.2s;
+            }
+
+            .btn {
+                width: 100%;
+                padding: 0.7rem;
+                border-radius: var(--r);
+                border: none;
+                background: var(--grad-sun);
+                color: var(--slate-1);
+                font-weight: 500;
+                font-size: 0.9rem;
+                font-family: var(--sans);
+                cursor: pointer;
+                margin-top: 0.6rem;
+                transition:
+                    opacity var(--tr),
+                    filter var(--tr);
+                /* Touch-friendly */
+                min-height: 44px;
+                -webkit-tap-highlight-color: transparent;
+            }
+            .btn:hover:not(:disabled) {
+                opacity: 1;
+                filter: brightness(1.04);
+            }
+            .btn:disabled {
+                opacity: 0.35;
+                cursor: not-allowed;
+            }
+
+            .error-box {
+                display: none;
+                margin-top: 0.9rem;
+                padding: 0.58rem 0.75rem;
+                background: rgba(255, 172, 28, 0.08);
+                border: 1px solid rgba(255, 172, 28, 0.32);
+                border-radius: var(--r);
+                color: var(--bh-hi);
+                font-size: 0.76rem;
+                font-family: var(--mono);
+            }
+            .error-box.show {
+                display: block;
+            }
+
+            .info-note {
+                margin-top: 1.4rem;
+                padding: 0.6rem 0.75rem;
+                background: rgba(255, 172, 28, 0.06);
+                border: 1px solid rgba(255, 172, 28, 0.18);
+                border-radius: var(--r);
+                font-size: 0.74rem;
+                color: var(--lo);
+                line-height: 1.55;
+            }
+            .info-note strong {
+                color: var(--text);
+            }
+
+            @media (max-width: 480px) {
+                .card-body {
+                    padding: 1.25rem 1.1rem 1.1rem;
+                }
+                .card-head {
+                    padding: 0.75rem 1.1rem;
+                }
+                .card-head-title {
+                    font-size: 0.82rem;
+                }
+                h1 {
+                    font-size: 1rem;
+                }
+                .subtitle {
+                    font-size: 0.78rem;
+                    margin-bottom: 1.2rem;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="wrap">
+            <div class="card">
+                <div class="card-head">
+                    <img
+                        class="hdr-logo-img"
+                        src="bytehive-logo-full.svg"
+                        alt="Bytehive"
+                        width="262"
+                        height="58"
+                    />
+                    <div class="card-head-title">First Run Setup</div>
+                </div>
+                <div class="card-body">
+                    <div class="step-badge">Step 1 of 1</div>
+                    <h1>Set admin password</h1>
+                    <p class="subtitle">
+                        No accounts exist yet. Create the administrator password
+                        to secure your instance — you will be logged in
+                        automatically after this step.
+                    </p>
+
+                    <div class="field">
+                        <label for="pw">Password</label>
+                        <input
+                            id="pw"
+                            type="password"
+                            placeholder="Choose a strong password"
+                            autocomplete="new-password"
+                            autofocus
+                            oninput="onPwInput()"
+                        />
+                        <div class="strength-wrap">
+                            <div class="strength-bar" id="sbar"></div>
+                        </div>
+                        <div class="strength-label" id="slabel"></div>
+                    </div>
+
+                    <div class="field">
+                        <label for="pw2">Confirm password</label>
+                        <input
+                            id="pw2"
+                            type="password"
+                            placeholder="Repeat your password"
+                            autocomplete="new-password"
+                            oninput="onConfirmInput()"
+                        />
+                    </div>
+
+                    <div class="error-box" id="err"></div>
+
+                    <button
+                        class="btn"
+                        id="submit-btn"
+                        onclick="doSetup()"
+                        disabled
+                    >
+                        Create account &amp; continue →
+                    </button>
+
+                    <div class="info-note">
+                        <strong>Admin account</strong> — this creates a user
+                        named
+                        <code
+                            style="font-family: var(--mono); font-size: 0.78rem"
+                            >admin</code
+                        >
+                        with full access. You can add more users and change this
+                        password later in the admin panel.
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            function scorePassword(pw) {
+                if (!pw) return { score: 0, label: "", color: "" };
+                if (pw.length < 8)
+                    return {
+                        score: 0,
+                        label: "At least 8 characters required",
+                        color: "var(--danger)",
+                    };
+                let s = 1,
+                    label = "Weak",
+                    color = "var(--danger)";
+                if (pw.length >= 10 && /[A-Z]/.test(pw) && /[0-9]/.test(pw)) {
+                    s = 2;
+                    label = "Fair";
+                    color = "var(--warn)";
+                }
+                if (
+                    pw.length >= 12 &&
+                    /[A-Z]/.test(pw) &&
+                    /[0-9]/.test(pw) &&
+                    /[^A-Za-z0-9]/.test(pw)
+                ) {
+                    s = 3;
+                    label = "Good";
+                    color = "var(--a)";
+                }
+                if (
+                    pw.length >= 16 &&
+                    /[A-Z]/.test(pw) &&
+                    /[0-9]/.test(pw) &&
+                    /[^A-Za-z0-9]/.test(pw)
+                ) {
+                    s = 4;
+                    label = "Strong";
+                    color = "var(--a)";
+                }
+                return { score: s, label, color };
+            }
+            function onPwInput() {
+                const pw = document.getElementById("pw").value;
+                const { score, label, color } = scorePassword(pw);
+                const bar = document.getElementById("sbar");
+                const lbl = document.getElementById("slabel");
+                bar.style.width = (score / 4) * 100 + "%";
+                bar.style.background = color || "transparent";
+                lbl.textContent = label;
+                lbl.style.color = color || "var(--muted)";
+                updateSubmitState();
+            }
+            function onConfirmInput() {
+                updateSubmitState();
+            }
+            function updateSubmitState() {
+                const pw = document.getElementById("pw").value;
+                const pw2 = document.getElementById("pw2").value;
+                document.getElementById("submit-btn").disabled = !(
+                    pw.length >= 8 && pw === pw2
+                );
+            }
+            function showError(msg) {
+                const el = document.getElementById("err");
+                el.textContent = msg;
+                el.classList.add("show");
+            }
+            function clearError() {
+                document.getElementById("err").classList.remove("show");
+            }
+
+            async function doSetup() {
+                clearError();
+                const pw = document.getElementById("pw").value;
+                const pw2 = document.getElementById("pw2").value;
+                if (pw !== pw2) {
+                    showError("Passwords do not match.");
+                    return;
+                }
+                if (pw.length < 8) {
+                    showError("Password must be at least 8 characters.");
+                    return;
+                }
+                const btn = document.getElementById("submit-btn");
+                btn.disabled = true;
+                btn.textContent = "Setting up…";
+                try {
+                    const res = await fetch("/api/auth/setup", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ password: pw }),
+                    });
+                    const data = await res.json();
+                    if (data.ok) {
+                        btn.textContent = "✓ Done — redirecting…";
+                        window.location.href = "/";
+                    } else {
+                        showError(
+                            data.error || "Setup failed. Please try again.",
+                        );
+                        btn.disabled = false;
+                        btn.textContent = "Create account & continue →";
+                    }
+                } catch (e) {
+                    showError("Network error — is the server running?");
+                    btn.disabled = false;
+                    btn.textContent = "Create account & continue →";
+                }
+            }
+            document.addEventListener("keydown", (e) => {
+                if (
+                    e.key === "Enter" &&
+                    !document.getElementById("submit-btn").disabled
+                )
+                    doSetup();
+            });
+        </script>
+    </body>
+</html>
