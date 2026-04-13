@@ -47,7 +47,12 @@ fn main() {
 
     let auth = Arc::new(Auth::new(cfg.framework.http_token.clone()));
 
-    let registry = AppRegistry::new(Arc::clone(&bus), Arc::clone(&cfg), Arc::clone(&user_store));
+    let registry = AppRegistry::new(
+        Arc::clone(&bus),
+        Arc::clone(&cfg),
+        Arc::clone(&user_store),
+        cli.config.clone(),
+    );
 
     register_filesync(&registry, &cfg);
 

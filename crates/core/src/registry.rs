@@ -87,6 +87,7 @@ pub struct AppRegistry {
     bus: Arc<MessageBus>,
     config: Arc<FrameworkConfig>,
     user_store: Arc<UserStore>,
+    config_path: std::path::PathBuf,
 }
 
 impl AppRegistry {
@@ -94,12 +95,14 @@ impl AppRegistry {
         bus: Arc<MessageBus>,
         config: Arc<FrameworkConfig>,
         user_store: Arc<UserStore>,
+        config_path: std::path::PathBuf,
     ) -> Arc<Self> {
         Arc::new(Self {
             slots: RwLock::new(Vec::new()),
             bus,
             config,
             user_store,
+            config_path,
         })
     }
 
@@ -121,6 +124,7 @@ impl AppRegistry {
             config: initial_config.clone(),
             shutdown: stop_rx,
             auth_service: Arc::clone(&self.user_store),
+            config_path: self.config_path.clone(),
         };
 
         log::info!("starting app '{}' v{}", name, manifest.version);
@@ -219,6 +223,7 @@ impl AppRegistry {
             config: config.clone(),
             shutdown: stop_rx,
             auth_service: Arc::clone(&self.user_store),
+            config_path: self.config_path.clone(),
         };
 
         log::info!("starting app '{name}'");
