@@ -6,14 +6,18 @@ use std::{path::Path, sync::Arc};
 
 #[test]
 fn build_client_tls_config_returns_arc() {
-    let config = build_client_tls_config();
+    let dir = std::env::temp_dir().join(format!("bh_test_{}", line!()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = build_client_tls_config(&dir).unwrap();
 
     let _clone = Arc::clone(&config);
 }
 
 #[test]
 fn build_server_tls_config_succeeds() {
-    let result = build_server_tls_config();
+    let dir = std::env::temp_dir().join(format!("bh_test_{}", line!()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let result = build_server_tls_config(&dir);
     assert!(
         result.is_ok(),
         "server TLS config should build without error; got: {:?}",
@@ -23,14 +27,20 @@ fn build_server_tls_config_succeeds() {
 
 #[test]
 fn build_server_tls_config_is_cloneable() {
-    let cfg = build_server_tls_config().unwrap();
+    let dir = std::env::temp_dir().join(format!("bh_test_{}", line!()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = build_server_tls_config(&dir).unwrap();
     let _clone = Arc::clone(&cfg);
 }
 
 #[test]
 fn build_server_tls_config_generates_fresh_cert_each_call() {
-    let cfg1 = build_server_tls_config().unwrap();
-    let cfg2 = build_server_tls_config().unwrap();
+    let dir1 = std::env::temp_dir().join(format!("bh_test_{}_1", line!()));
+    std::fs::create_dir_all(&dir1).unwrap();
+    let dir2 = std::env::temp_dir().join(format!("bh_test_{}_2", line!()));
+    std::fs::create_dir_all(&dir2).unwrap();
+    let cfg1 = build_server_tls_config(&dir1).unwrap();
+    let cfg2 = build_server_tls_config(&dir2).unwrap();
 
     let _c1 = Arc::clone(&cfg1);
     let _c2 = Arc::clone(&cfg2);

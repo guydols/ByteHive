@@ -1,5 +1,7 @@
 use crate::bundler;
+use crate::cert_fingerprint;
 use crate::common::{self, LargeFileEndOutcome, PendingChanges};
+use crate::known_hosts::{ClientStatus, KnownClients};
 use crate::manifest;
 use crate::protocol::*;
 use crate::sync_engine::SyncEngine;
@@ -9,7 +11,7 @@ use crate::watcher::{self, FsEvent};
 use bytehive_core::MessageBus;
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 use log::{debug, error, info, warn};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::io;
 use std::net::{TcpListener, TcpStream};
@@ -18,8 +20,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-
-pub type AuthChecker = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 struct Peer {
     broadcast_tx: Sender<Option<Frame>>,
@@ -30,7 +30,11 @@ pub struct Server {
     engine: Arc<SyncEngine>,
     bind_addr: String,
     bus: Option<Arc<MessageBus>>,
-    auth_checker: Option<AuthChecker>,
+    /// Server-side known-hosts table.  Every connecting client must have its
+    /// certificate fingerprint in this table with status `Allowed` before
+    /// it can sync.  Unknown clients are added as `Pending` and an approval
+    /// bus event is published.
+    known_clients: Arc<Mutex<KnownClients>>,
     stopped: Arc<AtomicBool>,
     peers: Arc<RwLock<HashMap<String, Peer>>>,
 
@@ -52,30 +56,18 @@ impl Drop for ConnGuard {
 }
 
 impl Server {
-    pub fn new_with_engine(
+    pub fn new(
         engine: Arc<SyncEngine>,
         bind_addr: String,
         bus: Arc<MessageBus>,
+        known_clients: Arc<Mutex<KnownClients>>,
         tls_config: Arc<rustls::ServerConfig>,
     ) -> Self {
-        Self::new_with_engine_and_auth(engine, bind_addr, bus, None, tls_config)
-    }
-
-    pub fn new_with_engine_and_auth(
-        engine: Arc<SyncEngine>,
-        bind_addr: String,
-        bus: Arc<MessageBus>,
-        auth_checker: Option<AuthChecker>,
-        tls_config: Arc<rustls::ServerConfig>,
-    ) -> Self {
-        if auth_checker.is_none() {
-            warn!("filesync server: authentication is DISABLED (no auth_checker provided)");
-        }
         Self {
             engine,
             bind_addr,
             bus: Some(bus),
-            auth_checker,
+            known_clients,
             stopped: Arc::new(AtomicBool::new(false)),
             peers: Arc::new(RwLock::new(HashMap::new())),
             active_conns: Arc::new(RwLock::new(Vec::new())),
@@ -140,14 +132,21 @@ impl Server {
                     let bus = self.bus.clone();
                     let peers = self.peers.clone();
                     let active_conns = self.active_conns.clone();
-                    let auth = self.auth_checker.clone();
+                    let known_clients = self.known_clients.clone();
                     let tls = self.tls_config.clone();
                     thread::Builder::new()
                         .name(format!("srv-client-{addr}"))
                         .spawn(move || {
-                            if let Err(e) =
-                                handle_client(stream, eng, peers, active_conns, bus, auth, tls)
-                            {
+                            if let Err(e) = handle_client(
+                                stream,
+                                addr.to_string(),
+                                eng,
+                                peers,
+                                active_conns,
+                                bus,
+                                known_clients,
+                                tls,
+                            ) {
                                 error!("filesync: client {addr} session error: {e}");
                             }
                             info!("filesync: client {addr} disconnected");
@@ -170,15 +169,37 @@ impl Server {
 
 fn handle_client(
     stream: TcpStream,
+    addr: String,
     engine: Arc<SyncEngine>,
     peers: Arc<RwLock<HashMap<String, Peer>>>,
     active_conns: Arc<RwLock<Vec<Arc<Connection>>>>,
     bus: Option<Arc<MessageBus>>,
-    auth_checker: Option<AuthChecker>,
+    known_clients: Arc<Mutex<KnownClients>>,
     tls_config: Arc<rustls::ServerConfig>,
 ) -> io::Result<()> {
     let conn = Arc::new(Connection::new_server(stream, tls_config)?);
     debug!("filesync: TLS handshake complete with new client");
+
+    // ── Known-host check ────────────────────────────────────────────────────
+    // The client's certificate was exchanged and key-ownership was proven
+    // during the mutual-TLS handshake.  We now derive its fingerprint and
+    // look it up in the known_clients table.
+    let client_fp = match &conn.peer_cert {
+        Some(der) => cert_fingerprint(der),
+        None => {
+            // Should never happen with client_auth_mandatory = true, but
+            // guard defensively.
+            warn!("filesync: client at {addr} did not present a certificate — rejecting");
+            let _ = conn.send(&Message::Rejected {
+                reason: "no client certificate presented".into(),
+            });
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "no client certificate",
+            ));
+        }
+    };
+    debug!("filesync: client cert fingerprint: {}…", &client_fp[..16]);
 
     active_conns.write().push(conn.clone());
     let _conn_guard = ConnGuard {
@@ -190,7 +211,7 @@ fn handle_client(
         Message::Hello {
             node_id,
             protocol_version,
-            credential,
+            ..
         } => {
             if protocol_version != PROTOCOL_VERSION {
                 return Err(io::Error::new(
@@ -201,19 +222,69 @@ fn handle_client(
                     ),
                 ));
             }
-            if let Some(ref checker) = auth_checker {
-                let cred = credential.as_deref().unwrap_or("");
-                if !checker(cred) {
-                    warn!("filesync: rejected client {node_id} — invalid credential");
+            debug!("filesync: received Hello from {node_id} proto={protocol_version}");
+
+            // ── Authorization check ──────────────────────────────────────
+            let status = {
+                let mut kc = known_clients.lock();
+                let is_new = kc.upsert_pending(&node_id, &client_fp, &addr);
+                let status = kc.status(&client_fp).unwrap_or(ClientStatus::Pending);
+                (status, is_new)
+            };
+
+            match status {
+                (ClientStatus::Allowed, _) => {
+                    info!(
+                        "filesync: client {node_id} authorized (fp: {}…)",
+                        &client_fp[..16]
+                    );
+                }
+                (ClientStatus::Pending, is_new) => {
+                    if is_new {
+                        info!(
+                            "filesync: unknown client {node_id} (fp: {}…) — pending admin approval",
+                            &client_fp[..16]
+                        );
+                        if let Some(ref bus) = bus {
+                            bus.publish(
+                                "filesync",
+                                "filesync.client_approval_needed",
+                                serde_json::json!({
+                                    "node_id":     node_id,
+                                    "fingerprint": client_fp,
+                                    "addr":        addr,
+                                }),
+                            );
+                        }
+                    } else {
+                        debug!(
+                            "filesync: client {node_id} still pending (fp: {}…)",
+                            &client_fp[..16]
+                        );
+                    }
+                    let _ = conn.send(&Message::ApprovalPending {
+                        fingerprint: client_fp,
+                    });
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
-                        "filesync: authentication failed",
+                        "filesync: client pending approval",
                     ));
                 }
-                info!("filesync: client {node_id} authenticated");
-                debug!("filesync: credential accepted for {node_id}");
+                (ClientStatus::Rejected, _) => {
+                    warn!(
+                        "filesync: rejected client {node_id} (fp: {}…)",
+                        &client_fp[..16]
+                    );
+                    let _ = conn.send(&Message::Rejected {
+                        reason: "client rejected by administrator".into(),
+                    });
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "filesync: client rejected",
+                    ));
+                }
             }
-            debug!("filesync: received Hello from {node_id} proto={protocol_version}");
+
             node_id
         }
         _ => {

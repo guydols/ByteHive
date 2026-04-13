@@ -1,6 +1,8 @@
+use crate::cert_fingerprint;
 use crate::common::{self, LargeFileEndOutcome, PendingChanges};
 use crate::gui::state::ConnectionStatus;
 use crate::gui::state::SharedState;
+use crate::known_hosts::KnownServers;
 use crate::manifest;
 use crate::protocol::*;
 use crate::sync_engine::SyncEngine;
@@ -27,15 +29,27 @@ pub struct Client {
     server_addr: String,
     bus: Option<Arc<MessageBus>>,
     stopped: Arc<AtomicBool>,
-    auth_token: Option<String>,
+    /// Directory where the client's stable identity cert and `known_servers.toml`
+    /// are stored.  Populated from the framework config dir at construction.
+    identity_dir: PathBuf,
     tls_config: Arc<rustls::ClientConfig>,
     gui_state: Option<SharedState>,
+    /// Set to `true` when the server responds with `ApprovalPending`.  The run
+    /// loop uses a longer, fixed back-off while this flag is set.
+    awaiting_approval: Arc<AtomicBool>,
 }
 
 impl Client {
     pub fn new(root: std::path::PathBuf, server_addr: String) -> Self {
-        use crate::app::build_client_tls_config;
         use crate::exclusions::{ExclusionConfig, Exclusions};
+        let identity_dir = dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("bytehive")
+            .join("filesync");
+        let tls_config = crate::app::build_client_tls_config(&identity_dir).unwrap_or_else(|e| {
+            log::warn!("filesync: TLS config failed ({e}), falling back to ephemeral cert");
+            crate::app::build_ephemeral_client_tls_config()
+        });
         let node_id = format!("cli-{:x}", timestamp_id());
         let exclusions = Arc::new(Exclusions::compile(&ExclusionConfig::default()));
         Self {
@@ -43,9 +57,10 @@ impl Client {
             server_addr,
             bus: None,
             stopped: Arc::new(AtomicBool::new(false)),
-            auth_token: None,
-            tls_config: build_client_tls_config(),
+            identity_dir,
+            tls_config,
             gui_state: None,
+            awaiting_approval: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -53,46 +68,42 @@ impl Client {
         engine: Arc<SyncEngine>,
         server_addr: String,
         bus: Arc<MessageBus>,
-        auth_token: Option<String>,
+        identity_dir: PathBuf,
         tls_config: Arc<rustls::ClientConfig>,
     ) -> Self {
-        if auth_token.is_none() {
-            log::warn!(
-                "filesync client: no auth_token configured — connecting without credentials"
-            );
-        }
         debug!(
-            "filesync client: new_with_engine (node={} server={} auth={})",
+            "filesync client: new_with_engine (node={} server={} identity_dir={:?})",
             engine.node_id(),
             server_addr,
-            if auth_token.is_some() { "set" } else { "none" }
+            identity_dir,
         );
         Self {
             engine,
             server_addr,
             bus: Some(bus),
             stopped: Arc::new(AtomicBool::new(false)),
-            auth_token,
+            identity_dir,
             tls_config,
             gui_state: None,
+            awaiting_approval: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn new_standalone(
         engine: Arc<SyncEngine>,
         server_addr: String,
-        auth_token: Option<String>,
+        identity_dir: PathBuf,
         gui_state: Option<SharedState>,
     ) -> Self {
-        use crate::app::build_client_tls_config;
-        if auth_token.is_none() {
-            log::warn!("filesync client: no auth_token configured, connecting without credentials");
-        }
+        let tls_config = crate::app::build_client_tls_config(&identity_dir).unwrap_or_else(|e| {
+            log::warn!("filesync: TLS config failed ({e}), falling back to ephemeral cert");
+            crate::app::build_ephemeral_client_tls_config()
+        });
         debug!(
-            "filesync client: new_standalone (node={} server={} auth={} gui={})",
+            "filesync client: new_standalone (node={} server={} identity_dir={:?} gui={})",
             engine.node_id(),
             server_addr,
-            if auth_token.is_some() { "set" } else { "none" },
+            identity_dir,
             gui_state.is_some()
         );
         Self {
@@ -100,9 +111,10 @@ impl Client {
             server_addr,
             bus: None,
             stopped: Arc::new(AtomicBool::new(false)),
-            auth_token,
-            tls_config: build_client_tls_config(),
+            identity_dir,
+            tls_config,
             gui_state,
+            awaiting_approval: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -115,8 +127,19 @@ impl Client {
         self.stopped.store(true, Ordering::SeqCst);
     }
 
+    /// Whether the last connection attempt ended with an `ApprovalPending`
+    /// response from the server.  The GUI can poll this to show status.
+    pub fn is_awaiting_approval(&self) -> bool {
+        self.awaiting_approval.load(Ordering::SeqCst)
+    }
+
     pub fn run(&self) {
+        // Default back-off for normal errors.  When the server replies with
+        // ApprovalPending we use a much longer fixed interval so we don't
+        // hammer it while waiting for an admin to act.
+        const APPROVAL_POLL_SECS: u64 = 30;
         let mut backoff = Duration::from_secs(1);
+
         loop {
             if self.stopped.load(Ordering::SeqCst) {
                 debug!("filesync: run loop: stop flag set, exiting");
@@ -126,6 +149,7 @@ impl Client {
             match self.session() {
                 Ok(()) => {
                     info!("filesync: session ended cleanly");
+                    self.awaiting_approval.store(false, Ordering::SeqCst);
                     backoff = Duration::from_secs(1);
                     debug!("filesync: backoff reset to 1 s after clean session");
                 }
@@ -134,8 +158,23 @@ impl Client {
                         debug!("filesync: session error during shutdown (expected): {e}");
                         break;
                     }
-                    error!("filesync: session error: {e}");
-                    debug!("filesync: session error kind={:?}", e.kind());
+                    let msg = e.to_string();
+                    if msg.contains("awaiting_approval") {
+                        // Server told us we're pending; use long fixed interval.
+                        info!(
+                            "filesync: awaiting admin approval — will retry in {APPROVAL_POLL_SECS} s"
+                        );
+                        backoff = Duration::from_secs(APPROVAL_POLL_SECS);
+                    } else if msg.contains("client_rejected") {
+                        error!(
+                            "filesync: this client has been rejected by the server administrator"
+                        );
+                        // Back off a long time; the admin needs to explicitly re-allow.
+                        backoff = Duration::from_secs(300);
+                    } else {
+                        error!("filesync: session error: {e}");
+                        debug!("filesync: session error kind={:?}", e.kind());
+                    }
                 }
             }
             if self.stopped.load(Ordering::SeqCst) {
@@ -155,8 +194,10 @@ impl Client {
                     return;
                 }
             }
-            backoff = (backoff * 2).min(Duration::from_secs(60));
-            debug!("filesync: next backoff will be {} s", backoff.as_secs());
+            if !self.awaiting_approval.load(Ordering::SeqCst) {
+                backoff = (backoff * 2).min(Duration::from_secs(60));
+                debug!("filesync: next backoff will be {} s", backoff.as_secs());
+            }
         }
     }
 
@@ -199,6 +240,60 @@ impl Client {
         );
         debug!("filesync session: TLS 1.3 handshake complete");
 
+        // ── TOFU server fingerprint check ────────────────────────────────────
+        // Verify the server's certificate fingerprint against our local store.
+        // On first connection we record it (Trust On First Use).  On subsequent
+        // connections we require it to match — a mismatch means the server cert
+        // has changed unexpectedly (possible MITM or unannounced rotation).
+        {
+            let known_servers_path = self.identity_dir.join("known_servers.toml");
+            let mut ks = KnownServers::load_or_create(&known_servers_path);
+
+            match &conn.peer_cert {
+                None => {
+                    warn!("filesync session: server did not present a certificate — cannot verify identity");
+                }
+                Some(der) => {
+                    let server_fp = cert_fingerprint(der);
+                    match ks.get_fingerprint(&self.server_addr) {
+                        None => {
+                            // First time we connect to this server — pin its cert (TOFU).
+                            info!(
+                                "filesync: trusting new server {} — pinning fingerprint {}… \
+                                 (delete {:?} to re-trust after cert rotation)",
+                                self.server_addr,
+                                &server_fp[..16],
+                                known_servers_path
+                            );
+                            ks.pin(&self.server_addr, &server_fp);
+                        }
+                        Some(stored_fp) if stored_fp == server_fp => {
+                            debug!(
+                                "filesync session: server fingerprint verified for {}",
+                                self.server_addr
+                            );
+                        }
+                        Some(stored_fp) => {
+                            // Fingerprint mismatch — abort immediately.
+                            let msg = format!(
+                                "filesync: SERVER FINGERPRINT MISMATCH for {}! \
+                                 Stored: {}…  Got: {}…  \
+                                 If the server legitimately regenerated its certificate, \
+                                 delete {:?} to re-trust.",
+                                self.server_addr,
+                                &stored_fp[..16],
+                                &server_fp[..16],
+                                known_servers_path
+                            );
+                            error!("{msg}");
+                            conn.shutdown();
+                            return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg));
+                        }
+                    }
+                }
+            }
+        }
+
         debug!(
             "filesync session: sending Hello (node_id={} proto={})",
             self.engine.node_id(),
@@ -207,7 +302,7 @@ impl Client {
         conn.send(&Message::Hello {
             node_id: self.engine.node_id().to_string(),
             protocol_version: PROTOCOL_VERSION,
-            credential: self.auth_token.clone(),
+            credential: None,
         })?;
 
         match conn.recv()? {
@@ -228,10 +323,39 @@ impl Client {
                         ),
                     ));
                 }
+                // Approved — clear the awaiting flag.
+                self.awaiting_approval.store(false, Ordering::SeqCst);
                 info!("filesync: server node_id={node_id}");
                 debug!(
                     "filesync session: protocol version agreed: {protocol_version} with server {node_id}"
                 );
+            }
+            Message::ApprovalPending { fingerprint } => {
+                self.awaiting_approval.store(true, Ordering::SeqCst);
+                if let Some(ref gs) = self.gui_state {
+                    gs.write().status = ConnectionStatus::AwaitingApproval;
+                }
+                info!(
+                    "filesync: connection pending admin approval on server \
+                     (our fingerprint: {}…)",
+                    &fingerprint[..16.min(fingerprint.len())]
+                );
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "awaiting_approval",
+                ));
+            }
+            Message::Rejected { reason } => {
+                self.awaiting_approval.store(false, Ordering::SeqCst);
+                if let Some(ref gs) = self.gui_state {
+                    gs.write().status =
+                        ConnectionStatus::Error(format!("Rejected by server: {reason}"));
+                }
+                error!("filesync: connection rejected by server: {reason}");
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("client_rejected: {reason}"),
+                ));
             }
             other => {
                 error!("filesync session: expected Hello from server, got unexpected message");

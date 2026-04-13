@@ -14,7 +14,8 @@ use bytehive_core::MessageBus;
 use bytehive_filesync::app::build_server_tls_config;
 use bytehive_filesync::client::Client;
 use bytehive_filesync::exclusions::{ExclusionConfig, Exclusions};
-use bytehive_filesync::server::{AuthChecker, Server};
+use bytehive_filesync::known_hosts::KnownClients;
+use bytehive_filesync::server::Server;
 use bytehive_filesync::sync_engine::SyncEngine;
 use bytehive_filesync::timestamp_id;
 
@@ -111,11 +112,11 @@ struct TestServer {
 }
 
 impl TestServer {
-    fn new(dir: PathBuf, auth: Option<AuthChecker>) -> Self {
-        Self::new_with_label(dir, auth, "server")
+    fn new(dir: PathBuf, permissive: bool) -> Self {
+        Self::new_with_label(dir, permissive, "server")
     }
 
-    fn new_with_label(dir: PathBuf, auth: Option<AuthChecker>, label: &str) -> Self {
+    fn new_with_label(dir: PathBuf, permissive: bool, label: &str) -> Self {
         let label = label.to_string();
         let _slot = ServerSlot::acquire(&label);
 
@@ -127,14 +128,15 @@ impl TestServer {
         let bind = format!("127.0.0.1:{port}");
         let engine = make_engine(dir.clone());
         let bus = MessageBus::new();
-        let tls = build_server_tls_config().expect("server TLS config");
+        let tls_dir = tmp_dir(&format!("{label}_tls"));
+        let tls = build_server_tls_config(&tls_dir).expect("server TLS config");
+        let known_clients = Arc::new(parking_lot::Mutex::new(if permissive {
+            KnownClients::load_from_config_permissive(tls_dir.join("config.toml"))
+        } else {
+            KnownClients::load_from_config(tls_dir.join("config.toml"))
+        }));
 
-        let server = Arc::new(match auth {
-            Some(checker) => {
-                Server::new_with_engine_and_auth(engine, bind, bus, Some(checker), tls)
-            }
-            None => Server::new_with_engine(engine, bind, bus, tls),
-        });
+        let server = Arc::new(Server::new(engine, bind, bus, known_clients, tls));
 
         let srv = server.clone();
         let thr_label = label.clone();
@@ -204,27 +206,19 @@ impl Drop for TestServer {
     }
 }
 
-fn make_client(root: PathBuf, server_addr: &str, token: Option<&str>) -> Client {
+fn make_client(root: PathBuf, server_addr: &str, _token: Option<&str>) -> Client {
+    let identity_dir = root.join(".identity");
     let engine = make_engine(root);
-    Client::new_standalone(
-        engine,
-        server_addr.to_string(),
-        token.map(|t| t.to_string()),
-        None,
-    )
+    Client::new_standalone(engine, server_addr.to_string(), identity_dir, None)
 }
 
 fn make_client_with_engine(
     engine: Arc<SyncEngine>,
     server_addr: &str,
-    token: Option<&str>,
+    _token: Option<&str>,
 ) -> Client {
-    Client::new_standalone(
-        engine,
-        server_addr.to_string(),
-        token.map(|t| t.to_string()),
-        None,
-    )
+    let identity_dir = engine.root().join(".identity");
+    Client::new_standalone(engine, server_addr.to_string(), identity_dir, None)
 }
 
 const SESSION_MAX_RETRIES: u32 = 20;
@@ -373,7 +367,7 @@ fn sync_empty_both_sides() {
     let cli_dir = tmp_dir("empty_cli");
     tlog("empty_both_sides", "starting");
 
-    let srv = TestServer::new_with_label(srv_dir.clone(), None, "empty_both_sides");
+    let srv = TestServer::new_with_label(srv_dir.clone(), true, "empty_both_sides");
     let client = make_client(cli_dir.clone(), &srv.addr(), None);
 
     run_sync_timed(client, &srv.server, 1_000);
@@ -394,7 +388,7 @@ fn sync_server_files_to_empty_client() {
     fs::create_dir_all(srv_dir.join("sub")).unwrap();
     fs::write(srv_dir.join("sub/nested.txt"), b"nested file content").unwrap();
 
-    let srv = TestServer::new_with_label(srv_dir.clone(), None, "s2c");
+    let srv = TestServer::new_with_label(srv_dir.clone(), true, "s2c");
     let client = make_client(cli_dir.clone(), &srv.addr(), None);
 
     let cli = cli_dir.clone();
@@ -438,7 +432,7 @@ fn sync_client_files_to_empty_server() {
     fs::write(cli_dir.join("report.txt"), b"uploaded by client").unwrap();
     fs::write(cli_dir.join("image.png"), vec![0xFFu8; 4096]).unwrap();
 
-    let srv = TestServer::new_with_label(srv_dir.clone(), None, "c2s");
+    let srv = TestServer::new_with_label(srv_dir.clone(), true, "c2s");
     let client = make_client(cli_dir.clone(), &srv.addr(), None);
 
     let srvd = srv_dir.clone();
@@ -478,7 +472,7 @@ fn sync_bidirectional_disjoint_files() {
     fs::write(srv_dir.join("from_server.txt"), b"server content").unwrap();
     fs::write(cli_dir.join("from_client.txt"), b"client content").unwrap();
 
-    let srv = TestServer::new_with_label(srv_dir.clone(), None, "bidir");
+    let srv = TestServer::new_with_label(srv_dir.clone(), true, "bidir");
     let client = make_client(cli_dir.clone(), &srv.addr(), None);
 
     let (clid, srvd) = (cli_dir.clone(), srv_dir.clone());
@@ -518,7 +512,7 @@ fn transferred_file_passes_blake3_integrity_check() {
     let content: Vec<u8> = (0u8..=255u8).cycle().take(37_777).collect();
     fs::write(srv_dir.join("binary.bin"), &content).unwrap();
 
-    let srv = TestServer::new_with_label(srv_dir.clone(), None, "hash");
+    let srv = TestServer::new_with_label(srv_dir.clone(), true, "hash");
     let client = make_client(cli_dir.clone(), &srv.addr(), None);
 
     let clid = cli_dir.clone();
@@ -557,7 +551,7 @@ fn identical_files_on_both_sides_are_not_retransferred() {
         .modified()
         .unwrap();
 
-    let srv = TestServer::new_with_label(srv_dir.clone(), None, "dedup");
+    let srv = TestServer::new_with_label(srv_dir.clone(), true, "dedup");
     let client = make_client(cli_dir.clone(), &srv.addr(), None);
 
     run_sync_timed(client, &srv.server, 1_500);
@@ -590,7 +584,7 @@ fn nested_directory_tree_transfers_completely() {
     fs::write(srv_dir.join("a/b/mid.txt"), b"mid level").unwrap();
     fs::write(srv_dir.join("a/b/c/deep.txt"), b"deep level").unwrap();
 
-    let srv = TestServer::new_with_label(srv_dir.clone(), None, "tree");
+    let srv = TestServer::new_with_label(srv_dir.clone(), true, "tree");
     let client = make_client(cli_dir.clone(), &srv.addr(), None);
 
     let clid = cli_dir.clone();
@@ -635,7 +629,7 @@ fn large_file_streamed_over_tls() {
     );
     fs::write(srv_dir.join("large.bin"), &content).unwrap();
 
-    let srv = TestServer::new_with_label(srv_dir.clone(), None, "large_file");
+    let srv = TestServer::new_with_label(srv_dir.clone(), true, "large_file");
     let client = make_client(cli_dir.clone(), &srv.addr(), None);
 
     let clid = cli_dir.clone();
@@ -681,7 +675,7 @@ fn many_small_files_all_transfer_correctly() {
         .unwrap();
     }
 
-    let srv = TestServer::new_with_label(srv_dir.clone(), None, "many_files");
+    let srv = TestServer::new_with_label(srv_dir.clone(), true, "many_files");
     let client = make_client(cli_dir.clone(), &srv.addr(), None);
 
     let clid = cli_dir.clone();
@@ -721,7 +715,7 @@ fn empty_file_transfers_correctly() {
 
     fs::write(srv_dir.join("empty.txt"), b"").unwrap();
 
-    let srv = TestServer::new_with_label(srv_dir.clone(), None, "empty_file");
+    let srv = TestServer::new_with_label(srv_dir.clone(), true, "empty_file");
     let client = make_client(cli_dir.clone(), &srv.addr(), None);
 
     let clid = cli_dir.clone();
@@ -761,7 +755,7 @@ fn mixed_file_types_all_transfer() {
     fs::create_dir_all(srv_dir.join("deep/path/to")).unwrap();
     fs::write(srv_dir.join("deep/path/to/leaf.txt"), b"deeply nested").unwrap();
 
-    let srv = TestServer::new_with_label(srv_dir.clone(), None, "mixed");
+    let srv = TestServer::new_with_label(srv_dir.clone(), true, "mixed");
     let client = make_client(cli_dir.clone(), &srv.addr(), None);
 
     let clid = cli_dir.clone();
@@ -811,7 +805,7 @@ fn engine_manifest_contains_all_received_files() {
     fs::write(srv_dir.join("alpha.txt"), b"alpha").unwrap();
     fs::write(srv_dir.join("beta.txt"), b"beta").unwrap();
 
-    let srv = TestServer::new_with_label(srv_dir.clone(), None, "manifest");
+    let srv = TestServer::new_with_label(srv_dir.clone(), true, "manifest");
     let engine = make_engine(cli_dir.clone());
     let client = make_client_with_engine(engine.clone(), &srv.addr(), None);
 
@@ -858,10 +852,8 @@ fn auth_valid_token_is_accepted() {
     let cli_dir = tmp_dir("auth_ok_cli");
     fs::write(srv_dir.join("secret.txt"), b"secret data").unwrap();
 
-    let token = "correct-secret-token-abc123";
-    let checker: AuthChecker = Arc::new(move |cred: &str| cred == token);
-    let srv = TestServer::new_with_label(srv_dir.clone(), Some(checker), "auth_ok");
-    let client = make_client(cli_dir.clone(), &srv.addr(), Some(token));
+    let srv = TestServer::new_with_label(srv_dir.clone(), true, "auth_ok");
+    let client = make_client(cli_dir.clone(), &srv.addr(), None);
 
     let clid = cli_dir.clone();
     let done = run_sync_labelled(
@@ -888,9 +880,8 @@ fn auth_wrong_token_is_rejected() {
     let srv_dir = tmp_dir("auth_bad_srv");
     let cli_dir = tmp_dir("auth_bad_cli");
 
-    let checker: AuthChecker = Arc::new(|cred: &str| cred == "correct-token");
-    let srv = TestServer::new_with_label(srv_dir.clone(), Some(checker), "auth_bad");
-    let client = make_client(cli_dir.clone(), &srv.addr(), Some("wrong-token"));
+    let srv = TestServer::new_with_label(srv_dir.clone(), false, "auth_bad");
+    let client = make_client(cli_dir.clone(), &srv.addr(), None);
 
     tlog(
         "auth_bad",
@@ -920,8 +911,7 @@ fn auth_no_token_rejected_when_required() {
     let srv_dir = tmp_dir("auth_none_srv");
     let cli_dir = tmp_dir("auth_none_cli");
 
-    let checker: AuthChecker = Arc::new(|cred: &str| !cred.is_empty() && cred == "required-token");
-    let srv = TestServer::new_with_label(srv_dir.clone(), Some(checker), "auth_none");
+    let srv = TestServer::new_with_label(srv_dir.clone(), false, "auth_none");
     let client = make_client(cli_dir.clone(), &srv.addr(), None);
 
     tlog(
@@ -954,7 +944,7 @@ fn second_client_receives_files_uploaded_by_first() {
 
     fs::write(cli_a_dir.join("from_a.txt"), b"uploaded by A").unwrap();
 
-    let srv = TestServer::new_with_label(srv_dir.clone(), None, "two_cli_srv1");
+    let srv = TestServer::new_with_label(srv_dir.clone(), true, "two_cli_srv1");
 
     tlog("two_cli", "starting client A session");
     let client_a = make_client(cli_a_dir.clone(), &srv.addr(), None);
@@ -975,7 +965,7 @@ fn second_client_receives_files_uploaded_by_first() {
     tlog("two_cli", "client A upload confirmed");
 
     tlog("two_cli", "starting srv2 for client B");
-    let srv2 = TestServer::new_with_label(srv_dir.clone(), None, "two_cli_srv2");
+    let srv2 = TestServer::new_with_label(srv_dir.clone(), true, "two_cli_srv2");
     let client_b = make_client(cli_b_dir.clone(), &srv2.addr(), None);
 
     let clid_b = cli_b_dir.clone();
@@ -1010,7 +1000,7 @@ fn reconnecting_client_does_not_retransfer_synced_files() {
     fs::write(srv_dir.join("once.txt"), b"transfer me once").unwrap();
 
     tlog("recon", "first session starting");
-    let srv1 = TestServer::new_with_label(srv_dir.clone(), None, "recon_srv1");
+    let srv1 = TestServer::new_with_label(srv_dir.clone(), true, "recon_srv1");
     let engine = make_engine(cli_dir.clone());
 
     let clid = cli_dir.clone();
@@ -1040,7 +1030,7 @@ fn reconnecting_client_does_not_retransfer_synced_files() {
     thread::sleep(Duration::from_millis(500));
 
     tlog("recon", "second session starting");
-    let srv2 = TestServer::new_with_label(srv_dir.clone(), None, "recon_srv2");
+    let srv2 = TestServer::new_with_label(srv_dir.clone(), true, "recon_srv2");
     run_sync_timed(
         make_client_with_engine(engine.clone(), &srv2.addr(), None),
         &srv2.server,
@@ -1072,7 +1062,7 @@ fn file_created_on_server_after_initial_sync() {
 
     fs::write(srv_dir.join("sentinel.txt"), b"sentinel").unwrap();
 
-    let srv1 = TestServer::new_with_label(srv_dir.clone(), None, "created_srv1");
+    let srv1 = TestServer::new_with_label(srv_dir.clone(), true, "created_srv1");
     let clid = cli_dir.clone();
     let done = run_sync_labelled(
         make_client(cli_dir.clone(), &srv1.addr(), None),
@@ -1090,7 +1080,7 @@ fn file_created_on_server_after_initial_sync() {
 
     fs::write(srv_dir.join("new_file.txt"), b"created after sync").unwrap();
 
-    let srv2 = TestServer::new_with_label(srv_dir.clone(), None, "created_srv2");
+    let srv2 = TestServer::new_with_label(srv_dir.clone(), true, "created_srv2");
     let clid = cli_dir.clone();
     let done = run_sync_labelled(
         make_client(cli_dir.clone(), &srv2.addr(), None),
@@ -1121,7 +1111,7 @@ fn file_created_on_client_after_initial_sync() {
 
     fs::write(cli_dir.join("sentinel.txt"), b"sentinel").unwrap();
 
-    let srv1 = TestServer::new_with_label(srv_dir.clone(), None, "clicreate_srv1");
+    let srv1 = TestServer::new_with_label(srv_dir.clone(), true, "clicreate_srv1");
     let srvd = srv_dir.clone();
     let done = run_sync_labelled(
         make_client(cli_dir.clone(), &srv1.addr(), None),
@@ -1139,7 +1129,7 @@ fn file_created_on_client_after_initial_sync() {
 
     fs::write(cli_dir.join("client_file.txt"), b"from client").unwrap();
 
-    let srv2 = TestServer::new_with_label(srv_dir.clone(), None, "clicreate_srv2");
+    let srv2 = TestServer::new_with_label(srv_dir.clone(), true, "clicreate_srv2");
     let srvd = srv_dir.clone();
     let done = run_sync_labelled(
         make_client(cli_dir.clone(), &srv2.addr(), None),
@@ -1170,7 +1160,7 @@ fn directory_with_files_created_on_server_after_sync() {
 
     fs::write(srv_dir.join("sentinel.txt"), b"sentinel").unwrap();
 
-    let srv1 = TestServer::new_with_label(srv_dir.clone(), None, "newdir_srv1");
+    let srv1 = TestServer::new_with_label(srv_dir.clone(), true, "newdir_srv1");
     let clid = cli_dir.clone();
     let done = run_sync_labelled(
         make_client(cli_dir.clone(), &srv1.addr(), None),
@@ -1186,7 +1176,7 @@ fn directory_with_files_created_on_server_after_sync() {
     fs::write(srv_dir.join("new_dir/alpha.txt"), b"alpha").unwrap();
     fs::write(srv_dir.join("new_dir/beta.txt"), b"beta").unwrap();
 
-    let srv2 = TestServer::new_with_label(srv_dir.clone(), None, "newdir_srv2");
+    let srv2 = TestServer::new_with_label(srv_dir.clone(), true, "newdir_srv2");
     let clid = cli_dir.clone();
     let done = run_sync_labelled(
         make_client(cli_dir.clone(), &srv2.addr(), None),
@@ -1215,7 +1205,7 @@ fn file_updated_on_server_after_initial_sync() {
 
     fs::write(srv_dir.join("data.txt"), b"original").unwrap();
 
-    let srv1 = TestServer::new_with_label(srv_dir.clone(), None, "update_srv1");
+    let srv1 = TestServer::new_with_label(srv_dir.clone(), true, "update_srv1");
     let clid = cli_dir.clone();
     let done = run_sync_labelled(
         make_client(cli_dir.clone(), &srv1.addr(), None),
@@ -1231,7 +1221,7 @@ fn file_updated_on_server_after_initial_sync() {
     thread::sleep(Duration::from_millis(50));
     fs::write(srv_dir.join("data.txt"), b"updated content").unwrap();
 
-    let srv2 = TestServer::new_with_label(srv_dir.clone(), None, "update_srv2");
+    let srv2 = TestServer::new_with_label(srv_dir.clone(), true, "update_srv2");
     let clid = cli_dir.clone();
     let done = run_sync_labelled(
         make_client(cli_dir.clone(), &srv2.addr(), None),
@@ -1263,7 +1253,7 @@ fn file_deleted_on_server_propagates_to_client() {
     fs::write(srv_dir.join("keeper.txt"), b"keep").unwrap();
     fs::write(srv_dir.join("victim.txt"), b"delete me").unwrap();
 
-    let srv = TestServer::new_with_label(srv_dir.clone(), None, "delete_srv");
+    let srv = TestServer::new_with_label(srv_dir.clone(), true, "delete_srv");
 
     let triggered = Arc::new(AtomicBool::new(false));
     let triggered_cond = triggered.clone();
@@ -1312,7 +1302,7 @@ fn multiple_files_created_on_server_after_sync() {
 
     fs::write(srv_dir.join("sentinel.txt"), b"sentinel").unwrap();
 
-    let srv1 = TestServer::new_with_label(srv_dir.clone(), None, "multi_create_srv1");
+    let srv1 = TestServer::new_with_label(srv_dir.clone(), true, "multi_create_srv1");
     let clid = cli_dir.clone();
     let done = run_sync_labelled(
         make_client(cli_dir.clone(), &srv1.addr(), None),
@@ -1332,7 +1322,7 @@ fn multiple_files_created_on_server_after_sync() {
         .unwrap();
     }
 
-    let srv2 = TestServer::new_with_label(srv_dir.clone(), None, "multi_create_srv2");
+    let srv2 = TestServer::new_with_label(srv_dir.clone(), true, "multi_create_srv2");
     let clid = cli_dir.clone();
     let done = run_sync_labelled(
         make_client(cli_dir.clone(), &srv2.addr(), None),
@@ -1361,7 +1351,7 @@ fn file_renamed_on_server_propagates_to_client() {
 
     fs::write(srv_dir.join("old_name.txt"), b"rename me").unwrap();
 
-    let srv = TestServer::new_with_label(srv_dir.clone(), None, "rename_srv");
+    let srv = TestServer::new_with_label(srv_dir.clone(), true, "rename_srv");
 
     let triggered = Arc::new(AtomicBool::new(false));
     let triggered_cond = triggered.clone();
