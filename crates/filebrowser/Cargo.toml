@@ -9,7 +9,6 @@ serde             = { workspace = true }
 serde_json        = { workspace = true }
 parking_lot       = { workspace = true }
 log               = { workspace = true }
-const_format      = { workspace = true }
 uuid              = { version = "1", features = ["v4"] }
 sha2              = "0.10"
 

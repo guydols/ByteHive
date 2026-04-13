@@ -202,3 +202,12 @@ bind_addr = "0.0.0.0:7878"
 [apps.filebrowser]
 max_upload_mb = 200
 allow_delete  = false
+
+[[filesync_known_clients]]
+node_id = "gui-18a6040ceed3180d"
+fingerprint = "30a9affdb0b18df66302e9c0b9ad6680490a428fd215e63a78b9b49053f0e372"
+label = ""
+status = "allowed"
+addr = "127.0.0.1:33536"
+first_seen_ms = 1776111556666
+last_seen_ms = 1776111581775
