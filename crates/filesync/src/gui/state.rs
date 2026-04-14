@@ -9,6 +9,10 @@ pub enum ConnectionStatus {
     InitialSync,
     Idle,
     Paused,
+    /// The server has received the connection but an administrator has not yet
+    /// approved this client.  The client retries with a longer back-off while
+    /// in this state.
+    AwaitingApproval,
     Error(String),
 }
 
@@ -20,6 +24,7 @@ impl ConnectionStatus {
             Self::InitialSync => "Initial sync…",
             Self::Idle => "Connected",
             Self::Paused => "Paused",
+            Self::AwaitingApproval => "Awaiting approval…",
             Self::Error(_) => "Error",
         }
     }
@@ -30,6 +35,7 @@ impl ConnectionStatus {
             Self::InitialSync => [59, 130, 246, 255],
             Self::Connecting => [245, 158, 11, 255],
             Self::Paused => [168, 85, 247, 255],
+            Self::AwaitingApproval => [251, 191, 36, 255],
             Self::Error(_) => [239, 68, 68, 255],
             Self::Disconnected => [148, 163, 184, 255],
         }
@@ -170,6 +176,10 @@ mod tests {
         assert_eq!(ConnectionStatus::Idle.label(), "Connected");
         assert_eq!(ConnectionStatus::Paused.label(), "Paused");
         assert_eq!(
+            ConnectionStatus::AwaitingApproval.label(),
+            "Awaiting approval…"
+        );
+        assert_eq!(
             ConnectionStatus::Error("some error".into()).label(),
             "Error"
         );
@@ -182,6 +192,7 @@ mod tests {
             ConnectionStatus::InitialSync,
             ConnectionStatus::Connecting,
             ConnectionStatus::Paused,
+            ConnectionStatus::AwaitingApproval,
             ConnectionStatus::Error("x".into()),
             ConnectionStatus::Disconnected,
         ];
@@ -203,6 +214,7 @@ mod tests {
             ConnectionStatus::InitialSync,
             ConnectionStatus::Connecting,
             ConnectionStatus::Paused,
+            ConnectionStatus::AwaitingApproval,
             ConnectionStatus::Error("x".into()),
             ConnectionStatus::Disconnected,
         ];
@@ -227,6 +239,10 @@ mod tests {
             ConnectionStatus::Disconnected
         );
         assert_eq!(
+            ConnectionStatus::AwaitingApproval,
+            ConnectionStatus::AwaitingApproval
+        );
+        assert_eq!(
             ConnectionStatus::Error("a".into()),
             ConnectionStatus::Error("a".into())
         );
@@ -235,6 +251,10 @@ mod tests {
             ConnectionStatus::Error("b".into())
         );
         assert_ne!(ConnectionStatus::Idle, ConnectionStatus::Disconnected);
+        assert_ne!(
+            ConnectionStatus::AwaitingApproval,
+            ConnectionStatus::Connecting
+        );
     }
 
     #[test]

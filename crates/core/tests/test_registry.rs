@@ -64,7 +64,7 @@ fn test_setup() -> (Arc<AppRegistry>, Arc<MockApp>) {
         apps: HashMap::new(),
     });
     let user_store = UserStore::empty();
-    let reg = AppRegistry::new(bus, config, user_store);
+    let reg = AppRegistry::new(bus, config, user_store, std::path::PathBuf::from("."));
     let app = Arc::new(MockApp::new("mock"));
     (reg, app)
 }
@@ -174,7 +174,7 @@ fn responder_setup() -> Arc<AppRegistry> {
         apps: HashMap::new(),
     });
     let user_store = UserStore::empty();
-    AppRegistry::new(bus, config, user_store)
+    AppRegistry::new(bus, config, user_store, std::path::PathBuf::from("."))
 }
 
 #[test]

@@ -350,19 +350,29 @@ fn run_server_subprocess(args: &[String]) {
     use bytehive_core::MessageBus;
     use bytehive_filesync::app::build_server_tls_config;
     use bytehive_filesync::exclusions::{ExclusionConfig, Exclusions};
+    use bytehive_filesync::known_hosts::KnownClients;
     use bytehive_filesync::server::Server;
     use bytehive_filesync::sync_engine::SyncEngine;
     use bytehive_filesync::timestamp_id;
+    use parking_lot::Mutex;
 
     let id = format!("bench-srv-{:x}", timestamp_id());
     let exclusions = Arc::new(Exclusions::compile(&ExclusionConfig::default()));
     let engine = Arc::new(SyncEngine::new(dir, id, exclusions));
     let bus = MessageBus::new();
-    let tls = build_server_tls_config().expect("server TLS config");
-    let server = Arc::new(Server::new_with_engine(
+    // Stress bench uses a temp dir for the server identity cert and an
+    // in-memory known_clients that auto-approves everyone.
+    let bench_state_dir = std::env::temp_dir().join(format!("bh_bench_srv_{port}"));
+    std::fs::create_dir_all(&bench_state_dir).expect("create bench state dir");
+    let tls = build_server_tls_config(&bench_state_dir).expect("server TLS config");
+    let known_clients = Arc::new(Mutex::new(KnownClients::load_from_config_permissive(
+        bench_state_dir.join("config.toml"),
+    )));
+    let server = Arc::new(Server::new(
         engine,
         format!("127.0.0.1:{port}"),
         bus,
+        known_clients,
         tls,
     ));
 
@@ -424,7 +434,15 @@ fn run_client_subprocess(args: &[String]) {
     let id = format!("bench-cli-{:x}", timestamp_id());
     let exclusions = Arc::new(Exclusions::compile(&ExclusionConfig::default()));
     let engine = Arc::new(SyncEngine::new(dir, id, exclusions));
-    let client = Arc::new(Client::new_standalone(engine, server_addr, None, None));
+    // Stress bench clients use the GUI config dir as their identity directory
+    // so they get a stable cert across runs.
+    let identity_dir = bytehive_filesync::gui::config::GuiConfig::config_dir().join("filesync");
+    let client = Arc::new(Client::new_standalone(
+        engine,
+        server_addr,
+        identity_dir,
+        None,
+    ));
 
     let cli = client.clone();
     let _handle = std::thread::Builder::new()

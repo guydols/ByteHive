@@ -8,7 +8,7 @@ pub const BUNDLE_MAX_FILES: usize = 500;
 pub const LARGE_FILE_THRESHOLD: u64 = 8 * 1024 * 1024;
 pub const FILE_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 pub const DEBOUNCE_MS: u64 = 200;
 pub const FILE_STABILITY_MS: u64 = 500;
 pub const SUPPRESSION_SECS: u64 = 2;
@@ -51,7 +51,22 @@ pub enum Message {
     Hello {
         node_id: String,
         protocol_version: u32,
+        /// Kept for wire compatibility; no longer used for authentication.
+        /// Identity is established via the mutual-TLS certificate fingerprint.
         credential: Option<String>,
+    },
+    /// Sent by the server when the connecting client's certificate fingerprint
+    /// is not yet in the allowed list.  The client should display a
+    /// "waiting for approval" status and retry with back-off.
+    ApprovalPending {
+        /// The client's own certificate fingerprint (echoed back so the
+        /// admin and the client can cross-check them).
+        fingerprint: String,
+    },
+    /// Sent by the server when the connecting client has been explicitly
+    /// rejected by an administrator.
+    Rejected {
+        reason: String,
     },
     ManifestExchange(Manifest),
     Bundle(FileBundle),

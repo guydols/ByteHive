@@ -4,6 +4,7 @@ use crate::gui::config::GuiConfig;
 use crate::gui::state::{ConnectionStatus, SharedState};
 use crate::sync_engine::SyncEngine;
 use crate::timestamp_id;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -87,10 +88,15 @@ fn session_loop(
             s.log_event(format!("Connecting to {} …", cfg.server_addr));
         }
 
+        // The stable identity certificate and known_servers.toml live in a
+        // "filesync" sub-directory under the GUI's config directory.
+        // Future path: ~/.config/bytehive/filesync/
+        let identity_dir: PathBuf = GuiConfig::config_dir().join("filesync");
+
         let client = Client::new_standalone(
             engine.clone(),
             cfg.server_addr.clone(),
-            Some(cfg.auth_token.clone()),
+            identity_dir,
             Some(state.clone()),
         );
 

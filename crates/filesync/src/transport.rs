@@ -193,6 +193,15 @@ fn io_loop(
 pub struct Connection {
     recv_rx: Mutex<Receiver<io::Result<Message>>>,
     send_tx: Sender<Option<Frame>>,
+    /// DER-encoded end-entity certificate presented by the remote peer during
+    /// the TLS handshake.
+    ///
+    /// * Server connection: the client's certificate (mutual TLS).
+    /// * Client connection: the server's certificate.
+    ///
+    /// `None` if the peer did not present a certificate (should not happen
+    /// in normal operation since both sides use stable identity certs).
+    pub peer_cert: Option<Vec<u8>>,
 }
 
 impl Connection {
@@ -228,7 +237,7 @@ impl Connection {
         // tries to read the peer's next handshake record.  With the 5 ms poll
         // timeout already set, that read returns EAGAIN (WouldBlock / os error
         // 11) after 5 ms if the peer hasn't replied yet.  complete_io()
-        // propagates that error immediately (no retry), so write_all() —and
+        // propagates that error immediately (no retry), so write_all() — and
         // therefore every send — fails with "Resource temporarily unavailable"
         // before any application data is exchanged.  The peer then sees an
         // unexpected EOF as the connection drops.
@@ -254,6 +263,22 @@ impl Connection {
         tls.tcp()
             .set_read_timeout(Some(Duration::from_millis(READ_POLL_MS)))?;
 
+        // Extract the peer's end-entity certificate now, while we still have
+        // direct access to the TLS connection object (before it moves into the
+        // io_loop thread).
+        let peer_cert: Option<Vec<u8>> = match &tls {
+            TlsStream::Server(s) => s
+                .conn
+                .peer_certificates()
+                .and_then(|certs| certs.first())
+                .map(|c| c.as_ref().to_vec()),
+            TlsStream::Client(s) => s
+                .conn
+                .peer_certificates()
+                .and_then(|certs| certs.first())
+                .map(|c| c.as_ref().to_vec()),
+        };
+
         let (recv_tx, recv_rx) = bounded::<io::Result<Message>>(RECV_CHANNEL_DEPTH);
         let (send_tx, send_rx) = bounded::<Option<Frame>>(SEND_QUEUE_DEPTH);
 
@@ -268,6 +293,7 @@ impl Connection {
         Ok(Self {
             recv_rx: Mutex::new(recv_rx),
             send_tx,
+            peer_cert,
         })
     }
 

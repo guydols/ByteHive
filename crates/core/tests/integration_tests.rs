@@ -82,7 +82,7 @@ fn create_test_server() -> (TestHttpServer, Arc<UserStore>) {
         apps: HashMap::new(),
     });
     let users = UserStore::empty();
-    let registry = AppRegistry::new(bus.clone(), config, users.clone());
+    let registry = AppRegistry::new(bus.clone(), config, users.clone(), std::env::temp_dir());
     let auth = Arc::new(Auth::new("test-secret-key"));
 
     let server = TestHttpServer::new(registry, bus.clone(), auth, users.clone());
