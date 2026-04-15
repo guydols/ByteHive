@@ -315,6 +315,22 @@ fn handle_client(
 
     let remote = match conn.recv()? {
         Message::ManifestExchange(m) => m,
+        Message::InsufficientDiskSpace {
+            available_bytes,
+            required_bytes,
+        } => {
+            error!(
+                "filesync: client {client_id} reports insufficient disk space — \
+                 {available_bytes} B available, {required_bytes} B required; aborting sync"
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!(
+                    "filesync: client {client_id} out of disk space: \
+                     {available_bytes} B available, {required_bytes} B required"
+                ),
+            ));
+        }
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -328,6 +344,41 @@ fn handle_client(
         "filesync: {client_id} manifest — {} file(s) {} dir(s)",
         r_files, r_dirs
     );
+
+    // ── Preemptive disk-space check (server) ──────────────────────────────
+    // Simulate the client's send-list computation (is_server = false) to
+    // predict the bytes the client will upload.  Abort before sending
+    // anything if the server filesystem cannot accommodate them.
+    let bytes_from_client: u64 = manifest::compute_send_list(&remote, &local, false)
+        .iter()
+        .filter_map(|p| remote.files.get(p))
+        .filter(|m| !m.is_dir)
+        .map(|m| m.size)
+        .sum();
+    if bytes_from_client > 0 {
+        let avail = common::available_disk_space(engine.root()).unwrap_or(0);
+        if avail < bytes_from_client {
+            error!(
+                "filesync: not enough disk space on server for {client_id} — \
+                 {avail} B available, {bytes_from_client} B required; aborting sync"
+            );
+            let _ = conn.send(&Message::InsufficientDiskSpace {
+                available_bytes: avail,
+                required_bytes: bytes_from_client,
+            });
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!(
+                    "filesync: server out of disk space: \
+                     {avail} B available, {bytes_from_client} B required"
+                ),
+            ));
+        }
+        debug!(
+            "filesync: disk-space check OK for {client_id} — \
+             {avail} B available, {bytes_from_client} B required"
+        );
+    }
 
     let to_client = manifest::compute_send_list(&local, &remote, true);
     let files_sent_to_client = to_client
@@ -370,7 +421,7 @@ fn handle_client(
                     "filesync: initial recv Bundle from {client_id}: bundle_id={} files={} size={} B",
                     b.bundle_id, n_files, b_bytes
                 );
-                let n = engine.apply_bundle(&b)?;
+                let n = engine.apply_bundle(&b)?.written;
                 for fd in &b.files {
                     if !fd.metadata.is_dir {
                         files_received += 1;
@@ -457,6 +508,38 @@ fn handle_client(
                             },
                         );
                     }
+                    Ok(crate::sync_engine::FinishResult::CommittedWithConflict(ci)) => {
+                        files_received += 1;
+                        warn!(
+                            "filesync: initial sync large file committed {path:?} from {client_id} \
+                             (conflict copy: {:?})",
+                            ci.conflict_copy_path
+                        );
+                        if let Some(ref bus) = bus {
+                            bus.publish(
+                                "filesync",
+                                "filesync.conflict_copy",
+                                serde_json::json!({
+                                    "original":      ci.original_path,
+                                    "conflict_copy": ci.conflict_copy_path,
+                                    "peer":          client_id,
+                                }),
+                            );
+                            bus.publish(
+                                "filesync",
+                                "filesync.file_changed",
+                                serde_json::json!({ "path": path, "node": client_id }),
+                            );
+                        }
+                        broadcast_to_others(
+                            &peers,
+                            &client_id,
+                            &Message::LargeFileEnd {
+                                path: path.clone(),
+                                final_hash,
+                            },
+                        );
+                    }
                     Ok(crate::sync_engine::FinishResult::MissingChunks(indices)) => {
                         warn!(
                             "filesync: initial sync {path:?} missing {} chunk(s), requesting retransmit",
@@ -478,6 +561,22 @@ fn handle_client(
                     sync_start.elapsed().as_millis()
                 );
                 break;
+            }
+            Message::InsufficientDiskSpace {
+                available_bytes,
+                required_bytes,
+            } => {
+                error!(
+                    "filesync: client {client_id} reports insufficient disk space during upload — \
+                     {available_bytes} B available, {required_bytes} B required; aborting sync"
+                );
+                return Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    format!(
+                        "filesync: client {client_id} out of disk space: \
+                         {available_bytes} B available, {required_bytes} B required"
+                    ),
+                ));
             }
             _ => {
                 warn!("filesync: unexpected message during initial sync from {client_id}");
@@ -708,6 +807,16 @@ fn client_recv_loop(
                     error!("filesync: recv from {client_id}: {e}");
                     debug!("filesync: connection error from {client_id} (kind={kind:?})");
                 }
+                return;
+            }
+            Ok(Message::InsufficientDiskSpace {
+                available_bytes,
+                required_bytes,
+            }) => {
+                error!(
+                    "filesync: {client_id} reports insufficient disk space — \
+                     {available_bytes} B available, {required_bytes} B required; disconnecting"
+                );
                 return;
             }
             _ => {

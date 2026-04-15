@@ -1,10 +1,14 @@
 //! Shared helpers used by both the filesync **client** and **server**.
 //!
+//! Includes preemptive disk-space checking via [`check_disk_space`] /
+//! [`available_disk_space`], which are called after a manifest exchange to
+//! abort the sync early when the local filesystem has insufficient room.
+//!
 //! Everything that was duplicated between `client.rs` and `server.rs` lives
 //! here so that bug-fixes and behavioural changes only need to happen once.
 
 use crate::protocol::*;
-use crate::sync_engine::{ChunkResult, FinishResult, SyncEngine};
+use crate::sync_engine::{ChunkResult, ConflictInfo, FinishResult, SyncEngine};
 use crate::transport::Connection;
 use crate::watcher::FsEvent;
 
@@ -16,6 +20,36 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+
+// ── Disk-space helpers ────────────────────────────────────────────────────
+
+/// Returns the number of bytes currently available on the filesystem that
+/// contains `path`.  Thin wrapper over [`fs2::available_space`].
+pub fn available_disk_space(path: &Path) -> io::Result<u64> {
+    fs2::available_space(path)
+}
+
+/// Asserts that at least `required_bytes` are available on the filesystem
+/// that contains `path`.
+///
+/// * `Ok(available)` – there is enough space; `available` is the free-byte
+///   count at the time of the check.
+/// * `Err(StorageFull)` – not enough space; the error message includes both
+///   the available and required byte counts.
+pub fn check_disk_space(path: &Path, required_bytes: u64) -> io::Result<u64> {
+    let available = available_disk_space(path)?;
+    if available < required_bytes {
+        Err(io::Error::new(
+            io::ErrorKind::StorageFull,
+            format!(
+                "insufficient disk space: {} B available, {} B required",
+                available, required_bytes
+            ),
+        ))
+    } else {
+        Ok(available)
+    }
+}
 
 // ── Pending-changes accumulator ──────────────────────────────────────────
 
@@ -256,6 +290,8 @@ pub struct BundleApplied {
     pub dirs_count: usize,
     /// Total bytes across all entries in the bundle.
     pub bytes: u64,
+    /// Conflict copies created while applying this bundle.
+    pub conflicts: Vec<ConflictInfo>,
 }
 
 /// Outcome of processing a `LargeFileChunk` message.
@@ -290,14 +326,35 @@ pub fn handle_recv_bundle(
     bus: &Option<Arc<MessageBus>>,
     log_prefix: &str,
 ) -> io::Result<BundleApplied> {
-    let applied = engine.apply_bundle(bundle)?;
+    let apply_result = engine.apply_bundle(bundle)?;
 
     let files_count = bundle.files.iter().filter(|f| !f.metadata.is_dir).count();
     let dirs_count = bundle.files.iter().filter(|f| f.metadata.is_dir).count();
     let bytes: u64 = bundle.files.iter().map(|f| f.metadata.size).sum();
 
+    let applied = apply_result.written;
+
     info!("{log_prefix}: +{applied} file(s) from {peer}");
     publish_changed(bus, bundle, peer);
+
+    for ci in &apply_result.conflicts {
+        warn!(
+            "{log_prefix}: conflict copy from {peer}: {:?} → {:?}",
+            ci.original_path, ci.conflict_copy_path
+        );
+        if let Some(ref bus) = bus {
+            bus.publish(
+                "filesync",
+                "filesync.conflict_copy",
+                serde_json::json!({
+                    "original":      ci.original_path,
+                    "conflict_copy": ci.conflict_copy_path,
+                    "peer":          peer,
+                    "node":          engine.node_id(),
+                }),
+            );
+        }
+    }
 
     if files_count > 0 {
         if let Some(ref bus) = bus {
@@ -320,6 +377,7 @@ pub fn handle_recv_bundle(
         files_count,
         dirs_count,
         bytes,
+        conflicts: apply_result.conflicts,
     })
 }
 
@@ -351,10 +409,19 @@ pub fn handle_recv_large_file_chunk(
 ) -> io::Result<ChunkOutcome> {
     match engine.receive_large_file_chunk(path, chunk_index, data)? {
         ChunkResult::ReadyToCommit(hash) => {
-            engine.commit_large_file(path, hash).map_err(|e| {
+            match engine.commit_large_file(path, hash).map_err(|e| {
                 error!("{log_prefix}: large file commit after retransmit from {peer}: {e}");
                 e
-            })?;
+            })? {
+                FinishResult::Committed => {}
+                FinishResult::CommittedWithConflict(ci) => {
+                    warn!(
+                        "{log_prefix}: conflict copy during retransmit commit: {:?} → {:?}",
+                        ci.original_path, ci.conflict_copy_path
+                    );
+                }
+                FinishResult::MissingChunks(_) => {}
+            }
             info!("{log_prefix}: large file committed {path:?} from {peer} (after retransmit)");
             Ok(ChunkOutcome::Committed)
         }
@@ -375,6 +442,40 @@ pub fn handle_recv_large_file_end(
         FinishResult::Committed => {
             info!("{log_prefix}: large file committed {path:?} from {peer}");
             if let Some(ref bus) = bus {
+                bus.publish(
+                    "filesync",
+                    "filesync.file_changed",
+                    serde_json::json!({ "path": path, "node": peer }),
+                );
+                bus.publish(
+                    "filesync",
+                    "filesync.incremental_stats",
+                    serde_json::json!({
+                        "node":          engine.node_id(),
+                        "peer":          peer,
+                        "files_changed": 1,
+                    }),
+                );
+            }
+            Ok(LargeFileEndOutcome::Committed)
+        }
+        FinishResult::CommittedWithConflict(ci) => {
+            info!(
+                "{log_prefix}: large file committed {path:?} from {peer} \
+                 (conflict copy: {:?})",
+                ci.conflict_copy_path
+            );
+            if let Some(ref bus) = bus {
+                bus.publish(
+                    "filesync",
+                    "filesync.conflict_copy",
+                    serde_json::json!({
+                        "original":      ci.original_path,
+                        "conflict_copy": ci.conflict_copy_path,
+                        "peer":          peer,
+                        "node":          engine.node_id(),
+                    }),
+                );
                 bus.publish(
                     "filesync",
                     "filesync.file_changed",

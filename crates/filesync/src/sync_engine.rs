@@ -29,8 +29,26 @@ pub enum ChunkResult {
 #[derive(Debug)]
 pub enum FinishResult {
     Committed,
-
+    CommittedWithConflict(ConflictInfo),
     MissingChunks(Vec<u32>),
+}
+
+/// Information about a conflict that was resolved by creating a conflict copy.
+#[derive(Debug, Clone)]
+pub struct ConflictInfo {
+    /// Original file path (incoming file applied here).
+    pub original_path: PathBuf,
+    /// Path where the diverged local copy was saved.
+    pub conflict_copy_path: PathBuf,
+}
+
+/// Result of applying a bundle.
+#[derive(Debug, Default)]
+pub struct ApplyResult {
+    /// Number of entries actually written (files + dirs).
+    pub written: usize,
+    /// Conflict copies created during this apply.
+    pub conflicts: Vec<ConflictInfo>,
 }
 
 struct LargeFileAssembly {
@@ -57,6 +75,44 @@ pub struct SyncEngine {
     in_progress: RwLock<HashMap<PathBuf, LargeFileAssembly>>,
 
     exclusions: Arc<Exclusions>,
+}
+
+/// Returns the path that a conflict copy of `rel_path` should use.
+///
+/// Format: `{dir}/{stem} (conflict {unix_secs} {node_id}).{ext}`
+/// If the file has no extension the extension suffix is omitted.
+pub fn conflict_copy_name(rel_path: &Path, node_id: &str, unix_secs: u64) -> PathBuf {
+    let stem = rel_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    let ext = rel_path.extension().and_then(|s| s.to_str());
+    let conflict_filename = match ext {
+        Some(e) => format!("{stem} (conflict {unix_secs} {node_id}).{e}"),
+        None => format!("{stem} (conflict {unix_secs} {node_id})"),
+    };
+    match rel_path.parent().filter(|p| *p != Path::new("")) {
+        Some(parent) => parent.join(conflict_filename),
+        None => PathBuf::from(conflict_filename),
+    }
+}
+
+/// Compute the BLAKE3 hash of a file on disk.  Returns `None` if the file
+/// cannot be read (e.g. does not exist yet).
+fn hash_file(path: &Path) -> Option<[u8; 32]> {
+    use std::io::Read;
+    let file = fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Some(hasher.finalize().into())
 }
 
 impl SyncEngine {
@@ -188,9 +244,32 @@ impl SyncEngine {
             .collect()
     }
 
-    pub fn apply_bundle(&self, bundle: &FileBundle) -> std::io::Result<usize> {
+    /// Returns `Some(manifest_hash)` when both the on-disk file and the incoming
+    /// file have diverged from the recorded manifest hash (i.e. a genuine
+    /// two-sided conflict).  Returns `None` when there is no conflict.
+    fn detect_conflict(
+        &self,
+        rel_path: &Path,
+        full_path: &Path,
+        incoming_hash: &[u8; 32],
+    ) -> Option<[u8; 32]> {
+        // Must be a known file (present in our manifest)
+        let manifest_hash = self.manifest.read().files.get(rel_path).map(|m| m.hash)?;
+        // The incoming file must differ from the last-synced state
+        if incoming_hash == &manifest_hash {
+            return None;
+        }
+        // The on-disk file must also differ from the last-synced state
+        let on_disk_hash = hash_file(full_path)?;
+        if on_disk_hash == manifest_hash {
+            return None; // local never changed — no conflict
+        }
+        Some(manifest_hash)
+    }
+
+    pub fn apply_bundle(&self, bundle: &FileBundle) -> std::io::Result<ApplyResult> {
         let mut written = Vec::new();
-        let mut count = 0usize;
+        let mut result = ApplyResult::default();
 
         for fd in &bundle.files {
             if !safe_relative(&fd.metadata.rel_path) {
@@ -199,6 +278,42 @@ impl SyncEngine {
             }
 
             let full = self.root.join(&fd.metadata.rel_path);
+
+            // --- Conflict detection (files only) ---
+            if !fd.metadata.is_dir {
+                if let Some(_ancestor_hash) =
+                    self.detect_conflict(&fd.metadata.rel_path, &full, &fd.metadata.hash)
+                {
+                    let unix_secs = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let conflict_rel =
+                        conflict_copy_name(&fd.metadata.rel_path, &self.node_id, unix_secs);
+                    let conflict_full = self.root.join(&conflict_rel);
+                    if let Some(p) = conflict_full.parent() {
+                        fs::create_dir_all(p)?;
+                    }
+                    match fs::copy(&full, &conflict_full) {
+                        Ok(_) => {
+                            log::info!(
+                                "conflict: {:?} diverged; local copy saved as {:?}",
+                                fd.metadata.rel_path,
+                                conflict_rel
+                            );
+                            result.conflicts.push(ConflictInfo {
+                                original_path: fd.metadata.rel_path.clone(),
+                                conflict_copy_path: conflict_rel,
+                            });
+                        }
+                        Err(e) => {
+                            warn!("conflict copy failed for {:?}: {e}", fd.metadata.rel_path);
+                        }
+                    }
+                }
+            }
+
+            // --- Apply the incoming file ---
             self.suppressed.write().insert(fd.metadata.rel_path.clone());
             written.push(fd.metadata.rel_path.clone());
 
@@ -215,11 +330,11 @@ impl SyncEngine {
                 .write()
                 .files
                 .insert(fd.metadata.rel_path.clone(), fd.metadata.clone());
-            count += 1;
+            result.written += 1;
         }
 
         self.schedule_unsuppress(written);
-        Ok(count)
+        Ok(result)
     }
 
     pub fn begin_large_file(
@@ -376,6 +491,54 @@ impl SyncEngine {
             }
         }
 
+        // --- Conflict detection ---
+        let conflict = {
+            let manifest_hash = self.manifest.read().files.get(path).map(|m| m.hash);
+            if let Some(manifest_hash) = manifest_hash {
+                if final_hash != manifest_hash {
+                    if let Some(on_disk_hash) = hash_file(&asm.dst) {
+                        if on_disk_hash != manifest_hash {
+                            let unix_secs = SystemTime::now()
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            let conflict_rel = conflict_copy_name(path, &self.node_id, unix_secs);
+                            let conflict_full = self.root.join(&conflict_rel);
+                            if let Some(p) = conflict_full.parent() {
+                                let _ = fs::create_dir_all(p);
+                            }
+                            match fs::copy(&asm.dst, &conflict_full) {
+                                Ok(_) => {
+                                    log::info!(
+                                        "conflict: large file {:?} diverged; \
+                                         local copy saved as {:?}",
+                                        path,
+                                        conflict_rel
+                                    );
+                                    Some(ConflictInfo {
+                                        original_path: path.clone(),
+                                        conflict_copy_path: conflict_rel,
+                                    })
+                                }
+                                Err(e) => {
+                                    warn!("conflict copy failed for large file {:?}: {e}", path);
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
         fs::rename(&asm.tmp_path, &asm.dst)?;
 
         let meta = fs::metadata(&asm.dst)?;
@@ -401,7 +564,11 @@ impl SyncEngine {
             .unwrap_or(&asm.tmp_path)
             .to_path_buf();
         self.schedule_unsuppress(vec![path.clone(), tmp_rel]);
-        Ok(FinishResult::Committed)
+        if let Some(ci) = conflict {
+            Ok(FinishResult::CommittedWithConflict(ci))
+        } else {
+            Ok(FinishResult::Committed)
+        }
     }
 
     pub fn clear_in_progress(&self) {
