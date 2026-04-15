@@ -315,6 +315,22 @@ fn handle_client(
 
     let remote = match conn.recv()? {
         Message::ManifestExchange(m) => m,
+        Message::InsufficientDiskSpace {
+            available_bytes,
+            required_bytes,
+        } => {
+            error!(
+                "filesync: client {client_id} reports insufficient disk space — \
+                 {available_bytes} B available, {required_bytes} B required; aborting sync"
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!(
+                    "filesync: client {client_id} out of disk space: \
+                     {available_bytes} B available, {required_bytes} B required"
+                ),
+            ));
+        }
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -328,6 +344,41 @@ fn handle_client(
         "filesync: {client_id} manifest — {} file(s) {} dir(s)",
         r_files, r_dirs
     );
+
+    // ── Preemptive disk-space check (server) ──────────────────────────────
+    // Simulate the client's send-list computation (is_server = false) to
+    // predict the bytes the client will upload.  Abort before sending
+    // anything if the server filesystem cannot accommodate them.
+    let bytes_from_client: u64 = manifest::compute_send_list(&remote, &local, false)
+        .iter()
+        .filter_map(|p| remote.files.get(p))
+        .filter(|m| !m.is_dir)
+        .map(|m| m.size)
+        .sum();
+    if bytes_from_client > 0 {
+        let avail = common::available_disk_space(engine.root()).unwrap_or(0);
+        if avail < bytes_from_client {
+            error!(
+                "filesync: not enough disk space on server for {client_id} — \
+                 {avail} B available, {bytes_from_client} B required; aborting sync"
+            );
+            let _ = conn.send(&Message::InsufficientDiskSpace {
+                available_bytes: avail,
+                required_bytes: bytes_from_client,
+            });
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!(
+                    "filesync: server out of disk space: \
+                     {avail} B available, {bytes_from_client} B required"
+                ),
+            ));
+        }
+        debug!(
+            "filesync: disk-space check OK for {client_id} — \
+             {avail} B available, {bytes_from_client} B required"
+        );
+    }
 
     let to_client = manifest::compute_send_list(&local, &remote, true);
     let files_sent_to_client = to_client
@@ -510,6 +561,22 @@ fn handle_client(
                     sync_start.elapsed().as_millis()
                 );
                 break;
+            }
+            Message::InsufficientDiskSpace {
+                available_bytes,
+                required_bytes,
+            } => {
+                error!(
+                    "filesync: client {client_id} reports insufficient disk space during upload — \
+                     {available_bytes} B available, {required_bytes} B required; aborting sync"
+                );
+                return Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    format!(
+                        "filesync: client {client_id} out of disk space: \
+                         {available_bytes} B available, {required_bytes} B required"
+                    ),
+                ));
             }
             _ => {
                 warn!("filesync: unexpected message during initial sync from {client_id}");
@@ -740,6 +807,16 @@ fn client_recv_loop(
                     error!("filesync: recv from {client_id}: {e}");
                     debug!("filesync: connection error from {client_id} (kind={kind:?})");
                 }
+                return;
+            }
+            Ok(Message::InsufficientDiskSpace {
+                available_bytes,
+                required_bytes,
+            }) => {
+                error!(
+                    "filesync: {client_id} reports insufficient disk space — \
+                     {available_bytes} B available, {required_bytes} B required; disconnecting"
+                );
                 return;
             }
             _ => {

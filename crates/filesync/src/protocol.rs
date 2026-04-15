@@ -98,6 +98,16 @@ pub enum Message {
         from: PathBuf,
         to: PathBuf,
     },
+
+    /// Sent by either side when a preemptive disk-space check fails after
+    /// receiving the remote manifest.  The receiver should abort the sync
+    /// and surface the error to the user / operator.
+    InsufficientDiskSpace {
+        /// Free bytes on the sender's filesystem at the time of the check.
+        available_bytes: u64,
+        /// Bytes that would have been needed to complete the sync.
+        required_bytes: u64,
+    },
 }
 
 pub fn serialise_message(msg: &Message) -> io::Result<Vec<u8>> {

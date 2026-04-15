@@ -1,5 +1,9 @@
 //! Shared helpers used by both the filesync **client** and **server**.
 //!
+//! Includes preemptive disk-space checking via [`check_disk_space`] /
+//! [`available_disk_space`], which are called after a manifest exchange to
+//! abort the sync early when the local filesystem has insufficient room.
+//!
 //! Everything that was duplicated between `client.rs` and `server.rs` lives
 //! here so that bug-fixes and behavioural changes only need to happen once.
 
@@ -16,6 +20,36 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+
+// ── Disk-space helpers ────────────────────────────────────────────────────
+
+/// Returns the number of bytes currently available on the filesystem that
+/// contains `path`.  Thin wrapper over [`fs2::available_space`].
+pub fn available_disk_space(path: &Path) -> io::Result<u64> {
+    fs2::available_space(path)
+}
+
+/// Asserts that at least `required_bytes` are available on the filesystem
+/// that contains `path`.
+///
+/// * `Ok(available)` – there is enough space; `available` is the free-byte
+///   count at the time of the check.
+/// * `Err(StorageFull)` – not enough space; the error message includes both
+///   the available and required byte counts.
+pub fn check_disk_space(path: &Path, required_bytes: u64) -> io::Result<u64> {
+    let available = available_disk_space(path)?;
+    if available < required_bytes {
+        Err(io::Error::new(
+            io::ErrorKind::StorageFull,
+            format!(
+                "insufficient disk space: {} B available, {} B required",
+                available, required_bytes
+            ),
+        ))
+    } else {
+        Ok(available)
+    }
+}
 
 // ── Pending-changes accumulator ──────────────────────────────────────────
 

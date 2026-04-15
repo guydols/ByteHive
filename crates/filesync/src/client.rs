@@ -406,6 +406,50 @@ impl Client {
             );
         }
 
+        // ── Preemptive disk-space check (client) ──────────────────────────────
+        // Simulate the server's send-list computation (is_server = true) to
+        // predict exactly which bytes will arrive.  We do this *before* sending
+        // our ManifestExchange so that, if we are out of space, the server is
+        // notified before it starts transmitting anything.
+        let bytes_incoming: u64 = manifest::compute_send_list(&remote, &local, true)
+            .iter()
+            .filter_map(|p| remote.files.get(p))
+            .filter(|m| !m.is_dir)
+            .map(|m| m.size)
+            .sum();
+        if bytes_incoming > 0 {
+            match common::check_disk_space(self.engine.root(), bytes_incoming) {
+                Ok(avail) => {
+                    debug!(
+                        "filesync session: disk-space check OK — {} B available, {} B required",
+                        avail, bytes_incoming
+                    );
+                }
+                Err(_) => {
+                    let avail = common::available_disk_space(self.engine.root()).unwrap_or(0);
+                    error!(
+                        "filesync: not enough disk space on client — \
+                         {} B available, {} B required; aborting sync",
+                        avail, bytes_incoming
+                    );
+                    // Notify the server before closing so it can surface the
+                    // real reason rather than a generic connection error.
+                    let _ = conn.send(&Message::InsufficientDiskSpace {
+                        available_bytes: avail,
+                        required_bytes: bytes_incoming,
+                    });
+                    return Err(io::Error::new(
+                        io::ErrorKind::StorageFull,
+                        format!(
+                            "filesync: client out of disk space: \
+                             {} B available, {} B required",
+                            avail, bytes_incoming
+                        ),
+                    ));
+                }
+            }
+        }
+
         debug!("filesync session: sending local ManifestExchange");
         conn.send(&Message::ManifestExchange(local.clone()))?;
 
@@ -579,6 +623,24 @@ impl Client {
                         sync_start.elapsed().as_millis()
                     );
                     break;
+                }
+                Message::InsufficientDiskSpace {
+                    available_bytes,
+                    required_bytes,
+                } => {
+                    error!(
+                        "filesync session: server reports insufficient disk space — \
+                         {} B available, {} B required; aborting sync",
+                        available_bytes, required_bytes
+                    );
+                    return Err(io::Error::new(
+                        io::ErrorKind::StorageFull,
+                        format!(
+                            "filesync: server out of disk space: \
+                             {} B available, {} B required",
+                            available_bytes, required_bytes
+                        ),
+                    ));
                 }
                 other => {
                     warn!("filesync session: unexpected message during initial-sync recv phase");
@@ -819,6 +881,16 @@ fn recv_loop(engine: Arc<SyncEngine>, conn: Arc<Connection>, bus: Option<Arc<Mes
                     error!("{prefix}: server gone: {e}");
                     debug!("{prefix}: connection error kind={kind:?}, recv-loop exiting");
                 }
+                return;
+            }
+            Ok(Message::InsufficientDiskSpace {
+                available_bytes,
+                required_bytes,
+            }) => {
+                error!(
+                    "{prefix}: server reports insufficient disk space — \
+                     {available_bytes} B available, {required_bytes} B required; disconnecting"
+                );
                 return;
             }
             Ok(other) => {
