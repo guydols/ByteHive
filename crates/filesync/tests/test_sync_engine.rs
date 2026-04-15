@@ -86,7 +86,8 @@ fn apply_bundle_writes_file_to_disk() {
     let engine = make_engine(dir.clone());
     let n = engine
         .apply_bundle(&file_bundle("hello.txt", b"hello world"))
-        .unwrap();
+        .unwrap()
+        .written;
     assert_eq!(n, 1);
     assert_eq!(fs::read(dir.join("hello.txt")).unwrap(), b"hello world");
     fs::remove_dir_all(&dir).unwrap();
@@ -122,7 +123,7 @@ fn apply_bundle_creates_parent_directories() {
 fn apply_bundle_creates_directory_entry() {
     let dir = tmp_dir("dir_entry");
     let engine = make_engine(dir.clone());
-    let n = engine.apply_bundle(&dir_bundle("mydir")).unwrap();
+    let n = engine.apply_bundle(&dir_bundle("mydir")).unwrap().written;
     assert_eq!(n, 1);
     assert!(dir.join("mydir").is_dir());
     fs::remove_dir_all(&dir).unwrap();
@@ -145,7 +146,7 @@ fn apply_bundle_rejects_path_traversal() {
         }],
         bundle_id: 99,
     };
-    let n = engine.apply_bundle(&evil_bundle).unwrap();
+    let n = engine.apply_bundle(&evil_bundle).unwrap().written;
     assert_eq!(n, 0, "path traversal must be rejected");
     assert!(!dir.parent().unwrap().join("escaped.txt").exists());
     fs::remove_dir_all(&dir).unwrap();
@@ -168,7 +169,7 @@ fn apply_bundle_rejects_absolute_path() {
         }],
         bundle_id: 100,
     };
-    let n = engine.apply_bundle(&evil_bundle).unwrap();
+    let n = engine.apply_bundle(&evil_bundle).unwrap().written;
     assert_eq!(n, 0);
     fs::remove_dir_all(&dir).unwrap();
 }
@@ -214,7 +215,7 @@ fn apply_bundle_handles_multiple_files_in_one_bundle() {
         ],
         bundle_id: 5,
     };
-    let n = engine.apply_bundle(&bundle).unwrap();
+    let n = engine.apply_bundle(&bundle).unwrap().written;
     assert_eq!(n, 2);
     assert_eq!(fs::read(dir.join("a.txt")).unwrap(), b"a");
     assert_eq!(fs::read(dir.join("b.txt")).unwrap(), b"b");
@@ -526,6 +527,7 @@ fn large_file_finish_detects_missing_chunks() {
             assert_eq!(missing, vec![1], "chunk 1 must be reported missing");
         }
         FinishResult::Committed => panic!("must not commit when a chunk is missing"),
+        FinishResult::CommittedWithConflict(_) => panic!("must not commit when a chunk is missing"),
     }
     fs::remove_dir_all(&dir).unwrap();
 }

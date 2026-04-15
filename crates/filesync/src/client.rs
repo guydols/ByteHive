@@ -463,7 +463,7 @@ impl Client {
                         b.bundle_id, n_files, n_dirs, bundle_bytes,
                         bytes_received + bundle_bytes
                     );
-                    let n = self.engine.apply_bundle(&b)?;
+                    let n = self.engine.apply_bundle(&b)?.written;
                     for fd in &b.files {
                         if fd.metadata.is_dir {
                             dirs_received += 1;
@@ -541,6 +541,21 @@ impl Client {
                                 files_received
                             );
                             info!("filesync: initial sync large file committed {path:?}");
+                        }
+                        crate::sync_engine::FinishResult::CommittedWithConflict(ci) => {
+                            files_received += 1;
+                            if let Some(ref gs) = self.gui_state {
+                                gs.write().files_received = files_received as u64;
+                            }
+                            debug!(
+                                "filesync session: large file committed {path:?} (files_received={})",
+                                files_received
+                            );
+                            warn!(
+                                "filesync: initial sync large file committed {path:?} \
+                                 (conflict copy: {:?})",
+                                ci.conflict_copy_path
+                            );
                         }
                         crate::sync_engine::FinishResult::MissingChunks(indices) => {
                             warn!(

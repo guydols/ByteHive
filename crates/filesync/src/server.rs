@@ -370,7 +370,7 @@ fn handle_client(
                     "filesync: initial recv Bundle from {client_id}: bundle_id={} files={} size={} B",
                     b.bundle_id, n_files, b_bytes
                 );
-                let n = engine.apply_bundle(&b)?;
+                let n = engine.apply_bundle(&b)?.written;
                 for fd in &b.files {
                     if !fd.metadata.is_dir {
                         files_received += 1;
@@ -442,6 +442,38 @@ fn handle_client(
                             "filesync: initial sync large file committed {path:?} from {client_id}"
                         );
                         if let Some(ref bus) = bus {
+                            bus.publish(
+                                "filesync",
+                                "filesync.file_changed",
+                                serde_json::json!({ "path": path, "node": client_id }),
+                            );
+                        }
+                        broadcast_to_others(
+                            &peers,
+                            &client_id,
+                            &Message::LargeFileEnd {
+                                path: path.clone(),
+                                final_hash,
+                            },
+                        );
+                    }
+                    Ok(crate::sync_engine::FinishResult::CommittedWithConflict(ci)) => {
+                        files_received += 1;
+                        warn!(
+                            "filesync: initial sync large file committed {path:?} from {client_id} \
+                             (conflict copy: {:?})",
+                            ci.conflict_copy_path
+                        );
+                        if let Some(ref bus) = bus {
+                            bus.publish(
+                                "filesync",
+                                "filesync.conflict_copy",
+                                serde_json::json!({
+                                    "original":      ci.original_path,
+                                    "conflict_copy": ci.conflict_copy_path,
+                                    "peer":          client_id,
+                                }),
+                            );
                             bus.publish(
                                 "filesync",
                                 "filesync.file_changed",
