@@ -64,6 +64,38 @@ impl EventLog {
     }
 }
 
+// ─── Conflicts ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConflictKind {
+    BothModified,
+    LocalOnly,
+    RemoteOnly,
+    BothCreated,
+}
+
+impl ConflictKind {
+    pub fn label(&self) -> &str {
+        match self {
+            Self::BothModified => "Both modified",
+            Self::LocalOnly    => "Deleted remotely",
+            Self::RemoteOnly   => "Deleted locally",
+            Self::BothCreated  => "Both created",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Conflict {
+    pub id: usize,
+    pub filename: String,
+    /// Absolute path to the containing folder.
+    pub folder_path: String,
+    pub local_modified: String,
+    pub remote_modified: String,
+    pub kind: ConflictKind,
+}
+
 #[derive(Debug, Clone)]
 pub struct SyncSnapshot {
     pub status: ConnectionStatus,
@@ -78,6 +110,8 @@ pub struct SyncSnapshot {
     pub bytes_received: u64,
 
     pub transfer_total: u64,
+
+    pub conflicts: Vec<Conflict>,
 
     pub last_connected: Option<Instant>,
     pub log: EventLog,
@@ -95,6 +129,7 @@ impl Default for SyncSnapshot {
             files_received: 0,
             bytes_received: 0,
             transfer_total: 0,
+            conflicts: Vec::new(),
             last_connected: None,
             log: EventLog::new(),
         }

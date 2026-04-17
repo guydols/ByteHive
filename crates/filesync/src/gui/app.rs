@@ -1,17 +1,24 @@
+//! Core application wiring — window settings, update loop, top-level view.
+//!
+//! Uses the ByteHive dark theme, header bar, status panel, stats/conflicts
+//! main content area, and collapsible log panel from the component modules.
+//! All real functionality (SyncManager, tray, config, etc.) is preserved.
+
 use crate::gui::config::GuiConfig;
 use crate::gui::manager::SyncManager;
 use crate::gui::state::{new_shared_state, SharedState, SyncSnapshot};
 use crate::gui::tray::{TrayEvent, TrayHandle};
+use crate::gui::{components, theme};
 
 use iced::{
-    widget::{button, column, container, progress_bar, row, scrollable, text, text_input, Space},
-    window, Alignment, Color, Element, Length, Size, Subscription, Task, Theme,
+    widget::{button, column, container, row, text, text_input, Space},
+    window, Alignment, Background, Element, Length, Size, Subscription, Task, Theme,
 };
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-type BtnStyle = Box<dyn Fn(&Theme, button::Status) -> button::Style>;
+// ─── Entry point ──────────────────────────────────────────────────────────────
 
 pub fn run(tray: TrayHandle) -> iced::Result {
     let tray_arc = Arc::new(Mutex::new(tray));
@@ -21,19 +28,20 @@ pub fn run(tray: TrayHandle) -> iced::Result {
         FileSyncGui::view,
     )
     .title(|_: &FileSyncGui| String::from("ByteHive FileSync"))
-    .theme(|s: &FileSyncGui| s.theme())
+    .theme(|_: &FileSyncGui| theme::bytehive_theme())
     .subscription(|s: &FileSyncGui| s.subscription())
     .window(window::Settings {
-        size: Size::new(640.0, 520.0),
-        min_size: Some(Size::new(520.0, 420.0)),
+        size: Size::new(1080.0, 760.0),
+        min_size: Some(Size::new(800.0, 600.0)),
         resizable: true,
         decorations: true,
-
         exit_on_close_request: false,
         ..Default::default()
     })
     .run()
 }
+
+// ─── State ────────────────────────────────────────────────────────────────────
 
 #[derive(Default)]
 struct SetupState {
@@ -57,7 +65,7 @@ struct DashboardState {
     manager: Arc<SyncManager>,
     state: SharedState,
     snapshot: SyncSnapshot,
-    show_log: bool,
+    log_expanded: bool,
 }
 
 enum Screen {
@@ -68,12 +76,14 @@ enum Screen {
 struct FileSyncGui {
     screen: Screen,
     tray: Arc<Mutex<TrayHandle>>,
-
     window_id: Option<window::Id>,
 }
 
+// ─── Messages ─────────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone)]
-enum Message {
+pub enum Message {
+    // Setup
     FolderInput(String),
     PickFolder,
     FolderPicked(Option<PathBuf>),
@@ -83,16 +93,26 @@ enum Message {
     SetupBack,
     SetupConnect,
 
+    // Dashboard
     Tick,
     TogglePause,
-    ToggleLog,
+    ToggleLogPanel,
     OpenSyncFolder,
 
+    // Conflicts
+    OpenConflictFolder(usize),
+    DismissConflict(usize),
+    KeepLocalVersion(usize),
+    KeepRemoteVersion(usize),
+
+    // Window management
     CaptureWindowId(window::Id),
     HideWindow(window::Id),
     ShowWindow,
     Quit,
 }
+
+// ─── Application logic ───────────────────────────────────────────────────────
 
 impl FileSyncGui {
     fn init(tray: Arc<Mutex<TrayHandle>>) -> (Self, Task<Message>) {
@@ -107,7 +127,7 @@ impl FileSyncGui {
                     manager,
                     state: shared,
                     snapshot,
-                    show_log: false,
+                    log_expanded: false,
                 })
             }
             _ => Screen::Setup(SetupState::default()),
@@ -122,12 +142,9 @@ impl FileSyncGui {
         )
     }
 
-    fn theme(&self) -> Theme {
-        Theme::Light
-    }
-
     fn update(&mut self, msg: Message) -> Task<Message> {
         match msg {
+            // ── Setup messages ────────────────────────────────────────────────
             Message::FolderInput(v) => {
                 if let Screen::Setup(s) = &mut self.screen {
                     s.folder_input = v;
@@ -229,12 +246,13 @@ impl FileSyncGui {
                         manager,
                         state: shared,
                         snapshot,
-                        show_log: false,
+                        log_expanded: false,
                     });
                 }
                 Task::none()
             }
 
+            // ── Dashboard messages ────────────────────────────────────────────
             Message::Tick => {
                 if let Ok(handle) = self.tray.lock() {
                     while let Ok(ev) = handle.events.try_recv() {
@@ -262,9 +280,9 @@ impl FileSyncGui {
                 Task::none()
             }
 
-            Message::ToggleLog => {
+            Message::ToggleLogPanel => {
                 if let Screen::Dashboard(d) = &mut self.screen {
-                    d.show_log = !d.show_log;
+                    d.log_expanded = !d.log_expanded;
                 }
                 Task::none()
             }
@@ -278,6 +296,55 @@ impl FileSyncGui {
                 Task::none()
             }
 
+            // ── Conflict messages ─────────────────────────────────────────────
+            Message::OpenConflictFolder(id) => {
+                if let Screen::Dashboard(d) = &self.screen {
+                    if let Some(conflict) = d.snapshot.conflicts.iter().find(|c| c.id == id) {
+                        let _ = std::process::Command::new("xdg-open")
+                            .arg(&conflict.folder_path)
+                            .spawn();
+                    }
+                }
+                Task::none()
+            }
+
+            Message::DismissConflict(id) => {
+                if let Screen::Dashboard(d) = &mut self.screen {
+                    {
+                        let mut s = d.state.write();
+                        s.conflicts.retain(|c| c.id != id);
+                        s.log_event(format!("Conflict #{id} dismissed by user"));
+                    }
+                    d.snapshot = d.state.read().clone();
+                }
+                Task::none()
+            }
+
+            Message::KeepLocalVersion(id) => {
+                if let Screen::Dashboard(d) = &mut self.screen {
+                    {
+                        let mut s = d.state.write();
+                        s.conflicts.retain(|c| c.id != id);
+                        s.log_event(format!("Conflict #{id} resolved: kept local version"));
+                    }
+                    d.snapshot = d.state.read().clone();
+                }
+                Task::none()
+            }
+
+            Message::KeepRemoteVersion(id) => {
+                if let Screen::Dashboard(d) = &mut self.screen {
+                    {
+                        let mut s = d.state.write();
+                        s.conflicts.retain(|c| c.id != id);
+                        s.log_event(format!("Conflict #{id} resolved: kept remote version"));
+                    }
+                    d.snapshot = d.state.read().clone();
+                }
+                Task::none()
+            }
+
+            // ── Window management ─────────────────────────────────────────────
             Message::CaptureWindowId(id) => {
                 if self.window_id.is_none() {
                     self.window_id = Some(id);
@@ -287,7 +354,6 @@ impl FileSyncGui {
 
             Message::HideWindow(id) => {
                 self.window_id = Some(id);
-
                 window::set_mode(id, window::Mode::Hidden)
             }
 
@@ -328,6 +394,8 @@ impl FileSyncGui {
     }
 }
 
+// ─── Setup views ──────────────────────────────────────────────────────────────
+
 fn view_setup(s: &SetupState) -> Element<'_, Message> {
     let step_num = match s.step {
         SetupStep::Folder => 1u8,
@@ -338,11 +406,13 @@ fn view_setup(s: &SetupState) -> Element<'_, Message> {
     let header = column![
         text("ByteHive FileSync")
             .size(28)
-            .color(Color::from_rgb8(0x1E, 0x29, 0x3B)),
+            .style(|_: &Theme| iced::widget::text::Style {
+                color: Some(theme::TEXT_PRIMARY),
+            }),
         vspace(4),
-        text(format!("Setup  —  Step {step_num} of 3"))
+        text(format!("Setup  \u{2014}  Step {step_num} of 3"))
             .size(14)
-            .color(Color::from_rgb8(0x64, 0x74, 0x8B)),
+            .style(theme::secondary),
         vspace(16),
         step_dots(step_num),
     ]
@@ -360,7 +430,7 @@ fn view_setup(s: &SetupState) -> Element<'_, Message> {
         .width(Length::Fill)
         .height(Length::Fill)
         .style(|_: &Theme| container::Style {
-            background: Some(Color::from_rgb8(0xF8, 0xFA, 0xFC).into()),
+            background: Some(Background::Color(theme::BG_PRIMARY)),
             ..Default::default()
         })
         .into()
@@ -370,9 +440,9 @@ fn step_dots(active: u8) -> Element<'static, Message> {
     let dots: Vec<Element<Message>> = (1u8..=3)
         .map(|i| {
             let colour = if i <= active {
-                Color::from_rgb8(0x3B, 0x82, 0xF6)
+                theme::AMBER
             } else {
-                Color::from_rgb8(0xCB, 0xD5, 0xE1)
+                theme::TEXT_MUTED
             };
             container(Space::new().width(0).height(0))
                 .width(Length::Fixed(10.0))
@@ -402,22 +472,24 @@ fn view_setup_folder(s: &SetupState) -> Element<'_, Message> {
         button("Browse")
             .on_press(Message::PickFolder)
             .padding([10, 18])
-            .style(style_secondary_btn()),
+            .style(theme::btn_ghost),
     ]
     .align_y(Alignment::Center);
 
     let mut inner = column![
         text("Sync Folder")
             .size(18)
-            .color(Color::from_rgb8(0x1E, 0x29, 0x3B)),
+            .style(|_: &Theme| iced::widget::text::Style {
+                color: Some(theme::TEXT_PRIMARY),
+            }),
         vspace(8),
         text("Choose the local folder to synchronise with the server.")
             .size(13)
-            .color(Color::from_rgb8(0x64, 0x74, 0x8B)),
+            .style(theme::secondary),
         vspace(20),
         text("Folder path")
             .size(13)
-            .color(Color::from_rgb8(0x64, 0x74, 0x8B)),
+            .style(theme::secondary),
         vspace(6),
         input_row,
     ]
@@ -427,32 +499,34 @@ fn view_setup_folder(s: &SetupState) -> Element<'_, Message> {
         inner = inner.push(vspace(10)).push(
             text(e.as_str())
                 .size(13)
-                .color(Color::from_rgb8(0xEF, 0x44, 0x44)),
+                .style(theme::red_text),
         );
     }
     inner = inner.push(vspace(24)).push(row![
         hspace_fill(),
-        button("Next →")
+        button("Next \u{2192}")
             .on_press(Message::SetupNext)
             .padding([10, 24])
-            .style(style_primary_btn()),
+            .style(theme::btn_primary),
     ]);
-    card(inner.into())
+    setup_card(inner.into())
 }
 
 fn view_setup_server(s: &SetupState) -> Element<'_, Message> {
     let mut inner = column![
         text("Server Connection")
             .size(18)
-            .color(Color::from_rgb8(0x1E, 0x29, 0x3B)),
+            .style(|_: &Theme| iced::widget::text::Style {
+                color: Some(theme::TEXT_PRIMARY),
+            }),
         vspace(8),
         text("Enter the server address and your authentication token.")
             .size(13)
-            .color(Color::from_rgb8(0x64, 0x74, 0x8B)),
+            .style(theme::secondary),
         vspace(20),
         text("Server address  (host:port)")
             .size(13)
-            .color(Color::from_rgb8(0x64, 0x74, 0x8B)),
+            .style(theme::secondary),
         vspace(6),
         text_input("192.168.1.10:7878", &s.server_input)
             .on_input(Message::ServerInput)
@@ -462,7 +536,7 @@ fn view_setup_server(s: &SetupState) -> Element<'_, Message> {
         vspace(14),
         text("Auth token")
             .size(13)
-            .color(Color::from_rgb8(0x64, 0x74, 0x8B)),
+            .style(theme::secondary),
         vspace(6),
         text_input("your-secret-token", &s.token_input)
             .on_input(Message::TokenInput)
@@ -477,38 +551,40 @@ fn view_setup_server(s: &SetupState) -> Element<'_, Message> {
         inner = inner.push(vspace(10)).push(
             text(e.as_str())
                 .size(13)
-                .color(Color::from_rgb8(0xEF, 0x44, 0x44)),
+                .style(theme::red_text),
         );
     }
     inner = inner.push(vspace(24)).push(row![
-        button("← Back")
+        button("\u{2190} Back")
             .on_press(Message::SetupBack)
             .padding([10, 18])
-            .style(style_secondary_btn()),
+            .style(theme::btn_ghost),
         hspace_fill(),
-        button("Next →")
+        button("Next \u{2192}")
             .on_press(Message::SetupNext)
             .padding([10, 24])
-            .style(style_primary_btn()),
+            .style(theme::btn_primary),
     ]);
-    card(inner.into())
+    setup_card(inner.into())
 }
 
 fn view_setup_review(s: &SetupState) -> Element<'_, Message> {
     let mut inner = column![
         text("Review & Connect")
             .size(18)
-            .color(Color::from_rgb8(0x1E, 0x29, 0x3B)),
+            .style(|_: &Theme| iced::widget::text::Style {
+                color: Some(theme::TEXT_PRIMARY),
+            }),
         vspace(8),
         text("Confirm your settings before connecting.")
             .size(13)
-            .color(Color::from_rgb8(0x64, 0x74, 0x8B)),
+            .style(theme::secondary),
         vspace(20),
         review_row("Sync folder", s.folder_input.clone()),
         vspace(10),
         review_row("Server", s.server_input.clone()),
         vspace(10),
-        review_row("Auth token", "●●●●●●●●".to_owned()),
+        review_row("Auth token", "\u{25CF}\u{25CF}\u{25CF}\u{25CF}\u{25CF}\u{25CF}\u{25CF}\u{25CF}".to_owned()),
         vspace(16),
         thin_rule(),
     ]
@@ -518,268 +594,96 @@ fn view_setup_review(s: &SetupState) -> Element<'_, Message> {
         inner = inner.push(vspace(10)).push(
             text(e.as_str())
                 .size(13)
-                .color(Color::from_rgb8(0xEF, 0x44, 0x44)),
+                .style(theme::red_text),
         );
     }
     inner = inner.push(vspace(24)).push(row![
-        button("← Back")
+        button("\u{2190} Back")
             .on_press(Message::SetupBack)
             .padding([10, 18])
-            .style(style_secondary_btn()),
+            .style(theme::btn_ghost),
         hspace_fill(),
         button("Connect")
             .on_press(Message::SetupConnect)
             .padding([10, 28])
-            .style(style_primary_btn()),
+            .style(theme::btn_primary),
     ]);
-    card(inner.into())
+    setup_card(inner.into())
 }
+
+// ─── Dashboard view ───────────────────────────────────────────────────────────
 
 fn view_dashboard(d: &DashboardState) -> Element<'_, Message> {
     let snap = &d.snapshot;
-    let paused = d.manager.is_paused();
+    let is_paused = d.manager.is_paused();
 
-    let [sr, sg, sb, _] = snap.status.colour();
-    let status_dot = container(Space::new().width(0).height(0))
-        .width(Length::Fixed(10.0))
-        .height(Length::Fixed(10.0))
-        .style(move |_: &Theme| container::Style {
-            background: Some(Color::from_rgb8(sr, sg, sb).into()),
-            border: iced::Border {
-                radius: 5.0.into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        });
+    let header = components::header::view(&snap.status);
+    let status_panel = components::status_panel::view(snap, is_paused);
+    let main_area = main_content(snap, &d.config);
+    let log_panel = components::log_panel::view(&snap.log, d.log_expanded);
 
-    let pause_style: BtnStyle = if paused {
-        style_primary_btn()
-    } else {
-        style_secondary_btn()
-    };
-    let status_row = row![
-        status_dot,
-        hspace(8),
-        text(snap.status.label()).size(15),
-        hspace_fill(),
-        button(if paused { "▶  Resume" } else { "⏸  Pause" })
-            .on_press(Message::TogglePause)
-            .padding([8, 18])
-            .style(pause_style),
-    ]
-    .align_y(Alignment::Center);
-
-    let stats_row = row![
-        stat_card("Files", snap.file_count.to_string()),
-        hspace(12),
-        stat_card("Dirs", snap.dir_count.to_string()),
-        hspace(12),
-        stat_card("Total size", fmt_bytes(snap.total_bytes)),
-    ]
-    .width(Length::Fill);
-
-    let transfer_row = row![
-        stat_card("Sent", fmt_bytes(snap.bytes_sent)),
-        hspace(12),
-        stat_card("Received", fmt_bytes(snap.bytes_received)),
-        hspace(12),
-        stat_card(
-            "Last active",
-            snap.last_connected
-                .map(|t| format!("{} s ago", t.elapsed().as_secs()))
-                .unwrap_or_else(|| "—".into()),
-        ),
-    ]
-    .width(Length::Fill);
-
-    use crate::gui::state::ConnectionStatus;
-    let is_syncing = matches!(snap.status, ConnectionStatus::InitialSync);
-    let progress_section: Option<Element<Message>> = if is_syncing {
-        let transferred = snap.bytes_sent + snap.bytes_received;
-        let (pct, label) = if snap.transfer_total > 0 {
-            let pct = (transferred as f32 / snap.transfer_total as f32).min(1.0);
-            let label = format!(
-                "{} / {}  ({:.0}%)",
-                fmt_bytes(transferred),
-                fmt_bytes(snap.transfer_total),
-                pct * 100.0
-            );
-            (pct, label)
-        } else {
-            (0.5_f32, format!("{} transferred…", fmt_bytes(transferred)))
-        };
-
-        let bar = container(
-            column![
-                row![
-                    text("Syncing…")
-                        .size(13)
-                        .color(Color::from_rgb8(0x3B, 0x82, 0xF6)),
-                    hspace_fill(),
-                    text(label.clone())
-                        .size(12)
-                        .color(Color::from_rgb8(0x64, 0x74, 0x8B)),
-                ]
-                .align_y(Alignment::Center),
-                vspace(6),
-                progress_bar(0.0..=1.0, pct).style(|_: &Theme| iced::widget::progress_bar::Style {
-                    background: Color::from_rgb8(0xE2, 0xE8, 0xF0).into(),
-                    bar: Color::from_rgb8(0x3B, 0x82, 0xF6).into(),
-                    border: iced::Border {
-                        radius: 3.0.into(),
-                        ..Default::default()
-                    },
-                }),
-            ]
-            .spacing(0),
-        )
-        .width(Length::Fill)
-        .padding([14, 16])
-        .style(|_: &Theme| container::Style {
-            background: Some(Color::from_rgb8(0xEF, 0xF6, 0xFF).into()),
-            border: iced::Border {
-                color: Color::from_rgb8(0x93, 0xC5, 0xFD),
-                width: 1.0,
-                radius: 8.0.into(),
-            },
-            ..Default::default()
-        });
-        Some(bar.into())
-    } else {
-        None
-    };
-
-    let cfg_row = row![
-        text(d.config.server_addr.as_str())
-            .size(13)
-            .color(Color::from_rgb8(0x64, 0x74, 0x8B)),
-        hspace(8),
-        text("→").size(13).color(Color::from_rgb8(0x94, 0xA3, 0xB8)),
-        hspace(8),
-        button(text(d.config.sync_root.to_string_lossy().to_string()).size(13))
-            .on_press(Message::OpenSyncFolder)
-            .padding(0)
-            .style(style_link_btn()),
-    ]
-    .align_y(Alignment::Center);
-
-    let log_label = if d.show_log {
-        "Hide log ▲"
-    } else {
-        "Show log ▼"
-    };
-
-    let mut body = column![
-        card(status_row.into()),
-        vspace(12),
-        stats_row,
-        vspace(12),
-        transfer_row,
-        vspace(12),
-        card(cfg_row.into()),
-        vspace(8),
-        row![
-            hspace_fill(),
-            button(log_label)
-                .on_press(Message::ToggleLog)
-                .padding([6, 12])
-                .style(style_ghost_btn()),
-        ],
+    let root = column![
+        header,
+        divider(),
+        status_panel,
+        divider(),
+        main_area,
+        log_panel,
     ]
     .spacing(0);
 
-    if let Some(progress) = progress_section {
-        body = body.push(vspace(12)).push(progress);
-    }
-
-    if d.show_log {
-        body = body.push(vspace(8)).push(view_log(snap));
-    }
-
-    container(scrollable(body.padding([20, 24])))
+    container(root)
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(|_: &Theme| container::Style {
-            background: Some(Color::from_rgb8(0xF8, 0xFA, 0xFC).into()),
-            ..Default::default()
+        .style(|_| {
+            use iced::widget::container;
+            container::Style {
+                background: Some(Background::Color(theme::BG_PRIMARY)),
+                ..Default::default()
+            }
         })
         .into()
 }
 
-fn view_log(snap: &SyncSnapshot) -> Element<'_, Message> {
-    let entries: Vec<Element<Message>> = snap
-        .log
-        .entries()
-        .iter()
-        .rev()
-        .map(|line| {
-            text(line.as_str())
-                .size(12)
-                .color(Color::from_rgb8(0x47, 0x55, 0x69))
-                .into()
-        })
-        .collect();
+/// Main content area: stats when no conflicts, stats + conflicts panel side by side.
+fn main_content<'a>(snap: &'a SyncSnapshot, config: &'a GuiConfig) -> Element<'a, Message> {
+    let server_addr = config.server_addr.clone();
+    let sync_root = config.sync_root.to_string_lossy().to_string();
+    let stats = components::stats_panel::view(snap, server_addr, sync_root);
 
-    container(scrollable(column(entries).spacing(4).padding(12)).height(Length::Fixed(160.0)))
-        .width(Length::Fill)
-        .style(|_: &Theme| container::Style {
-            background: Some(Color::from_rgb8(0xF1, 0xF5, 0xF9).into()),
-            border: iced::Border {
-                color: Color::from_rgb8(0xCB, 0xD5, 0xE1),
-                width: 1.0,
-                radius: 8.0.into(),
-            },
-            ..Default::default()
-        })
+    if snap.conflicts.is_empty() {
+        container(stats)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(16)
+            .into()
+    } else {
+        let conflicts = components::conflicts::view(&snap.conflicts);
+
+        row![
+            container(stats)
+                .width(Length::FillPortion(3))
+                .height(Length::Fill)
+                .padding(16),
+            container(conflicts)
+                .width(Length::FillPortion(2))
+                .height(Length::Fill)
+                .padding(16),
+        ]
+        .spacing(0)
+        .height(Length::Fill)
         .into()
+    }
 }
 
-fn card(content: Element<Message>) -> Element<Message> {
+// ─── Setup helpers ────────────────────────────────────────────────────────────
+
+fn setup_card(content: Element<Message>) -> Element<Message> {
     container(content)
         .width(Length::Fill)
         .padding(20)
-        .style(|_: &Theme| container::Style {
-            background: Some(Color::WHITE.into()),
-            border: iced::Border {
-                color: Color::from_rgb8(0xE2, 0xE8, 0xF0),
-                width: 1.0,
-                radius: 10.0.into(),
-            },
-            shadow: iced::Shadow {
-                color: Color::from_rgba(0.0, 0.0, 0.0, 0.04),
-                offset: iced::Vector { x: 0.0, y: 2.0 },
-                blur_radius: 8.0,
-            },
-            ..Default::default()
-        })
+        .style(theme::panel)
         .into()
-}
-
-fn stat_card(label_str: &'static str, value_str: String) -> Element<'static, Message> {
-    container(
-        column![
-            text(value_str)
-                .size(20)
-                .color(Color::from_rgb8(0x1E, 0x29, 0x3B)),
-            vspace(2),
-            text(label_str)
-                .size(12)
-                .color(Color::from_rgb8(0x94, 0xA3, 0xB8)),
-        ]
-        .spacing(0),
-    )
-    .width(Length::Fill)
-    .padding([14, 16])
-    .style(|_: &Theme| container::Style {
-        background: Some(Color::WHITE.into()),
-        border: iced::Border {
-            color: Color::from_rgb8(0xE2, 0xE8, 0xF0),
-            width: 1.0,
-            radius: 8.0.into(),
-        },
-        ..Default::default()
-    })
-    .into()
 }
 
 fn review_row(key: &'static str, value: String) -> Element<'static, Message> {
@@ -787,10 +691,12 @@ fn review_row(key: &'static str, value: String) -> Element<'static, Message> {
         text(key)
             .size(13)
             .width(Length::Fixed(110.0))
-            .color(Color::from_rgb8(0x94, 0xA3, 0xB8)),
+            .style(theme::muted),
         text(value)
             .size(13)
-            .color(Color::from_rgb8(0x1E, 0x29, 0x3B)),
+            .style(|_: &Theme| iced::widget::text::Style {
+                color: Some(theme::TEXT_PRIMARY),
+            }),
     ]
     .align_y(Alignment::Center)
     .into()
@@ -801,7 +707,18 @@ fn thin_rule<'a>() -> Element<'a, Message> {
         .width(Length::Fill)
         .height(Length::Fixed(1.0))
         .style(|_: &Theme| container::Style {
-            background: Some(Color::from_rgb8(0xE2, 0xE8, 0xF0).into()),
+            background: Some(Background::Color(theme::BORDER)),
+            ..Default::default()
+        })
+        .into()
+}
+
+fn divider<'a>() -> Element<'a, Message> {
+    container(Space::new().width(Length::Fill).height(0))
+        .width(Length::Fill)
+        .height(Length::Fixed(1.0))
+        .style(|_: &Theme| container::Style {
+            background: Some(Background::Color(theme::BORDER)),
             ..Default::default()
         })
         .into()
@@ -817,90 +734,4 @@ fn hspace(pixels: u16) -> Space {
 
 fn hspace_fill() -> Space {
     Space::new().width(Length::Fill)
-}
-
-fn style_primary_btn() -> BtnStyle {
-    Box::new(|_, status: button::Status| {
-        let bg = if matches!(status, button::Status::Hovered | button::Status::Pressed) {
-            Color::from_rgb8(0x25, 0x63, 0xEB)
-        } else {
-            Color::from_rgb8(0x3B, 0x82, 0xF6)
-        };
-        button::Style {
-            background: Some(bg.into()),
-            text_color: Color::WHITE,
-            border: iced::Border {
-                radius: 8.0.into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        }
-    })
-}
-
-fn style_secondary_btn() -> BtnStyle {
-    Box::new(|_, status: button::Status| {
-        let hover = matches!(status, button::Status::Hovered | button::Status::Pressed);
-        button::Style {
-            background: Some(
-                if hover {
-                    Color::from_rgb8(0xE2, 0xE8, 0xF0)
-                } else {
-                    Color::from_rgb8(0xF1, 0xF5, 0xF9)
-                }
-                .into(),
-            ),
-            text_color: Color::from_rgb8(0x47, 0x55, 0x69),
-            border: iced::Border {
-                color: if hover {
-                    Color::from_rgb8(0x94, 0xA3, 0xB8)
-                } else {
-                    Color::from_rgb8(0xCB, 0xD5, 0xE1)
-                },
-                width: 1.0,
-                radius: 8.0.into(),
-            },
-            ..Default::default()
-        }
-    })
-}
-
-fn style_link_btn() -> BtnStyle {
-    Box::new(|_, status: button::Status| button::Style {
-        background: None,
-        text_color: if matches!(status, button::Status::Hovered | button::Status::Pressed) {
-            Color::from_rgb8(0x25, 0x63, 0xEB)
-        } else {
-            Color::from_rgb8(0x3B, 0x82, 0xF6)
-        },
-        ..Default::default()
-    })
-}
-
-fn style_ghost_btn() -> BtnStyle {
-    Box::new(|_, status: button::Status| {
-        let hover = matches!(status, button::Status::Hovered | button::Status::Pressed);
-        button::Style {
-            background: if hover {
-                Some(Color::from_rgb8(0xF1, 0xF5, 0xF9).into())
-            } else {
-                None
-            },
-            text_color: Color::from_rgb8(0x64, 0x74, 0x8B),
-            border: iced::Border {
-                radius: 6.0.into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        }
-    })
-}
-
-fn fmt_bytes(b: u64) -> String {
-    match b {
-        0..1_024 => format!("{b} B"),
-        1_024..1_048_576 => format!("{:.1} KiB", b as f64 / 1_024.0),
-        1_048_576..1_073_741_824 => format!("{:.1} MiB", b as f64 / 1_048_576.0),
-        _ => format!("{:.2} GiB", b as f64 / 1_073_741_824.0),
-    }
 }
