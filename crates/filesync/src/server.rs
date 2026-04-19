@@ -918,7 +918,7 @@ fn local_change_broadcaster(
         }
 
         if pending.should_flush() {
-            debug!("filesync server: flushing local changes");
+            // debug!("filesync server: flushing local changes");
             flush_local_changes(&engine, &peers, &bus, &mut pending);
         }
     }
