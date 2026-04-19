@@ -6,7 +6,12 @@ fn main() {
     let log_level = GuiConfig::load()
         .and_then(|c| c.log_level)
         .unwrap_or_else(|| "info".to_string());
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(&log_level))
+        .filter_module("naga", log::LevelFilter::Warn)
+        .filter_module("wgpu", log::LevelFilter::Warn)
+        .filter_module("wgpu_core", log::LevelFilter::Warn)
+        .filter_module("wgpu_hal", log::LevelFilter::Warn)
+        .init();
 
     let tray_handle = tray::setup_tray();
 

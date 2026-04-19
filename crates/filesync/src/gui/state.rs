@@ -78,9 +78,9 @@ impl ConflictKind {
     pub fn label(&self) -> &str {
         match self {
             Self::BothModified => "Both modified",
-            Self::LocalOnly    => "Deleted remotely",
-            Self::RemoteOnly   => "Deleted locally",
-            Self::BothCreated  => "Both created",
+            Self::LocalOnly => "Deleted remotely",
+            Self::RemoteOnly => "Deleted locally",
+            Self::BothCreated => "Both created",
         }
     }
 }
@@ -94,6 +94,93 @@ pub struct Conflict {
     pub local_modified: String,
     pub remote_modified: String,
     pub kind: ConflictKind,
+}
+
+// ─── File tree ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct FileNode {
+    pub id: usize,
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    /// Whether this node is included in the sync scope.
+    pub included: bool,
+    /// Only relevant for directories — whether children are shown.
+    pub expanded: bool,
+    pub children: Vec<FileNode>,
+}
+
+impl FileNode {
+    pub fn dir(id: usize, name: &str, path: &str, children: Vec<FileNode>) -> Self {
+        Self {
+            id,
+            name: name.to_string(),
+            path: path.to_string(),
+            is_dir: true,
+            included: true,
+            expanded: true,
+            children,
+        }
+    }
+
+    pub fn file(id: usize, name: &str, path: &str) -> Self {
+        Self {
+            id,
+            name: name.to_string(),
+            path: path.to_string(),
+            is_dir: false,
+            included: true,
+            expanded: false,
+            children: vec![],
+        }
+    }
+}
+
+/// A flattened, renderable representation of a single tree row.
+#[derive(Debug, Clone)]
+pub struct FlatNode {
+    pub id: usize,
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub included: bool,
+    pub expanded: bool,
+    pub depth: usize,
+    pub has_children: bool,
+}
+
+/// Recursively flattens the tree into render rows, respecting expansion state.
+pub fn flatten_tree(nodes: &[FileNode]) -> Vec<FlatNode> {
+    let mut out = Vec::new();
+    flatten_recursive(nodes, 0, &mut out);
+    out
+}
+
+fn flatten_recursive(nodes: &[FileNode], depth: usize, out: &mut Vec<FlatNode>) {
+    for node in nodes {
+        out.push(FlatNode {
+            id: node.id,
+            name: node.name.clone(),
+            path: node.path.clone(),
+            is_dir: node.is_dir,
+            included: node.included,
+            expanded: node.expanded,
+            depth,
+            has_children: !node.children.is_empty(),
+        });
+        if node.is_dir && node.expanded {
+            flatten_recursive(&node.children, depth + 1, out);
+        }
+    }
+}
+
+// ─── Side panel tabs ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SideTab {
+    Stats,
+    Conflicts,
 }
 
 #[derive(Debug, Clone)]

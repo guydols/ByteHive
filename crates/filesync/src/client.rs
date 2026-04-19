@@ -396,14 +396,19 @@ impl Client {
             self.engine.root()
         );
         let local = self.engine.scan()?;
-        {
-            let l_files = local.files.values().filter(|m| !m.is_dir).count();
-            let l_dirs = local.files.values().filter(|m| m.is_dir).count();
-            let l_bytes: u64 = local.files.values().map(|m| m.size).sum();
-            debug!(
-                "filesync session: local manifest — {} file(s) {} dir(s) {} B total",
-                l_files, l_dirs, l_bytes
-            );
+        let (l_files, l_dirs, l_bytes) = count_manifest(&local);
+        debug!(
+            "filesync session: local manifest — {} file(s) {} dir(s) {} B total",
+            l_files, l_dirs, l_bytes
+        );
+
+        // Update GUI state with local stats right after scan so the Stats
+        // panel shows real values while the sync is still in progress.
+        if let Some(ref gs) = self.gui_state {
+            let mut s = gs.write();
+            s.file_count = l_files;
+            s.dir_count = l_dirs;
+            s.total_bytes = l_bytes;
         }
 
         // ── Preemptive disk-space check (client) ──────────────────────────────
@@ -676,6 +681,11 @@ impl Client {
         debug!("filesync session: sending SyncComplete to server");
         conn.send(&Message::SyncComplete)?;
 
+        let sync_duration_ms = sync_start.elapsed().as_millis() as u64;
+
+        let manifest_snap = self.engine.get_manifest();
+        let (local_file_count, local_dir_count, local_total_bytes) = count_manifest(&manifest_snap);
+
         if let Some(ref gs) = self.gui_state {
             let mut s = gs.write();
             s.bytes_sent = bytes_sent;
@@ -683,12 +693,10 @@ impl Client {
             s.transfer_total = 0;
             s.status = ConnectionStatus::Idle;
             s.last_connected = Some(Instant::now());
+            s.file_count = local_file_count;
+            s.dir_count = local_dir_count;
+            s.total_bytes = local_total_bytes;
         }
-
-        let sync_duration_ms = sync_start.elapsed().as_millis() as u64;
-
-        let manifest_snap = self.engine.get_manifest();
-        let (local_file_count, local_dir_count, local_total_bytes) = count_manifest(&manifest_snap);
 
         debug!(
             "filesync session: sync complete in {}ms — sent {} file(s) {} B | received {} file(s) {} dir(s) {} B | local {} file(s) {} dir(s) {} B",

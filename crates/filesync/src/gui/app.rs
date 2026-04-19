@@ -6,7 +6,7 @@
 
 use crate::gui::config::GuiConfig;
 use crate::gui::manager::SyncManager;
-use crate::gui::state::{new_shared_state, SharedState, SyncSnapshot};
+use crate::gui::state::{new_shared_state, FileNode, SharedState, SideTab, SyncSnapshot};
 use crate::gui::tray::{TrayEvent, TrayHandle};
 use crate::gui::{components, theme};
 
@@ -15,8 +15,10 @@ use iced::{
     window, Alignment, Background, Element, Length, Size, Subscription, Task, Theme,
 };
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
@@ -66,6 +68,9 @@ struct DashboardState {
     state: SharedState,
     snapshot: SyncSnapshot,
     log_expanded: bool,
+    file_tree: Vec<FileNode>,
+    active_tab: SideTab,
+    last_tree_refresh: Instant,
 }
 
 enum Screen {
@@ -99,6 +104,13 @@ pub enum Message {
     ToggleLogPanel,
     OpenSyncFolder,
 
+    // File tree
+    ToggleNodeExpanded(usize),
+    ToggleNodeIncluded(usize),
+
+    // Side panel tab
+    SelectTab(SideTab),
+
     // Conflicts
     OpenConflictFolder(usize),
     DismissConflict(usize),
@@ -122,12 +134,16 @@ impl FileSyncGui {
                 let manager = Arc::new(SyncManager::new(shared.clone()));
                 let snapshot = shared.read().clone();
                 manager.start(cfg.clone());
+                let file_tree = scan_file_tree(&cfg.sync_root);
                 Screen::Dashboard(DashboardState {
                     config: cfg,
                     manager,
                     state: shared,
                     snapshot,
                     log_expanded: false,
+                    file_tree,
+                    active_tab: SideTab::Stats,
+                    last_tree_refresh: Instant::now(),
                 })
             }
             _ => Screen::Setup(SetupState::default()),
@@ -241,12 +257,16 @@ impl FileSyncGui {
                     let manager = Arc::new(SyncManager::new(shared.clone()));
                     let snapshot = shared.read().clone();
                     manager.start(cfg.clone());
+                    let file_tree = scan_file_tree(&cfg.sync_root);
                     self.screen = Screen::Dashboard(DashboardState {
                         config: cfg,
                         manager,
                         state: shared,
                         snapshot,
                         log_expanded: false,
+                        file_tree,
+                        active_tab: SideTab::Stats,
+                        last_tree_refresh: Instant::now(),
                     });
                 }
                 Task::none()
@@ -265,6 +285,18 @@ impl FileSyncGui {
 
                 if let Screen::Dashboard(d) = &mut self.screen {
                     d.snapshot = d.state.read().clone();
+                    // Auto-switch to Conflicts tab when conflicts appear.
+                    if !d.snapshot.conflicts.is_empty() && d.active_tab == SideTab::Stats {
+                        d.active_tab = SideTab::Conflicts;
+                    } else if d.snapshot.conflicts.is_empty() && d.active_tab == SideTab::Conflicts
+                    {
+                        d.active_tab = SideTab::Stats;
+                    }
+                    // Periodically refresh the file tree from disk.
+                    if d.last_tree_refresh.elapsed() >= std::time::Duration::from_secs(5) {
+                        d.file_tree = refresh_file_tree(&d.file_tree, &d.config.sync_root);
+                        d.last_tree_refresh = Instant::now();
+                    }
                 }
                 Task::none()
             }
@@ -345,6 +377,29 @@ impl FileSyncGui {
             }
 
             // ── Window management ─────────────────────────────────────────────
+            // ── File tree messages ────────────────────────────────────────────
+            Message::ToggleNodeExpanded(id) => {
+                if let Screen::Dashboard(d) = &mut self.screen {
+                    toggle_expanded(&mut d.file_tree, id);
+                }
+                Task::none()
+            }
+
+            Message::ToggleNodeIncluded(id) => {
+                if let Screen::Dashboard(d) = &mut self.screen {
+                    toggle_included(&mut d.file_tree, id);
+                }
+                Task::none()
+            }
+
+            // ── Side panel tab ────────────────────────────────────────────────
+            Message::SelectTab(tab) => {
+                if let Screen::Dashboard(d) = &mut self.screen {
+                    d.active_tab = tab;
+                }
+                Task::none()
+            }
+
             Message::CaptureWindowId(id) => {
                 if self.window_id.is_none() {
                     self.window_id = Some(id);
@@ -487,20 +542,16 @@ fn view_setup_folder(s: &SetupState) -> Element<'_, Message> {
             .size(13)
             .style(theme::secondary),
         vspace(20),
-        text("Folder path")
-            .size(13)
-            .style(theme::secondary),
+        text("Folder path").size(13).style(theme::secondary),
         vspace(6),
         input_row,
     ]
     .spacing(0);
 
     if let Some(e) = &s.error {
-        inner = inner.push(vspace(10)).push(
-            text(e.as_str())
-                .size(13)
-                .style(theme::red_text),
-        );
+        inner = inner
+            .push(vspace(10))
+            .push(text(e.as_str()).size(13).style(theme::red_text));
     }
     inner = inner.push(vspace(24)).push(row![
         hspace_fill(),
@@ -534,9 +585,7 @@ fn view_setup_server(s: &SetupState) -> Element<'_, Message> {
             .padding(10)
             .size(14),
         vspace(14),
-        text("Auth token")
-            .size(13)
-            .style(theme::secondary),
+        text("Auth token").size(13).style(theme::secondary),
         vspace(6),
         text_input("your-secret-token", &s.token_input)
             .on_input(Message::TokenInput)
@@ -548,11 +597,9 @@ fn view_setup_server(s: &SetupState) -> Element<'_, Message> {
     .spacing(0);
 
     if let Some(e) = &s.error {
-        inner = inner.push(vspace(10)).push(
-            text(e.as_str())
-                .size(13)
-                .style(theme::red_text),
-        );
+        inner = inner
+            .push(vspace(10))
+            .push(text(e.as_str()).size(13).style(theme::red_text));
     }
     inner = inner.push(vspace(24)).push(row![
         button("\u{2190} Back")
@@ -584,18 +631,19 @@ fn view_setup_review(s: &SetupState) -> Element<'_, Message> {
         vspace(10),
         review_row("Server", s.server_input.clone()),
         vspace(10),
-        review_row("Auth token", "\u{25CF}\u{25CF}\u{25CF}\u{25CF}\u{25CF}\u{25CF}\u{25CF}\u{25CF}".to_owned()),
+        review_row(
+            "Auth token",
+            "\u{25CF}\u{25CF}\u{25CF}\u{25CF}\u{25CF}\u{25CF}\u{25CF}\u{25CF}".to_owned()
+        ),
         vspace(16),
         thin_rule(),
     ]
     .spacing(0);
 
     if let Some(e) = &s.error {
-        inner = inner.push(vspace(10)).push(
-            text(e.as_str())
-                .size(13)
-                .style(theme::red_text),
-        );
+        inner = inner
+            .push(vspace(10))
+            .push(text(e.as_str()).size(13).style(theme::red_text));
     }
     inner = inner.push(vspace(24)).push(row![
         button("\u{2190} Back")
@@ -619,7 +667,7 @@ fn view_dashboard(d: &DashboardState) -> Element<'_, Message> {
 
     let header = components::header::view(&snap.status);
     let status_panel = components::status_panel::view(snap, is_paused);
-    let main_area = main_content(snap, &d.config);
+    let main_area = main_content(d);
     let log_panel = components::log_panel::view(&snap.log, d.log_expanded);
 
     let root = column![
@@ -645,35 +693,147 @@ fn view_dashboard(d: &DashboardState) -> Element<'_, Message> {
         .into()
 }
 
-/// Main content area: stats when no conflicts, stats + conflicts panel side by side.
-fn main_content<'a>(snap: &'a SyncSnapshot, config: &'a GuiConfig) -> Element<'a, Message> {
-    let server_addr = config.server_addr.clone();
-    let sync_root = config.sync_root.to_string_lossy().to_string();
-    let stats = components::stats_panel::view(snap, server_addr, sync_root);
+/// File tree (left, 3 parts) + side panel with tabs (right, 2 parts).
+fn main_content(d: &DashboardState) -> Element<'_, Message> {
+    let tree = components::file_tree::view(&d.file_tree);
+    let side = components::side_panel::view(&d.snapshot, &d.active_tab);
 
-    if snap.conflicts.is_empty() {
-        container(stats)
-            .width(Length::Fill)
+    row![
+        container(tree)
+            .width(Length::FillPortion(3))
             .height(Length::Fill)
-            .padding(16)
-            .into()
-    } else {
-        let conflicts = components::conflicts::view(&snap.conflicts);
+            .padding(16),
+        container(side)
+            .width(Length::FillPortion(2))
+            .height(Length::Fill)
+            .padding(16),
+    ]
+    .spacing(0)
+    .height(Length::Fill)
+    .into()
+}
 
-        row![
-            container(stats)
-                .width(Length::FillPortion(3))
-                .height(Length::Fill)
-                .padding(16),
-            container(conflicts)
-                .width(Length::FillPortion(2))
-                .height(Length::Fill)
-                .padding(16),
-        ]
-        .spacing(0)
-        .height(Length::Fill)
-        .into()
+// ─── Tree mutation helpers ────────────────────────────────────────────────────
+
+fn toggle_expanded(nodes: &mut Vec<FileNode>, id: usize) {
+    for node in nodes.iter_mut() {
+        if node.id == id && node.is_dir {
+            node.expanded = !node.expanded;
+            return;
+        }
+        toggle_expanded(&mut node.children, id);
     }
+}
+
+fn toggle_included(nodes: &mut Vec<FileNode>, id: usize) {
+    for node in nodes.iter_mut() {
+        if node.id == id {
+            node.included = !node.included;
+            if node.is_dir {
+                set_all_included(&mut node.children, node.included);
+            }
+            return;
+        }
+        toggle_included(&mut node.children, id);
+    }
+}
+
+fn set_all_included(nodes: &mut Vec<FileNode>, included: bool) {
+    for node in nodes.iter_mut() {
+        node.included = included;
+        set_all_included(&mut node.children, included);
+    }
+}
+
+/// Scans the filesystem at `root` and builds a full tree of [`FileNode`]s.
+fn scan_file_tree(root: &std::path::Path) -> Vec<FileNode> {
+    let mut next_id: usize = 0;
+    let name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| root.to_string_lossy().to_string());
+
+    let children = scan_dir_recursive(root, &mut next_id);
+    next_id += 1;
+    // Root node starts expanded so the user sees top-level contents.
+    vec![FileNode::dir(
+        next_id,
+        &name,
+        &root.to_string_lossy(),
+        children,
+    )]
+}
+
+/// Recursively reads a directory and returns sorted child [`FileNode`]s.
+/// Directories are listed before files; both groups are sorted alphabetically.
+fn scan_dir_recursive(dir: &std::path::Path, next_id: &mut usize) -> Vec<FileNode> {
+    let mut entries: Vec<std::fs::DirEntry> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
+        Err(_) => return vec![],
+    };
+
+    // Directories first, then alphabetical within each group.
+    entries.sort_by(|a, b| {
+        let a_dir = a.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let b_dir = b.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        match (a_dir, b_dir) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.file_name().cmp(&b.file_name()),
+        }
+    });
+
+    let mut nodes = Vec::new();
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().to_string();
+        // Skip hidden files/directories.
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        let path_str = path.to_string_lossy().to_string();
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+
+        *next_id += 1;
+        let id = *next_id;
+        if is_dir {
+            let children = scan_dir_recursive(&path, next_id);
+            let mut node = FileNode::dir(id, &name, &path_str, children);
+            node.expanded = false; // child dirs start collapsed
+            nodes.push(node);
+        } else {
+            nodes.push(FileNode::file(id, &name, &path_str));
+        }
+    }
+    nodes
+}
+
+/// Collects per-node user state (expanded, included) keyed by path.
+fn collect_tree_state(nodes: &[FileNode], map: &mut HashMap<String, (bool, bool)>) {
+    for node in nodes {
+        map.insert(node.path.clone(), (node.expanded, node.included));
+        collect_tree_state(&node.children, map);
+    }
+}
+
+/// Applies previously collected user state onto a freshly scanned tree.
+fn apply_tree_state(nodes: &mut [FileNode], map: &HashMap<String, (bool, bool)>) {
+    for node in nodes {
+        if let Some(&(expanded, included)) = map.get(&node.path) {
+            node.expanded = expanded;
+            node.included = included;
+        }
+        apply_tree_state(&mut node.children, map);
+    }
+}
+
+/// Re-scans the filesystem and merges user state from the old tree.
+fn refresh_file_tree(old_tree: &[FileNode], root: &std::path::Path) -> Vec<FileNode> {
+    let mut state_map = HashMap::new();
+    collect_tree_state(old_tree, &mut state_map);
+    let mut new_tree = scan_file_tree(root);
+    apply_tree_state(&mut new_tree, &state_map);
+    new_tree
 }
 
 // ─── Setup helpers ────────────────────────────────────────────────────────────
