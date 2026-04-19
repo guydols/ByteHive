@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <strong>Your infrastructure. Your data. No compromises.</strong><br>
+  <strong>Your infrastructure. Your data. No nonsense.</strong><br>
   A self-hosted cloud server framework with a plugin architecture for composable, focused applications.
 </p>
 
@@ -14,15 +14,16 @@
 </p>
 
 > [!WARNING]
-> **Experimental (v0.1.0)** — file integrity is not guaranteed 100%. Linux only.
-
+> **Experimental (v0.1.0)** - There can be bugs. Linux only.
+> A stress test has ran for 100 hours without a single failure.
+> Tests do not yet cover all paths and possibilities.
 ---
 
 ## Features
 
 ### ⚡ Fast
 
-BLAKE3 hashing, parallel I/O, and a compact wire format — sync stays out of your way.
+BLAKE3 hashing, parallel I/O, and a compact wire format - sync stays out of your way.
 
 <details>
 <summary>Details</summary>
@@ -30,7 +31,7 @@ BLAKE3 hashing, parallel I/O, and a compact wire format — sync stays out of yo
 - Parallel file hashing (4 rayon threads) and parallel reading (4 reader threads)
 - Small files (< 8 MiB) batched into bundles (up to 8 MiB / 500 files); large files streamed in 8 MiB chunks with retransmit
 - bincode + LZ4 compressed wire format with 4-byte length prefix
-- inotify watcher with 200 ms debounce and 500 ms stability checks — changes picked up near-instantly
+- inotify watcher with 200 ms debounce and 500 ms stability checks - changes picked up near-instantly
 - Bounded message bus queues (256 messages) with automatic dead-subscriber GC
 </details>
 
@@ -55,11 +56,11 @@ One binary, one config file, one command to start. First-run wizard gets you goi
 <details>
 <summary>Details</summary>
 
-- Single TOML config with `[framework]` and `[apps.<name>]` sections — auto-persisted with format-preserving splicing
-- Web assets embedded directly into the binary — nothing to deploy separately
-- First-run setup wizard when no users exist — just open a browser
+- Single TOML config with `[framework]` and `[apps.<name>]` sections - auto-persisted with format-preserving splicing
+- Web assets embedded directly into the binary - nothing to deploy separately
+- First-run setup wizard when no users exist - just open a browser
 - Built-in web file manager with Monaco editor, file preview, upload/download, and share links
-- Bidirectional file sync that just works — conflict copies are created automatically
+- Bidirectional file sync that just works - conflict copies are created automatically
 </details>
 
 ### 🧩 Extensible
@@ -71,8 +72,8 @@ A plugin architecture that gives each app its own namespace, message topics, and
 
 - Apps implement the `App` trait (`manifest()`, `start()`, `stop()`, `handle_http()`, `on_message()`) managed by the `AppRegistry`
 - Pub/sub message bus with dot-separated topics and wildcard subscriptions (`filesync.*`, `*`)
-- SSE event stream at `/api/core/events` — every bus message available to the browser in real time
-- Axum HTTP server with proxy routing under `/api/*` and `/apps/*` — each app gets its own route space
+- SSE event stream at `/api/core/events` - every bus message available to the browser in real time
+- Axum HTTP server with proxy routing under `/api/*` and `/apps/*` - each app gets its own route space
 - Full user, group, and API key management via admin API
 </details>
 
@@ -80,15 +81,11 @@ A plugin architecture that gives each app its own namespace, message topics, and
 
 ## Screenshots
 
-<p align="center">
-  <em>Screenshots coming soon.</em>
-</p>
-
 | | |
 |:---:|:---:|
-| ![Dashboard](https://via.placeholder.com/480x270?text=Dashboard) | ![FileBrowser](https://via.placeholder.com/480x270?text=File+Browser) |
+| ![Dashboard](screenshots/dashboard.png) | ![FileBrowser](screenshots/filebrowser.png) |
 | **Dashboard** | **File Browser** |
-| ![FileSync](https://via.placeholder.com/480x270?text=FileSync+Status) | ![Editor](https://via.placeholder.com/480x270?text=Monaco+Editor) |
+| ![FileSync](screenshots/filesync-gui.png) | ![Editor](screenshots/editor.png) |
 | **FileSync Status** | **Monaco Editor** |
 
 ---
@@ -101,7 +98,7 @@ cargo build --release
 ./target/release/bytehive --config config.toml
 ```
 
-On first run with no users, navigate to `http://<host>:9000/` — you will be redirected to the setup wizard.
+On first run with no users, navigate to `http://<host>:9000/` - you will be redirected to the setup wizard.
 
 <details>
 <summary>Example configuration</summary>
@@ -127,10 +124,10 @@ allow_delete  = true
 
 ## Documentation
 
-- [Architecture](docs/ARCHITECTURE.md) — system design, module map, `App` trait contract
-- [Usage Guide](docs/USAGE.md) — setup and day-to-day usage
-- [FileSync](crates/filesync/README.md) — sync protocol and configuration
-- [FileBrowser](crates/filebrowser/README.md) — file manager details
+- [Architecture](docs/ARCHITECTURE.md) - system design, module map, `App` trait contract
+- [Usage Guide](docs/USAGE.md) - setup and day-to-day usage
+- [FileSync](crates/filesync/README.md) - sync protocol and configuration
+- [FileBrowser](crates/filebrowser/README.md) - file manager details
 
 ## License
 
