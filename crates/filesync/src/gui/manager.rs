@@ -72,6 +72,20 @@ fn session_loop(
     let node_id = format!("gui-{:x}", timestamp_id());
     let engine = Arc::new(SyncEngine::new(cfg.sync_root.clone(), node_id, exclusions));
 
+    // ── Eager local scan ──────────────────────────────────────────────────
+    // Show local file/dir/byte counts immediately, even before the first
+    // server session completes.  This way the Stats panel is never stuck
+    // at zero while waiting for a connection.
+    match engine.scan() {
+        Ok(_) => {
+            refresh_manifest_stats(&engine, &state);
+            state.write().log_event("Local folder scanned.");
+        }
+        Err(e) => {
+            state.write().log_event(format!("Initial scan failed: {e}"));
+        }
+    }
+
     loop {
         if stopped.load(Ordering::SeqCst) {
             break;

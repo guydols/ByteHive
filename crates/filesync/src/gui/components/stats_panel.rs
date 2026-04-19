@@ -1,63 +1,73 @@
-//! Statistics panel — shown in the main content area when there are no conflicts.
-//! Displays file/dir counts, transfer stats, and config info.
+//! Sync statistics panel — displayed in the Stats tab of the side panel.
+//!
+//! Shows totals for files, directories, transfer volume, and the last
+//! activity timestamp. Each stat is rendered as a labelled card.
 
 use iced::{
-    Alignment, Background, Border, Element, Length,
     widget::{column, container, row, text, Space},
+    Alignment, Background, Border, Color, Element, Length,
 };
 
 use crate::gui::app::Message;
 use crate::gui::state::SyncSnapshot;
 use crate::gui::theme;
 
-pub fn view(snap: &SyncSnapshot, server_addr: String, sync_root: String) -> Element<'static, Message> {
-    let heading = text("Sync Statistics")
-        .size(13)
-        .style(theme::muted);
+pub fn view(snap: &SyncSnapshot) -> Element<'static, Message> {
+    let total_files = format_count(snap.file_count as u64);
+    let total_dirs = format_count(snap.dir_count as u64);
+    let total_bytes = format_bytes(snap.total_bytes);
+    let bytes_sent = format_bytes(snap.bytes_sent);
+    let bytes_received = format_bytes(snap.bytes_received);
 
-    let stats_row = row![
-        stat_card("Files", snap.file_count.to_string()),
-        Space::new().width(12),
-        stat_card("Dirs", snap.dir_count.to_string()),
-        Space::new().width(12),
-        stat_card("Total size", fmt_bytes(snap.total_bytes)),
-    ]
-    .width(Length::Fill);
-
-    let transfer_row = row![
-        stat_card("Sent", fmt_bytes(snap.bytes_sent)),
-        Space::new().width(12),
-        stat_card("Received", fmt_bytes(snap.bytes_received)),
-        Space::new().width(12),
-        stat_card(
-            "Last active",
+    let row1 = stat_row(
+        stat_card("Files", total_files, theme::AMBER),
+        stat_card("Directories", total_dirs, theme::AMBER),
+    );
+    let row2 = stat_row(
+        stat_card("Total Size", total_bytes, theme::TEXT_SECONDARY),
+        stat_card("Sent", bytes_sent, theme::GREEN),
+    );
+    let row3 = stat_row(
+        stat_card("Received", bytes_received, theme::TEXT_SECONDARY),
+        last_active_card(
             snap.last_connected
                 .map(|t| format!("{} s ago", t.elapsed().as_secs()))
                 .unwrap_or_else(|| "\u{2014}".into()),
         ),
-    ]
-    .width(Length::Fill);
+    );
 
-    let config_row = row![
-        text(server_addr)
-            .size(13)
-            .style(theme::secondary),
-        Space::new().width(8),
-        text("\u{2192}").size(13).style(theme::muted),
-        Space::new().width(8),
-        text(sync_root)
-            .size(13)
-            .style(theme::amber_text),
-    ]
-    .align_y(Alignment::Center);
-
-    let config_container = container(config_row)
+    column![row1, row2, row3]
+        .spacing(10)
         .width(Length::Fill)
-        .padding([10, 16])
+        .into()
+}
+
+// ─── Individual card ──────────────────────────────────────────────────────────
+
+fn stat_card(label: &'static str, value: String, value_color: Color) -> Element<'static, Message> {
+    let value_widget =
+        text(value)
+            .size(22)
+            .style(move |_: &iced::Theme| iced::widget::text::Style {
+                color: Some(value_color),
+            });
+
+    let label_widget = text(label).size(11).style(theme::muted);
+
+    let inner = column![value_widget, Space::new().height(4), label_widget].spacing(0);
+
+    container(inner)
+        .width(Length::Fill)
+        .padding(iced::Padding::from([14, 14]))
         .style(|_| {
             use iced::widget::container;
             container::Style {
-                background: Some(Background::Color(theme::BG_SURFACE)),
+                background: Some(Background::Color(Color {
+                    r: 0.14,
+                    g: 0.14,
+                    b: 0.17,
+                    a: 1.0,
+                })),
                 border: Border {
                     color: theme::BORDER,
                     width: 1.0,
@@ -65,64 +75,77 @@ pub fn view(snap: &SyncSnapshot, server_addr: String, sync_root: String) -> Elem
                 },
                 ..Default::default()
             }
-        });
-
-    let inner = column![
-        heading,
-        Space::new().height(12),
-        stats_row,
-        Space::new().height(12),
-        transfer_row,
-        Space::new().height(16),
-        config_container,
-    ]
-    .spacing(0);
-
-    container(inner)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding(12)
-        .style(theme::panel)
+        })
         .into()
 }
 
-fn stat_card(label_str: &'static str, value_str: String) -> Element<'static, Message> {
-    container(
-        column![
-            text(value_str)
-                .size(20)
-                .style(|_: &iced::Theme| iced::widget::text::Style {
-                    color: Some(theme::TEXT_PRIMARY),
-                }),
-            Space::new().height(2),
-            text(label_str)
-                .size(12)
-                .style(theme::muted),
-        ]
-        .spacing(0),
-    )
-    .width(Length::Fill)
-    .padding([14, 16])
-    .style(|_| {
-        use iced::widget::container;
-        container::Style {
-            background: Some(Background::Color(theme::BG_SURFACE)),
-            border: Border {
-                color: theme::BORDER,
-                width: 1.0,
-                radius: 8.0.into(),
-            },
-            ..Default::default()
-        }
-    })
-    .into()
+fn last_active_card(timestamp: String) -> Element<'static, Message> {
+    let value_widget = text(timestamp).size(13).style(theme::secondary);
+
+    let label_widget = text("Last Active").size(11).style(theme::muted);
+
+    let inner = column![value_widget, Space::new().height(4), label_widget].spacing(0);
+
+    container(inner)
+        .width(Length::Fill)
+        .padding(iced::Padding::from([14, 14]))
+        .style(|_| {
+            use iced::widget::container;
+            container::Style {
+                background: Some(Background::Color(Color {
+                    r: 0.14,
+                    g: 0.14,
+                    b: 0.17,
+                    a: 1.0,
+                })),
+                border: Border {
+                    color: theme::BORDER,
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                ..Default::default()
+            }
+        })
+        .into()
 }
 
-fn fmt_bytes(b: u64) -> String {
-    match b {
-        0..1_024 => format!("{b} B"),
-        1_024..1_048_576 => format!("{:.1} KiB", b as f64 / 1_024.0),
-        1_048_576..1_073_741_824 => format!("{:.1} MiB", b as f64 / 1_048_576.0),
-        _ => format!("{:.2} GiB", b as f64 / 1_073_741_824.0),
+/// Lays two cards side by side with equal width.
+fn stat_row(
+    left: Element<'static, Message>,
+    right: Element<'static, Message>,
+) -> Element<'static, Message> {
+    row![left, Space::new().width(10), right]
+        .align_y(Alignment::Start)
+        .width(Length::Fill)
+        .into()
+}
+
+// ─── Formatting helpers ───────────────────────────────────────────────────────
+
+fn format_count(n: u64) -> String {
+    let s = n.to_string();
+    let mut result = String::new();
+    for (i, ch) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(ch);
+    }
+    result.chars().rev().collect()
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.0} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
     }
 }

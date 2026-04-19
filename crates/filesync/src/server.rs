@@ -302,7 +302,21 @@ fn handle_client(
     })?;
     debug!("filesync: sent Hello response to {client_id}");
 
-    let local = engine.scan()?;
+    // Use the cached manifest from the initial (or most recent periodic) scan
+    // when available, rather than blocking on a full re-walk + BLAKE3 hash of
+    // every file.  A fresh scan of a large tree (tens of thousands of dirs)
+    // can take minutes and starves the client waiting for ManifestExchange.
+    let cached = engine.get_manifest();
+    let local = if cached.files.is_empty() {
+        debug!("filesync: no cached manifest yet, running full scan for {client_id}");
+        engine.scan()?
+    } else {
+        debug!(
+            "filesync: reusing cached manifest for {client_id} ({} entries)",
+            cached.files.len()
+        );
+        cached
+    };
     let l_files = local.files.values().filter(|m| !m.is_dir).count();
     let l_dirs = local.files.values().filter(|m| m.is_dir).count();
     let l_bytes: u64 = local.files.values().map(|m| m.size).sum();
@@ -904,7 +918,7 @@ fn local_change_broadcaster(
         }
 
         if pending.should_flush() {
-            debug!("filesync server: flushing local changes");
+            // debug!("filesync server: flushing local changes");
             flush_local_changes(&engine, &peers, &bus, &mut pending);
         }
     }

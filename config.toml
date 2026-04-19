@@ -23,7 +23,7 @@ http_token = ""
 # Leave empty to use the built-in portal.
 web_root = ""
 
-log_level = "debug"
+log_level = "info"
 
 
 # =============================================================================
@@ -166,25 +166,72 @@ created_at = 1773176839540
 # -----------------------------------------------------------------------------
 
 [apps.filesync]
-root      = "/home/guy/Desktop/bytehive/server/"
+root      = "/home/guy/cloud/"
 mode      = "server"
 bind_addr = "0.0.0.0:7878"
 
 # Authentication: server validates clients via the framework UserStore.
 # No extra config needed for the server.  Clients set auth_token below.
 
-# Example exclusion rules — uncomment and adapt as needed:
-# exclude_patterns = [
-#     "*.log",          # all log files at the root level
-#     "build/**",       # everything inside build/
-#     "**/.cache/**",   # any .cache directory anywhere in the tree
-#     "tmp_?.dat",      # single-char wildcard: tmp_a.dat, tmp_b.dat …
-# ]
-# exclude_regex = [
-#     '.*\.(tmp|bak|swp)$',   # temporary/swap files
-#     '^private/',             # private/ directory at root
-#     'node_modules',          # any node_modules path component
-# ]
+exclude_patterns = [
+    # ── Python ────────────────────────────────────────────────
+    "**/venv/**",
+    "**/.venv/**",
+    "**/env/**",
+    "**/__pycache__/**",
+    "**/*.pyc",
+    "**/*.pyo",
+    "**/*.pyd",
+    "**/.pytest_cache/**",
+    "**/*.egg-info/**",
+    "**/dist/**",
+    "**/.mypy_cache/**",
+    "**/.ruff_cache/**",
+
+    # ── C / C++ ───────────────────────────────────────────────
+    "**/build/**",
+    "**/cmake-build-*/**",
+
+    # ── PlatformIO ────────────────────────────────────────────
+    "**/.pio/**",
+    "**/.pioenvs/**",
+    "**/.piolibdeps/**",
+
+    # ── Rust ──────────────────────────────────────────────────
+    "**/target/**",
+
+    # ── Node / JS ─────────────────────────────────────────────
+    "**/node_modules/**",
+
+    # ── General OS & editor noise ─────────────────────────────
+    "**/.DS_Store",
+    "**/Thumbs.db",
+    "**/*.tmp",
+    "**/*.bak",
+    "**/*.swp",
+    "**/*.swo",
+    "**/*~",
+    "**/.Trash-*/**",
+
+    # ── Logs & runtime artifacts ──────────────────────────────
+    "**/*.log",
+    "**/logs/**",
+    "**/tmp/**",
+    "**/temp/**",
+    "**/.cache/**",
+]
+
+exclude_regex = [
+    '.*\.pyc$',
+    '.*\.pyo$',
+    '.*\.(o|d|elf|map)$',
+    '(^|/)target/',
+    '(^|/)\.pio/',
+    '.*\.(tmp|bak|swp|swo)$',
+    '.*~$',
+    '(^|/)\.DS_Store$',
+    '(^|/)Thumbs\.db$',
+]
 
 
 # Client example (separate machine or second instance):
@@ -204,10 +251,10 @@ max_upload_mb = 200
 allow_delete  = false
 
 [[filesync_known_clients]]
-node_id = "gui-18a6040ceed3180d"
+node_id = "gui-18a782eb7111ab17"
 fingerprint = "30a9affdb0b18df66302e9c0b9ad6680490a428fd215e63a78b9b49053f0e372"
 label = ""
 status = "allowed"
-addr = "127.0.0.1:33536"
-first_seen_ms = 1776111556666
-last_seen_ms = 1776111581775
+addr = "127.0.0.1:54560"
+first_seen_ms = 1776532525762
+last_seen_ms = 1776604627158
