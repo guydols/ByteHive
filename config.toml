@@ -161,7 +161,7 @@ created_at = 1773176839540
 #     r"node_modules"      any path containing node_modules
 #
 #   Both lists are OR-combined: a path is excluded when ANY rule matches.
-#   The built-in always-ignored list (.git, .DS_Store, .filesync_tmp, …)
+#   The built-in always-ignored list (.git, .DS_Store, .bh_filesync, …)
 #   is applied before these rules and cannot be overridden.
 # -----------------------------------------------------------------------------
 

@@ -1450,6 +1450,11 @@
                     height: 48px;
                 }
             }
+            .tbtn.active {
+                color: var(--bh-hi);
+                border-color: rgba(255, 172, 28, 0.45);
+                background: rgba(255, 172, 28, 0.08);
+            }
         </style>
     </head>
     <body>
@@ -1629,6 +1634,17 @@
                     <button
                         class="tbtn tbtn-ic"
                         type="button"
+                        id="btn-hidden-toggle"
+                        onclick="toggleHidden()"
+                        title="Show dotfiles (H)"
+                    >
+                        <span class="material-icons" aria-hidden="true"
+                            >visibility_off</span
+                        >
+                    </button>
+                    <button
+                        class="tbtn tbtn-ic"
+                        type="button"
                         onclick="refresh()"
                         title="Refresh (R)"
                     >
@@ -1802,7 +1818,7 @@
                         type="text"
                         id="mkdir-name"
                         placeholder="folder-name"
-                        onkeydown="if(event.key==='Enter')doMkdir()"
+                        onkeydown="if (event.key === 'Enter') doMkdir();"
                         autocorrect="off"
                         autocapitalize="off"
                     />
@@ -1833,7 +1849,7 @@
                     <input
                         type="text"
                         id="rename-new"
-                        onkeydown="if(event.key==='Enter')doRename()"
+                        onkeydown="if (event.key === 'Enter') doRename();"
                         autocorrect="off"
                         autocapitalize="off"
                     />
@@ -1871,7 +1887,7 @@
                         type="text"
                         id="copy-to"
                         placeholder="folder/newname.txt"
-                        onkeydown="if(event.key==='Enter')doCopy()"
+                        onkeydown="if (event.key === 'Enter') doCopy();"
                         autocorrect="off"
                         autocapitalize="off"
                     />
@@ -2008,8 +2024,10 @@
         <script>
             let currentPath = "",
                 allEntries = [],
+                allSearchResults = [],
                 displayEntries = [],
                 selected = new Set();
+            let showHidden = localStorage.getItem("fb-show-hidden") === "true";
             let treeExpanded = new Set(),
                 treeCache = {};
             let renameFrom = null,
@@ -2027,20 +2045,94 @@
             let searchDebounce = null,
                 isSearchMode = false;
             const IMAGE_EXTS = new Set([
-                "png","jpg","jpeg","gif","webp","svg","bmp","ico","avif","tiff","tif",
+                "png",
+                "jpg",
+                "jpeg",
+                "gif",
+                "webp",
+                "svg",
+                "bmp",
+                "ico",
+                "avif",
+                "tiff",
+                "tif",
             ]);
             const VIDEO_EXTS = new Set(["mp4", "webm", "ogv", "mov"]);
             const AUDIO_EXTS = new Set([
-                "mp3","ogg","oga","wav","flac","aac","m4a","opus",
+                "mp3",
+                "ogg",
+                "oga",
+                "wav",
+                "flac",
+                "aac",
+                "m4a",
+                "opus",
             ]);
             const TEXT_EXTS = new Set([
-                "txt","md","rst","html","htm","css","scss","js","ts","jsx","tsx",
-                "mjs","json","jsonc","yml","yaml","toml","ini","cfg","conf","env",
-                "rs","py","rb","go","java","c","cpp","cc","h","hpp","cs","sh",
-                "bash","zsh","sql","kt","swift","lua","r","pl","ex","exs","hs",
-                "scala","proto","graphql","gql","tf","hcl","nix","vue","svelte",
-                "astro","xml","csv","dockerfile","makefile","gitignore","lock",
-                "fish","ps1","bat","cmd",
+                "txt",
+                "md",
+                "rst",
+                "html",
+                "htm",
+                "css",
+                "scss",
+                "js",
+                "ts",
+                "jsx",
+                "tsx",
+                "mjs",
+                "json",
+                "jsonc",
+                "yml",
+                "yaml",
+                "toml",
+                "ini",
+                "cfg",
+                "conf",
+                "env",
+                "rs",
+                "py",
+                "rb",
+                "go",
+                "java",
+                "c",
+                "cpp",
+                "cc",
+                "h",
+                "hpp",
+                "cs",
+                "sh",
+                "bash",
+                "zsh",
+                "sql",
+                "kt",
+                "swift",
+                "lua",
+                "r",
+                "pl",
+                "ex",
+                "exs",
+                "hs",
+                "scala",
+                "proto",
+                "graphql",
+                "gql",
+                "tf",
+                "hcl",
+                "nix",
+                "vue",
+                "svelte",
+                "astro",
+                "xml",
+                "csv",
+                "dockerfile",
+                "makefile",
+                "gitignore",
+                "lock",
+                "fish",
+                "ps1",
+                "bat",
+                "cmd",
             ]);
 
             /* ── Mobile sidebar ── */
@@ -2065,6 +2157,7 @@
                 .addEventListener("click", closeSidebar);
 
             async function init() {
+                updateHiddenToggleUI();
                 await navTo("");
                 setupDrop();
                 setupKeyboard();
@@ -2094,9 +2187,11 @@
                     }
                     const d = await r.json();
                     allEntries = d.entries || [];
-                    displayEntries = sortEntries([...allEntries]);
+                    displayEntries = sortEntries(
+                        applyHiddenFilter([...allEntries]),
+                    );
                     renderView();
-                    setStatus(allEntries.length + " items");
+                    setStatus(displayEntries.length + " items");
                 } catch (e) {
                     setStatus("Error: " + e.message);
                 }
@@ -2109,11 +2204,49 @@
                 }
                 document
                     .querySelectorAll("thead th")
-                    .forEach((th) => (th.className = th.className.replace(/\s*(sort-asc|sort-desc)/g, "")));
+                    .forEach(
+                        (th) =>
+                            (th.className = th.className.replace(
+                                /\s*(sort-asc|sort-desc)/g,
+                                "",
+                            )),
+                    );
                 const th = document.getElementById("th-" + field);
-                if (th) th.className += " " + (sortAsc ? "sort-asc" : "sort-desc");
+                if (th)
+                    th.className += " " + (sortAsc ? "sort-asc" : "sort-desc");
                 displayEntries = sortEntries([...displayEntries]);
                 renderView();
+            }
+            function applyHiddenFilter(entries) {
+                if (showHidden) return entries;
+                return entries.filter((e) => !e.name.startsWith("."));
+            }
+            function updateHiddenToggleUI() {
+                const btn = document.getElementById("btn-hidden-toggle");
+                if (!btn) return;
+                const icon = btn.querySelector(".material-icons");
+                icon.textContent = showHidden ? "visibility" : "visibility_off";
+                btn.classList.toggle("active", showHidden);
+                btn.title = showHidden
+                    ? "Hide dotfiles (H)"
+                    : "Show dotfiles (H)";
+            }
+            function toggleHidden() {
+                showHidden = !showHidden;
+                localStorage.setItem("fb-show-hidden", showHidden);
+                updateHiddenToggleUI();
+                if (isSearchMode) {
+                    displayEntries = sortEntries(
+                        applyHiddenFilter([...allSearchResults]),
+                    );
+                } else {
+                    displayEntries = sortEntries(
+                        applyHiddenFilter([...allEntries]),
+                    );
+                }
+                renderView();
+                setStatus(displayEntries.length + " items");
+                renderSidebarTree();
             }
             function sortEntries(arr) {
                 return arr.sort((a, b) => {
@@ -2289,13 +2422,17 @@
                 const name = path.split("/").pop();
                 document.getElementById("lightbox-name").textContent = name;
                 document.getElementById("lightbox-img").style.display = "none";
-                document.getElementById("lightbox-video").style.display = "none";
-                document.getElementById("lightbox-audio-wrap").style.display = "none";
+                document.getElementById("lightbox-video").style.display =
+                    "none";
+                document.getElementById("lightbox-audio-wrap").style.display =
+                    "none";
                 document.getElementById("lightbox-pdf").style.display = "none";
                 const vid = document.getElementById("lightbox-video");
                 const aud = document.getElementById("lightbox-audio");
-                vid.pause(); vid.src = "";
-                aud.pause(); aud.src = "";
+                vid.pause();
+                vid.src = "";
+                aud.pause();
+                aud.src = "";
                 if (IMAGE_EXTS.has(ext)) {
                     const img = document.getElementById("lightbox-img");
                     img.src = url;
@@ -2305,15 +2442,20 @@
                     vid.src = url;
                     vid.style.display = "";
                 } else if (AUDIO_EXTS.has(ext)) {
-                    document.getElementById("lightbox-audio-name").textContent = name;
+                    document.getElementById("lightbox-audio-name").textContent =
+                        name;
                     aud.src = url;
-                    document.getElementById("lightbox-audio-wrap").style.display = "";
+                    document.getElementById(
+                        "lightbox-audio-wrap",
+                    ).style.display = "";
                 } else if (ext === "pdf") {
                     document.getElementById("lightbox-pdf").src = url;
                     document.getElementById("lightbox-pdf").style.display = "";
                 }
-                document.getElementById("lightbox-nav-prev").disabled = lightboxIdx <= 0;
-                document.getElementById("lightbox-nav-next").disabled = lightboxIdx >= lightboxList.length - 1;
+                document.getElementById("lightbox-nav-prev").disabled =
+                    lightboxIdx <= 0;
+                document.getElementById("lightbox-nav-next").disabled =
+                    lightboxIdx >= lightboxList.length - 1;
                 document.getElementById("lightbox").classList.add("open");
             }
             function closeLightbox() {
@@ -2362,22 +2504,30 @@
                     editorPath = path;
                     editorDirty = false;
                     document.getElementById("editor-path").textContent = path;
-                    document.getElementById("editor-lang").textContent = d.language;
+                    document.getElementById("editor-lang").textContent =
+                        d.language;
                     document.getElementById("editor-status").textContent = "";
-                    document.getElementById("editor-dirty").style.display = "none";
-                    document.getElementById("editor-overlay").classList.add("open");
+                    document.getElementById("editor-dirty").style.display =
+                        "none";
+                    document
+                        .getElementById("editor-overlay")
+                        .classList.add("open");
                     require(["vs/editor/editor.main"], function () {
                         const mount = document.getElementById("editor-mount");
                         if (monacoEditor) {
                             monacoEditor.setValue(d.content);
-                            monaco.editor.setModelLanguage(monacoEditor.getModel(), d.language);
+                            monaco.editor.setModelLanguage(
+                                monacoEditor.getModel(),
+                                d.language,
+                            );
                         } else {
                             monacoEditor = monaco.editor.create(mount, {
                                 value: d.content,
                                 language: d.language,
                                 theme: "vs-dark",
                                 fontSize: 13,
-                                fontFamily: "'Geist Mono','Cascadia Code',ui-monospace,monospace",
+                                fontFamily:
+                                    "'Geist Mono','Cascadia Code',ui-monospace,monospace",
                                 fontLigatures: true,
                                 minimap: { enabled: window.innerWidth > 768 },
                                 scrollBeyondLastLine: false,
@@ -2389,12 +2539,16 @@
                                 padding: { top: 12, bottom: 12 },
                             });
                             monacoEditor.onDidChangeCursorPosition((e) => {
-                                document.getElementById("editor-cursor").textContent =
+                                document.getElementById(
+                                    "editor-cursor",
+                                ).textContent =
                                     `Ln ${e.position.lineNumber}, Col ${e.position.column}`;
                             });
                             monacoEditor.onDidChangeModelContent(() => {
                                 editorDirty = true;
-                                document.getElementById("editor-dirty").style.display = "";
+                                document.getElementById(
+                                    "editor-dirty",
+                                ).style.display = "";
                             });
                             monacoEditor.addCommand(
                                 monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS,
@@ -2407,37 +2561,60 @@
                 }
             }
             function closeEditor() {
-                if (editorDirty && !confirm("You have unsaved changes. Discard?"))
+                if (
+                    editorDirty &&
+                    !confirm("You have unsaved changes. Discard?")
+                )
                     return;
-                document.getElementById("editor-overlay").classList.remove("open");
+                document
+                    .getElementById("editor-overlay")
+                    .classList.remove("open");
                 editorDirty = false;
             }
             async function saveFile() {
                 if (!editorPath || !monacoEditor) return;
                 const content = monacoEditor.getValue();
-                document.getElementById("editor-status").textContent = "Saving…";
+                document.getElementById("editor-status").textContent =
+                    "Saving…";
                 try {
                     const r = await fetch("/api/filebrowser/write", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ path: editorPath, content, force: editorForced }),
+                        body: JSON.stringify({
+                            path: editorPath,
+                            content,
+                            force: editorForced,
+                        }),
                     });
                     const d = await r.json();
                     if (r.ok) {
                         editorDirty = false;
-                        document.getElementById("editor-dirty").style.display = "none";
-                        document.getElementById("editor-status").textContent = "✓ Saved";
-                        setTimeout(() => (document.getElementById("editor-status").textContent = ""), 2000);
+                        document.getElementById("editor-dirty").style.display =
+                            "none";
+                        document.getElementById("editor-status").textContent =
+                            "✓ Saved";
+                        setTimeout(
+                            () =>
+                                (document.getElementById(
+                                    "editor-status",
+                                ).textContent = ""),
+                            2000,
+                        );
                     } else {
-                        document.getElementById("editor-status").textContent = "✗ " + (d.error || r.status);
+                        document.getElementById("editor-status").textContent =
+                            "✗ " + (d.error || r.status);
                     }
                 } catch (e) {
-                    document.getElementById("editor-status").textContent = "✗ " + e.message;
+                    document.getElementById("editor-status").textContent =
+                        "✗ " + e.message;
                 }
             }
             function onSearchInput(val) {
                 clearTimeout(searchDebounce);
-                if (!val.trim()) { exitSearch(); return; }
+                if (!val.trim()) {
+                    exitSearch();
+                    return;
+                }
                 searchDebounce = setTimeout(() => doSearch(val.trim()), 350);
             }
             function onSearchKey(e) {
@@ -2448,41 +2625,61 @@
                 }
                 if (e.key === "Enter") {
                     clearTimeout(searchDebounce);
-                    doSearch(document.getElementById("search-box").value.trim());
+                    doSearch(
+                        document.getElementById("search-box").value.trim(),
+                    );
                 }
             }
             async function doSearch(q) {
                 if (!q) return;
                 isSearchMode = true;
-                document.getElementById("search-spinner").classList.add("active");
-                document.getElementById("search-box").closest("#hdr").classList.add("search-mode");
+                document
+                    .getElementById("search-spinner")
+                    .classList.add("active");
+                document
+                    .getElementById("search-box")
+                    .closest("#hdr")
+                    .classList.add("search-mode");
                 setStatus('Searching "' + q + '"…');
                 try {
                     const r = await fetch(
                         `/api/filebrowser/search?path=${encodeURIComponent(currentPath)}&q=${encodeURIComponent(q)}&max_results=300`,
                     );
                     const d = await r.json();
-                    if (!r.ok) { setStatus("Search error: " + (d.error || r.status)); return; }
-                    displayEntries = d.results || [];
+                    if (!r.ok) {
+                        setStatus("Search error: " + (d.error || r.status));
+                        return;
+                    }
+                    allSearchResults = d.results || [];
+                    displayEntries = sortEntries(
+                        applyHiddenFilter([...allSearchResults]),
+                    );
                     renderView();
                     setStatus(
                         (d.truncated ? "300+ " : "") +
                             displayEntries.length +
-                            ' results for "' + q + '"' +
+                            ' results for "' +
+                            q +
+                            '"' +
                             (d.truncated ? " (truncated)" : ""),
                     );
                 } catch (e) {
                     setStatus("Search error: " + e.message);
                 } finally {
-                    document.getElementById("search-spinner").classList.remove("active");
+                    document
+                        .getElementById("search-spinner")
+                        .classList.remove("active");
                 }
             }
             function exitSearch() {
                 isSearchMode = false;
+                allSearchResults = [];
                 document.getElementById("hdr").classList.remove("search-mode");
-                displayEntries = sortEntries([...allEntries]);
+                displayEntries = sortEntries(
+                    applyHiddenFilter([...allEntries]),
+                );
                 renderView();
-                setStatus(allEntries.length + " items");
+                setStatus(displayEntries.length + " items");
             }
             function renderBreadcrumb(path) {
                 const bc = document.getElementById("breadcrumb");
@@ -2500,8 +2697,13 @@
             async function ensureTreeLoaded(path) {
                 if (treeCache[path] !== undefined) return treeCache[path];
                 try {
-                    const r = await fetch("/api/filebrowser/ls?path=" + encodeURIComponent(path));
-                    if (!r.ok) { treeCache[path] = []; return []; }
+                    const r = await fetch(
+                        "/api/filebrowser/ls?path=" + encodeURIComponent(path),
+                    );
+                    if (!r.ok) {
+                        treeCache[path] = [];
+                        return [];
+                    }
                     const d = await r.json();
                     treeCache[path] = (d.entries || [])
                         .filter((e) => e.is_dir)
@@ -2524,22 +2726,32 @@
                 }
             }
             function renderTreeLevel(parentPath, depth) {
-                const dirs = treeCache[parentPath] || [];
+                const dirs = (treeCache[parentPath] || []).filter(
+                    (e) => showHidden || !e.name.startsWith("."),
+                );
                 return dirs
                     .map((e) => {
                         const expanded = treeExpanded.has(e.path);
-                        const active = currentPath === e.path || currentPath.startsWith(e.path + "/");
+                        const active =
+                            currentPath === e.path ||
+                            currentPath.startsWith(e.path + "/");
                         const childDirs = treeCache[e.path];
-                        const couldHaveChildren = childDirs === undefined || childDirs.length > 0;
+                        const couldHaveChildren =
+                            childDirs === undefined || childDirs.length > 0;
                         const padLeft = "calc(.5rem + " + depth * 0.85 + "rem)";
-                        const caretCls = "tree-caret material-icons" + (couldHaveChildren ? "" : " tree-caret-muted");
-                        const caretIcon = expanded ? "expand_more" : "chevron_right";
+                        const caretCls =
+                            "tree-caret material-icons" +
+                            (couldHaveChildren ? "" : " tree-caret-muted");
+                        const caretIcon = expanded
+                            ? "expand_more"
+                            : "chevron_right";
                         return `<div><div class="tree-item${active ? " active" : ""}" style="padding-left:${padLeft}" data-path="${esc(e.path)}" onclick="navTo('${esc(e.path)}')"><span class="${caretCls}" onclick="treeToggle('${esc(e.path)}',event)">${caretIcon}</span><span class="material-icons tree-ic">folder</span><span class="name">${esc(e.name)}</span></div>${expanded ? renderTreeLevel(e.path, depth + 1) : ""}</div>`;
                     })
                     .join("");
             }
             function renderSidebarTree() {
-                document.getElementById("tree-root").innerHTML = renderTreeLevel("", 0);
+                document.getElementById("tree-root").innerHTML =
+                    renderTreeLevel("", 0);
             }
             async function updateTree(activePath) {
                 if (activePath) {
@@ -2561,19 +2773,28 @@
                 if (p.classList.toggle("open")) {
                     const sel = [...selected][0];
                     if (sel) renderPropsPanel(sel);
-                    else p.innerHTML = '<div class="prop-title">Info</div><div style="color:var(--muted);font-size:.75rem;margin-top:.5rem">Select a file to see its properties.</div>';
+                    else
+                        p.innerHTML =
+                            '<div class="prop-title">Info</div><div style="color:var(--muted);font-size:.75rem;margin-top:.5rem">Select a file to see its properties.</div>';
                 }
             }
             function renderPropsPanel(path) {
                 const p = document.getElementById("props-panel");
                 if (!p.classList.contains("open")) return;
-                const e = allEntries.find((x) => x.path === path) || displayEntries.find((x) => x.path === path);
-                if (!e) { p.innerHTML = ""; return; }
+                const e =
+                    allEntries.find((x) => x.path === path) ||
+                    displayEntries.find((x) => x.path === path);
+                if (!e) {
+                    p.innerHTML = "";
+                    return;
+                }
                 const ext = (e.ext || "").toLowerCase();
                 const isImg = IMAGE_EXTS.has(ext);
                 p.innerHTML = `<div class="prop-title">Properties</div>${isImg ? `<img src="/api/filebrowser/thumb?path=${encodeURIComponent(e.path)}" style="width:100%;border-radius:4px;border:1px solid var(--bd);margin:.25rem 0" onerror="this.remove()">` : `<div class="prop-icon">${fileIcon(e)}</div>`}<div class="prop-name">${esc(e.name)}</div><div class="prop-row"><div class="prop-lbl">Type</div><div class="prop-val">${e.is_dir ? "Folder" : (e.ext || "—").toUpperCase()}</div></div><div class="prop-row"><div class="prop-lbl">Size</div><div class="prop-val">${e.is_dir ? "—" : fmtSize(e.size)}</div></div><div class="prop-row"><div class="prop-lbl">Modified</div><div class="prop-val">${fmtDate(e.mtime)}</div></div><div class="prop-row"><div class="prop-lbl">Path</div><div class="prop-val">${esc(e.path)}</div></div><div class="prop-actions">${canPreview(e) ? `<button class="prop-btn accent" onclick="openEntry('${esc(e.path)}',${e.is_dir})">⊙ Open / Preview</button>` : ""}<button class="prop-btn" onclick="downloadFile('${esc(e.path)}')">⬇ Download</button><button class="prop-btn" onclick="quickShare('${esc(e.path)}')">⬡ Share</button><button class="prop-btn" onclick="startRename('${esc(e.path)}','${esc(e.name)}')">✎ Rename</button><button class="prop-btn danger" onclick="deleteSingle('${esc(e.path)}')">✕ Delete</button></div>`;
             }
-            function openUpload() { document.getElementById("file-input").click(); }
+            function openUpload() {
+                document.getElementById("file-input").click();
+            }
             async function uploadFiles(files) {
                 if (!files || !files.length) return;
                 const wrap = document.getElementById("progress-bar-wrap");
@@ -2582,24 +2803,35 @@
                 bar.style.width = "0%";
                 let done = 0;
                 for (const file of files) {
-                    setStatus(`Uploading ${file.name} (${done + 1}/${files.length})…`);
+                    setStatus(
+                        `Uploading ${file.name} (${done + 1}/${files.length})…`,
+                    );
                     try {
                         await new Promise((resolve, reject) => {
                             const xhr = new XMLHttpRequest();
-                            xhr.open("POST", `/api/filebrowser/upload?dir=${encodeURIComponent(currentPath)}&name=${encodeURIComponent(file.name)}`);
+                            xhr.open(
+                                "POST",
+                                `/api/filebrowser/upload?dir=${encodeURIComponent(currentPath)}&name=${encodeURIComponent(file.name)}`,
+                            );
                             xhr.upload.onprogress = (ev) => {
                                 if (ev.lengthComputable) {
-                                    const pct = ((done + ev.loaded / ev.total) / files.length) * 100;
+                                    const pct =
+                                        ((done + ev.loaded / ev.total) /
+                                            files.length) *
+                                        100;
                                     bar.style.width = pct + "%";
                                 }
                             };
                             xhr.onload = () => {
                                 if (xhr.status >= 400) {
-                                    const d = JSON.parse(xhr.responseText || "{}");
+                                    const d = JSON.parse(
+                                        xhr.responseText || "{}",
+                                    );
                                     reject(new Error(d.error || xhr.status));
                                 } else resolve();
                             };
-                            xhr.onerror = () => reject(new Error("Network error"));
+                            xhr.onerror = () =>
+                                reject(new Error("Network error"));
                             xhr.send(file);
                         });
                         done++;
@@ -2615,18 +2847,27 @@
             }
             function setupDrop() {
                 const overlay = document.getElementById("drop-overlay");
-                document.addEventListener("dragover", (e) => { e.preventDefault(); overlay.classList.add("active"); });
-                document.addEventListener("dragleave", (e) => { if (!e.relatedTarget) overlay.classList.remove("active"); });
+                document.addEventListener("dragover", (e) => {
+                    e.preventDefault();
+                    overlay.classList.add("active");
+                });
+                document.addEventListener("dragleave", (e) => {
+                    if (!e.relatedTarget) overlay.classList.remove("active");
+                });
                 document.addEventListener("drop", async (e) => {
                     e.preventDefault();
                     overlay.classList.remove("active");
-                    if (e.dataTransfer.files.length) await uploadFiles(e.dataTransfer.files);
+                    if (e.dataTransfer.files.length)
+                        await uploadFiles(e.dataTransfer.files);
                 });
             }
             function openMkdir() {
                 document.getElementById("mkdir-name").value = "";
                 openModal("modal-mkdir");
-                setTimeout(() => document.getElementById("mkdir-name").focus(), 50);
+                setTimeout(
+                    () => document.getElementById("mkdir-name").focus(),
+                    50,
+                );
             }
             async function doMkdir() {
                 const name = document.getElementById("mkdir-name").value.trim();
@@ -2640,16 +2881,23 @@
                         body: JSON.stringify({ path }),
                     });
                     const d = await r.json();
-                    if (!r.ok) { setStatus("Error: " + d.error); return; }
+                    if (!r.ok) {
+                        setStatus("Error: " + d.error);
+                        return;
+                    }
                     await refresh();
                 } catch (e) {
                     setStatus("Error: " + e.message);
                 }
             }
             function downloadFile(path) {
-                window.location = "/api/filebrowser/download?path=" + encodeURIComponent(path);
+                window.location =
+                    "/api/filebrowser/download?path=" +
+                    encodeURIComponent(path);
             }
-            function downloadSelected() { selected.forEach((p) => downloadFile(p)); }
+            function downloadSelected() {
+                selected.forEach((p) => downloadFile(p));
+            }
             async function deleteSingle(path) {
                 if (!confirm('Delete "' + path + '"?')) return;
                 await doDelete([path]);
@@ -2663,7 +2911,11 @@
             async function doDelete(paths) {
                 for (const p of paths) {
                     try {
-                        const r = await fetch("/api/filebrowser/delete?path=" + encodeURIComponent(p), { method: "DELETE" });
+                        const r = await fetch(
+                            "/api/filebrowser/delete?path=" +
+                                encodeURIComponent(p),
+                            { method: "DELETE" },
+                        );
                         const d = await r.json();
                         if (!r.ok) setStatus("Delete failed: " + d.error);
                     } catch (e) {
@@ -2681,13 +2933,20 @@
                     const inp = document.getElementById("rename-new");
                     inp.focus();
                     const dot = currentName.lastIndexOf(".");
-                    inp.setSelectionRange(0, dot > 0 ? dot : currentName.length);
+                    inp.setSelectionRange(
+                        0,
+                        dot > 0 ? dot : currentName.length,
+                    );
                 }, 50);
             }
             async function doRename() {
-                const newName = document.getElementById("rename-new").value.trim();
+                const newName = document
+                    .getElementById("rename-new")
+                    .value.trim();
                 if (!newName || !renameFrom) return;
-                const dir = renameFrom.includes("/") ? renameFrom.substring(0, renameFrom.lastIndexOf("/")) : "";
+                const dir = renameFrom.includes("/")
+                    ? renameFrom.substring(0, renameFrom.lastIndexOf("/"))
+                    : "";
                 const to = dir ? dir + "/" + newName : newName;
                 closeModal("modal-rename");
                 try {
@@ -2697,7 +2956,10 @@
                         body: JSON.stringify({ from: renameFrom, to }),
                     });
                     const d = await r.json();
-                    if (!r.ok) { setStatus("Rename failed: " + d.error); return; }
+                    if (!r.ok) {
+                        setStatus("Rename failed: " + d.error);
+                        return;
+                    }
                     await refresh();
                 } catch (e) {
                     setStatus("Error: " + e.message);
@@ -2709,12 +2971,22 @@
                 copyFrom = [...selected][0];
                 document.getElementById("copy-from").value = copyFrom;
                 const name = copyFrom.split("/").pop() || copyFrom;
-                const ext = name.includes(".") ? "." + name.split(".").pop() : "";
-                const base = ext ? name.slice(0, name.length - ext.length) : name;
-                const dir = copyFrom.includes("/") ? copyFrom.substring(0, copyFrom.lastIndexOf("/")) : "";
-                document.getElementById("copy-to").value = (dir ? dir + "/" : "") + base + "_copy" + ext;
+                const ext = name.includes(".")
+                    ? "." + name.split(".").pop()
+                    : "";
+                const base = ext
+                    ? name.slice(0, name.length - ext.length)
+                    : name;
+                const dir = copyFrom.includes("/")
+                    ? copyFrom.substring(0, copyFrom.lastIndexOf("/"))
+                    : "";
+                document.getElementById("copy-to").value =
+                    (dir ? dir + "/" : "") + base + "_copy" + ext;
                 openModal("modal-copy");
-                setTimeout(() => document.getElementById("copy-to").focus(), 50);
+                setTimeout(
+                    () => document.getElementById("copy-to").focus(),
+                    50,
+                );
             }
             async function doCopy() {
                 const to = document.getElementById("copy-to").value.trim();
@@ -2727,7 +2999,10 @@
                         body: JSON.stringify({ from: copyFrom, to }),
                     });
                     const d = await r.json();
-                    if (!r.ok) { setStatus("Copy failed: " + (d.error || r.status)); return; }
+                    if (!r.ok) {
+                        setStatus("Copy failed: " + (d.error || r.status));
+                        return;
+                    }
                     await refresh();
                     setStatus("Copied to " + to);
                 } catch (e) {
@@ -2752,29 +3027,40 @@
             }
             async function doShare() {
                 if (!shareTarget) return;
-                const password = document.getElementById("share-password").value;
-                const expires_hours = document.getElementById("share-expires").value;
+                const password =
+                    document.getElementById("share-password").value;
+                const expires_hours =
+                    document.getElementById("share-expires").value;
                 try {
                     const body = { path: shareTarget };
                     if (password) body.password = password;
-                    if (expires_hours) body.expires_hours = parseInt(expires_hours);
+                    if (expires_hours)
+                        body.expires_hours = parseInt(expires_hours);
                     const r = await fetch("/api/filebrowser/share", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify(body),
                     });
                     const d = await r.json();
-                    if (!r.ok) { setStatus("Share failed: " + d.error); return; }
+                    if (!r.ok) {
+                        setStatus("Share failed: " + d.error);
+                        return;
+                    }
                     const url = location.origin + d.url;
-                    document.getElementById("share-url-display").textContent = url;
-                    document.getElementById("share-result").style.display = "block";
+                    document.getElementById("share-url-display").textContent =
+                        url;
+                    document.getElementById("share-result").style.display =
+                        "block";
                 } catch (e) {
                     setStatus("Error: " + e.message);
                 }
             }
             function copyShareUrl() {
-                const txt = document.getElementById("share-url-display").textContent;
-                navigator.clipboard.writeText(txt).then(() => setStatus("Copied!"));
+                const txt =
+                    document.getElementById("share-url-display").textContent;
+                navigator.clipboard
+                    .writeText(txt)
+                    .then(() => setStatus("Copied!"));
             }
             async function openSharesList() {
                 openModal("modal-shares");
@@ -2784,15 +3070,23 @@
                 const list = document.getElementById("shares-list");
                 try {
                     const r = await fetch("/api/filebrowser/shares");
-                    if (!r.ok) { list.innerHTML = '<div class="empty">Could not load.</div>'; return; }
+                    if (!r.ok) {
+                        list.innerHTML =
+                            '<div class="empty">Could not load.</div>';
+                        return;
+                    }
                     const d = await r.json();
                     const shares = d.shares || [];
                     if (!shares.length) {
-                        list.innerHTML = '<div class="empty"><div class="icon">⬡</div><p>No active shares.</p></div>';
+                        list.innerHTML =
+                            '<div class="empty"><div class="icon">⬡</div><p>No active shares.</p></div>';
                         return;
                     }
                     list.innerHTML = shares
-                        .map((s) => `<div class="share-row"><span style="font-size:.9rem">${s.is_dir ? "⬡" : "▤"}</span><div class="share-info"><div class="share-path">${esc(s.path)}</div><div class="share-token">${location.origin}/s/${s.token}${s.password_protected ? " 🔒" : ""}${s.expires_ms ? ` · exp ${new Date(s.expires_ms).toLocaleDateString()}` : "· no expiry"} · ${s.download_count} dl</div></div><button class="row-btn" onclick="navigator.clipboard.writeText('${location.origin}/s/${s.token}').then(()=>setStatus('Copied!'))">⎘</button><button class="row-btn" style="color:var(--danger)" onclick="revokeShare('${s.token}')">✕</button></div>`)
+                        .map(
+                            (s) =>
+                                `<div class="share-row"><span style="font-size:.9rem">${s.is_dir ? "⬡" : "▤"}</span><div class="share-info"><div class="share-path">${esc(s.path)}</div><div class="share-token">${location.origin}/s/${s.token}${s.password_protected ? " 🔒" : ""}${s.expires_ms ? ` · exp ${new Date(s.expires_ms).toLocaleDateString()}` : "· no expiry"} · ${s.download_count} dl</div></div><button class="row-btn" onclick="navigator.clipboard.writeText('${location.origin}/s/${s.token}').then(()=>setStatus('Copied!'))">⎘</button><button class="row-btn" style="color:var(--danger)" onclick="revokeShare('${s.token}')">✕</button></div>`,
+                        )
                         .join("");
                 } catch (e) {
                     list.innerHTML = `<div class="empty">Error: ${esc(e.message)}</div>`;
@@ -2800,7 +3094,9 @@
             }
             async function revokeShare(token) {
                 try {
-                    await fetch("/api/filebrowser/share?token=" + token, { method: "DELETE" });
+                    await fetch("/api/filebrowser/share?token=" + token, {
+                        method: "DELETE",
+                    });
                     await loadShares();
                 } catch (e) {
                     setStatus("Error: " + e.message);
@@ -2809,10 +3105,20 @@
             function setupKeyboard() {
                 document.addEventListener("keydown", (e) => {
                     const tag = document.activeElement.tagName;
-                    const inInput = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
-                    const editorOpen = document.getElementById("editor-overlay").classList.contains("open");
-                    const lightboxOpen = document.getElementById("lightbox").classList.contains("open");
-                    if (editorOpen) { if (e.key === "Escape") closeEditor(); return; }
+                    const inInput =
+                        tag === "INPUT" ||
+                        tag === "TEXTAREA" ||
+                        tag === "SELECT";
+                    const editorOpen = document
+                        .getElementById("editor-overlay")
+                        .classList.contains("open");
+                    const lightboxOpen = document
+                        .getElementById("lightbox")
+                        .classList.contains("open");
+                    if (editorOpen) {
+                        if (e.key === "Escape") closeEditor();
+                        return;
+                    }
                     if (lightboxOpen) {
                         if (e.key === "Escape") closeLightbox();
                         else if (e.key === "ArrowLeft") lightboxNav(-1);
@@ -2820,42 +3126,96 @@
                         return;
                     }
                     if (e.key === "Escape") {
-                        document.querySelectorAll(".modal-overlay.open").forEach((m) => m.classList.remove("open"));
-                        if (isSearchMode) { exitSearch(); document.getElementById("search-box").value = ""; }
+                        document
+                            .querySelectorAll(".modal-overlay.open")
+                            .forEach((m) => m.classList.remove("open"));
+                        if (isSearchMode) {
+                            exitSearch();
+                            document.getElementById("search-box").value = "";
+                        }
                         closeSidebar();
                         return;
                     }
                     if (inInput) return;
-                    if ((e.ctrlKey || e.metaKey) && e.key === "f") { e.preventDefault(); document.getElementById("search-box").focus(); return; }
-                    if (e.key === "F5" || (e.key === "r" && !e.ctrlKey)) { refresh(); return; }
+                    if ((e.ctrlKey || e.metaKey) && e.key === "f") {
+                        e.preventDefault();
+                        document.getElementById("search-box").focus();
+                        return;
+                    }
+                    if (e.key === "F5" || (e.key === "r" && !e.ctrlKey)) {
+                        refresh();
+                        return;
+                    }
                     if (selected.size === 1) {
                         const path = [...selected][0];
-                        const entry = allEntries.find((x) => x.path === path) || displayEntries.find((x) => x.path === path);
-                        if (e.key === "Enter") { openEntry(path, entry && entry.is_dir); return; }
-                        if (e.key === "F2") { const n = entry ? entry.name : ""; startRename(path, n); return; }
-                        if (e.key === "Delete" || e.key === "Backspace") { deleteSelected(); return; }
-                        if (e.key === "d" || e.key === "D") { downloadSelected(); return; }
-                        if (e.key === "s" || e.key === "S") { openShareModal(); return; }
-                        if (e.key === "c" || e.key === "C") { openCopyModal(); return; }
-                        if (e.key === "i" || e.key === "I") { toggleProps(); return; }
+                        const entry =
+                            allEntries.find((x) => x.path === path) ||
+                            displayEntries.find((x) => x.path === path);
+                        if (e.key === "Enter") {
+                            openEntry(path, entry && entry.is_dir);
+                            return;
+                        }
+                        if (e.key === "F2") {
+                            const n = entry ? entry.name : "";
+                            startRename(path, n);
+                            return;
+                        }
+                        if (e.key === "Delete" || e.key === "Backspace") {
+                            deleteSelected();
+                            return;
+                        }
+                        if (e.key === "d" || e.key === "D") {
+                            downloadSelected();
+                            return;
+                        }
+                        if (e.key === "s" || e.key === "S") {
+                            openShareModal();
+                            return;
+                        }
+                        if (e.key === "c" || e.key === "C") {
+                            openCopyModal();
+                            return;
+                        }
+                        if (e.key === "i" || e.key === "I") {
+                            toggleProps();
+                            return;
+                        }
                     }
-                    if (e.key === "u" || e.key === "U") { openUpload(); return; }
-                    if (e.key === "n" || e.key === "N") { openMkdir(); return; }
-                    if (e.key === "v" || e.key === "V") { toggleView(); return; }
+                    if (e.key === "u" || e.key === "U") {
+                        openUpload();
+                        return;
+                    }
+                    if (e.key === "n" || e.key === "N") {
+                        openMkdir();
+                        return;
+                    }
+                    if (e.key === "v" || e.key === "V") {
+                        toggleView();
+                        return;
+                    }
+                    if (e.key === "h" || e.key === "H") {
+                        toggleHidden();
+                        return;
+                    }
                     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
                         e.preventDefault();
                         if (!displayEntries.length) return;
                         const paths = displayEntries.map((x) => x.path);
                         const cur = [...selected][0];
                         let idx = cur ? paths.indexOf(cur) : -1;
-                        idx = e.key === "ArrowDown" ? Math.min(idx + 1, paths.length - 1) : Math.max(idx - 1, 0);
+                        idx =
+                            e.key === "ArrowDown"
+                                ? Math.min(idx + 1, paths.length - 1)
+                                : Math.max(idx - 1, 0);
                         selected.clear();
                         selected.add(paths[idx]);
                         syncSelectionUI();
                         updateToolbar();
                         updateStatusSel();
                         renderPropsPanel(paths[idx]);
-                        const row = document.querySelector(`[data-path="${CSS.escape(paths[idx])}"]`);
+                        const row = document.querySelector(
+                            `[data-path="${CSS.escape(paths[idx])}"]`,
+                        );
                         if (row) row.scrollIntoView({ block: "nearest" });
                         return;
                     }
@@ -2868,21 +3228,85 @@
                 await loadDir(currentPath);
                 await ensureTreeLoaded(currentPath);
                 renderSidebarTree();
-                setStatus(allEntries.length + " items");
+                setStatus(displayEntries.length + " items");
             }
-            function openModal(id) { document.getElementById(id).classList.add("open"); }
-            function closeModal(id) { document.getElementById(id).classList.remove("open"); }
-            function setStatus(msg) { document.getElementById("status-msg").textContent = msg; }
+            function openModal(id) {
+                document.getElementById(id).classList.add("open");
+            }
+            function closeModal(id) {
+                document.getElementById(id).classList.remove("open");
+            }
+            function setStatus(msg) {
+                document.getElementById("status-msg").textContent = msg;
+            }
             function fileIcon(e) {
                 if (e.is_dir) return "📁";
                 const ext = (e.ext || "").toLowerCase();
                 const map = {
-                    pdf:"▤",png:"🖼",jpg:"🖼",jpeg:"🖼",gif:"🖼",webp:"🖼",svg:"🖼",bmp:"🖼",ico:"🖼",avif:"🖼",
-                    mp4:"▶",mkv:"▶",avi:"▶",mov:"▶",webm:"▶",mp3:"♫",wav:"♫",ogg:"♫",flac:"♫",aac:"♫",m4a:"♫",opus:"♫",
-                    zip:"⊡",tar:"⊡",gz:"⊡","7z":"⊡",rar:"⊡",xz:"⊡",txt:"▤",md:"▤",rst:"▤",doc:"▤",docx:"▤",
-                    xls:"⊞",xlsx:"⊞",csv:"⊞",ppt:"⊞",pptx:"⊞",html:"⬦",htm:"⬦",
-                    js:"⚙",mjs:"⚙",ts:"⚙",jsx:"⚙",tsx:"⚙",py:"⚙",rs:"⚙",go:"⚙",java:"⚙",c:"⚙",cpp:"⚙",cs:"⚙",sh:"⚙",bash:"⚙",
-                    json:"≡",yml:"≡",yaml:"≡",toml:"≡",xml:"≡",sql:"≡",graphql:"≡",gql:"≡",proto:"≡",tf:"≡",
+                    pdf: "▤",
+                    png: "🖼",
+                    jpg: "🖼",
+                    jpeg: "🖼",
+                    gif: "🖼",
+                    webp: "🖼",
+                    svg: "🖼",
+                    bmp: "🖼",
+                    ico: "🖼",
+                    avif: "🖼",
+                    mp4: "▶",
+                    mkv: "▶",
+                    avi: "▶",
+                    mov: "▶",
+                    webm: "▶",
+                    mp3: "♫",
+                    wav: "♫",
+                    ogg: "♫",
+                    flac: "♫",
+                    aac: "♫",
+                    m4a: "♫",
+                    opus: "♫",
+                    zip: "⊡",
+                    tar: "⊡",
+                    gz: "⊡",
+                    "7z": "⊡",
+                    rar: "⊡",
+                    xz: "⊡",
+                    txt: "▤",
+                    md: "▤",
+                    rst: "▤",
+                    doc: "▤",
+                    docx: "▤",
+                    xls: "⊞",
+                    xlsx: "⊞",
+                    csv: "⊞",
+                    ppt: "⊞",
+                    pptx: "⊞",
+                    html: "⬦",
+                    htm: "⬦",
+                    js: "⚙",
+                    mjs: "⚙",
+                    ts: "⚙",
+                    jsx: "⚙",
+                    tsx: "⚙",
+                    py: "⚙",
+                    rs: "⚙",
+                    go: "⚙",
+                    java: "⚙",
+                    c: "⚙",
+                    cpp: "⚙",
+                    cs: "⚙",
+                    sh: "⚙",
+                    bash: "⚙",
+                    json: "≡",
+                    yml: "≡",
+                    yaml: "≡",
+                    toml: "≡",
+                    xml: "≡",
+                    sql: "≡",
+                    graphql: "≡",
+                    gql: "≡",
+                    proto: "≡",
+                    tf: "≡",
                 };
                 return map[ext] || "▤";
             }
@@ -2890,49 +3314,102 @@
                 if (!bytes || bytes === 0) return "0 B";
                 const u = ["B", "KB", "MB", "GB", "TB"];
                 const i = Math.floor(Math.log(bytes) / Math.log(1024));
-                return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + " " + u[i];
+                return (
+                    (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) +
+                    " " +
+                    u[i]
+                );
             }
             function fmtDate(ts) {
                 if (!ts) return "—";
                 const d = new Date(ts * 1000);
-                return d.toLocaleDateString() + " " + d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+                return (
+                    d.toLocaleDateString() +
+                    " " +
+                    d.toLocaleTimeString([], {
+                        hour: "2-digit",
+                        minute: "2-digit",
+                    })
+                );
             }
             function esc(s) {
-                return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+                return String(s)
+                    .replace(/&/g, "&amp;")
+                    .replace(/</g, "&lt;")
+                    .replace(/>/g, "&gt;")
+                    .replace(/"/g, "&quot;")
+                    .replace(/'/g, "&#39;");
             }
-            let ctxPath = null, ctxIsDir = false;
+            let ctxPath = null,
+                ctxIsDir = false;
             function showCtxMenu(event, path, isDir) {
                 if (!selected.has(path)) {
-                    selected.clear(); selected.add(path);
-                    syncSelectionUI(); updateToolbar(); updateStatusSel();
+                    selected.clear();
+                    selected.add(path);
+                    syncSelectionUI();
+                    updateToolbar();
+                    updateStatusSel();
                 }
                 if (selected.size === 1) renderPropsPanel(path);
-                ctxPath = path; ctxIsDir = isDir;
+                ctxPath = path;
+                ctxIsDir = isDir;
                 const menu = document.getElementById("ctx-menu");
                 document.getElementById("ctx-open").hidden = isDir;
                 document.getElementById("ctx-open-text").hidden = isDir;
                 menu.classList.add("open");
-                const mw = menu.offsetWidth || 182, mh = menu.offsetHeight || 220;
-                let x = event.clientX, y = event.clientY;
-                if (x + mw > window.innerWidth - 4) x = window.innerWidth - mw - 4;
-                if (y + mh > window.innerHeight - 4) y = window.innerHeight - mh - 4;
+                const mw = menu.offsetWidth || 182,
+                    mh = menu.offsetHeight || 220;
+                let x = event.clientX,
+                    y = event.clientY;
+                if (x + mw > window.innerWidth - 4)
+                    x = window.innerWidth - mw - 4;
+                if (y + mh > window.innerHeight - 4)
+                    y = window.innerHeight - mh - 4;
                 menu.style.left = x + "px";
                 menu.style.top = y + "px";
             }
-            function hideCtxMenu() { document.getElementById("ctx-menu").classList.remove("open"); }
+            function hideCtxMenu() {
+                document.getElementById("ctx-menu").classList.remove("open");
+            }
             function ctxAction(action) {
                 hideCtxMenu();
                 if (!ctxPath) return;
-                const path = ctxPath, isDir = ctxIsDir;
-                const entry = allEntries.find((x) => x.path === path) || displayEntries.find((x) => x.path === path);
+                const path = ctxPath,
+                    isDir = ctxIsDir;
+                const entry =
+                    allEntries.find((x) => x.path === path) ||
+                    displayEntries.find((x) => x.path === path);
                 switch (action) {
-                    case "open": openEntry(path, isDir); break;
-                    case "open-text": openEditor(path, true); break;
-                    case "download": downloadFile(path); break;
-                    case "share": selected.clear(); selected.add(path); syncSelectionUI(); openShareModal(); break;
-                    case "copy": selected.clear(); selected.add(path); syncSelectionUI(); openCopyModal(); break;
-                    case "rename": startRename(path, entry ? entry.name : path.split("/").pop()); break;
-                    case "delete": deleteSingle(path); break;
+                    case "open":
+                        openEntry(path, isDir);
+                        break;
+                    case "open-text":
+                        openEditor(path, true);
+                        break;
+                    case "download":
+                        downloadFile(path);
+                        break;
+                    case "share":
+                        selected.clear();
+                        selected.add(path);
+                        syncSelectionUI();
+                        openShareModal();
+                        break;
+                    case "copy":
+                        selected.clear();
+                        selected.add(path);
+                        syncSelectionUI();
+                        openCopyModal();
+                        break;
+                    case "rename":
+                        startRename(
+                            path,
+                            entry ? entry.name : path.split("/").pop(),
+                        );
+                        break;
+                    case "delete":
+                        deleteSingle(path);
+                        break;
                 }
             }
             document.addEventListener("mousedown", (e) => {

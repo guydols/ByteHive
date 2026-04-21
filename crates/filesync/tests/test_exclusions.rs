@@ -112,14 +112,14 @@ fn rule_count_reflects_compiled_rules() {
 #[test]
 fn builtin_tmp_dir_excluded_without_config() {
     let e = excl(&[], &[]);
-    assert!(e.is_excluded(&PathBuf::from(".filesync_tmp")));
+    assert!(e.is_excluded(&PathBuf::from(".bh_filesync")));
 }
 
 #[test]
 fn builtin_tmp_dir_contents_excluded() {
     let e = excl(&[], &[]);
-    assert!(e.is_excluded(&PathBuf::from(".filesync_tmp/partial.tmp")));
-    assert!(e.is_excluded(&PathBuf::from(".filesync_tmp/sub/file.bin")));
+    assert!(e.is_excluded(&PathBuf::from(".bh_filesync/transfers/partial.tmp")));
+    assert!(e.is_excluded(&PathBuf::from(".bh_filesync/trash/file.bin")));
 }
 
 #[test]

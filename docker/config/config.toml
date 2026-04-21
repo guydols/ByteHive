@@ -1,0 +1,72 @@
+# =============================================================================
+# ByteHive — config.toml
+# =============================================================================
+
+[framework]
+http_addr = "0.0.0.0:9000"
+http_token = ""
+web_root = ""
+log_level = "info"
+
+
+[apps.filesync]
+root      = "/data/filesync"
+mode      = "server"
+bind_addr = "0.0.0.0:7878"
+
+exclude_patterns = [
+    "**/venv/**",
+    "**/.venv/**",
+    "**/env/**",
+    "**/__pycache__/**",
+    "**/*.pyc",
+    "**/*.pyo",
+    "**/*.pyd",
+    "**/.pytest_cache/**",
+    "**/*.egg-info/**",
+    "**/dist/**",
+    "**/.mypy_cache/**",
+    "**/.ruff_cache/**",
+
+    "**/build/**",
+    "**/cmake-build-*/**",
+
+    "**/.pio/**",
+    "**/.pioenvs/**",
+    "**/.piolibdeps/**",
+
+    "**/target/**",
+
+    "**/node_modules/**",
+
+    "**/.DS_Store",
+    "**/Thumbs.db",
+    "**/*.tmp",
+    "**/*.bak",
+    "**/*.swp",
+    "**/*.swo",
+    "**/*~",
+    "**/.Trash-*/**",
+
+    "**/*.log",
+    "**/logs/**",
+    "**/tmp/**",
+    "**/temp/**",
+    "**/.cache/**",
+]
+
+exclude_regex = [
+    '.*\.pyc$',
+    '.*\.pyo$',
+    '.*\.(o|d|elf|map)$',
+    '(^|/)target/',
+    '(^|/)\.pio/',
+    '.*\.(tmp|bak|swp|swo)$',
+    '.*~$',
+    '(^|/)\.DS_Store$',
+    '(^|/)Thumbs\.db$',
+]
+
+[apps.filebrowser]
+max_upload_mb = 2048
+allow_delete  = false

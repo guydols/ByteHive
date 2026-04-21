@@ -66,6 +66,10 @@ pub fn search_dir(base: &Path, cur: &Path, query: &str, max: usize, results: &mu
             return;
         }
         let name = entry.file_name().to_string_lossy().to_string();
+        // Never expose the internal .bh_filesync folder
+        if name == ".bh_filesync" {
+            continue;
+        }
         let path = entry.path();
         let rel = path
             .strip_prefix(base)
@@ -153,6 +157,37 @@ pub fn zip_directory(abs: &Path, _rel: &str) -> HttpResponse {
         },
         body: buf.into_inner(),
     }
+}
+
+/// Move `abs` into `.bh_filesync/trash` inside `root`.
+/// The item is stored as `<unix_ms>_<original_name>` in the trash folder.
+/// Falls back to copy+delete if a cross-device rename fails.
+pub fn move_to_bh_trash(root: &Path, abs: &Path) -> Result<(), String> {
+    let trash_dir = root.join(".bh_filesync").join("trash");
+    std::fs::create_dir_all(&trash_dir).map_err(|e| e.to_string())?;
+
+    let file_name = abs
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("unknown"))
+        .to_string_lossy();
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let trash_dest = trash_dir.join(format!("{unix_ms}_{file_name}"));
+
+    if std::fs::rename(abs, &trash_dest).is_err() {
+        // Cross-device or other issue — fall back to copy then delete
+        if abs.is_dir() {
+            copy_dir_all(abs, &trash_dest)?;
+            std::fs::remove_dir_all(abs).map_err(|e| e.to_string())?;
+        } else {
+            std::fs::copy(abs, &trash_dest).map_err(|e| e.to_string())?;
+            std::fs::remove_file(abs).map_err(|e| e.to_string())?;
+        }
+    }
+
+    Ok(())
 }
 
 pub fn extension(name: &str) -> &str {

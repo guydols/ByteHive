@@ -75,8 +75,8 @@ The `ExclusionConfig` accepts two kinds of rules:
 
 Built-in rules that are always active:
 
-- `.filesync_tmp`
-- `.filesync_tmp/**`
+- `.bh_filesync`
+- `.bh_filesync/**`
 
 Every compiled rule carries a diagnostic label (`builtin:`, `glob:`, or
 `regex:`) so that log output clearly indicates which rule excluded a path.
@@ -228,7 +228,7 @@ Files ≥ 8 MiB are streamed in three phases:
 3. **`LargeFileEnd`** — signals completion; receiver verifies BLAKE3 hash.
 
 The receiving side assembles chunks into a **pre-allocated temporary file**
-under `.filesync_tmp/`. Missing chunks can be requested via
+under `.bh_filesync/transfers/`. Missing chunks can be requested via
 **`RequestChunks`** for retransmission.
 
 ---
@@ -406,7 +406,9 @@ Events are published on the ByteHive message bus.
 | `READ_THREADS` | 4 | Parallel file-read threads |
 | `FULL_SCAN_INTERVAL_SECS` | 900 | Periodic full rescan interval (15 min) |
 | `METRICS_INTERVAL_SECS` | 60 | `root_stats` bus event interval |
-| `TMP_DIR` | `.filesync_tmp` | Temp directory for large-file assembly |
+| `BH_DIR` | `.bh_filesync` | Internal ByteHive state folder |
+| `TMP_DIR` | `.bh_filesync/transfers` | Temp directory for large-file assembly |
+| `TRASH_DIR` | `.bh_filesync/trash` | Trash folder for deleted files |
 
 ---
 

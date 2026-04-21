@@ -16,7 +16,9 @@ pub const SEND_QUEUE_DEPTH: usize = 512;
 pub const CLIENT_BROADCAST_DEPTH: usize = 512;
 pub const HASH_THREADS: usize = 4;
 pub const READ_THREADS: usize = 4;
-pub const TMP_DIR: &str = ".filesync_tmp";
+pub const BH_DIR: &str = ".bh_filesync";
+pub const TMP_DIR: &str = ".bh_filesync/transfers";
+pub const TRASH_DIR: &str = ".bh_filesync/trash";
 pub const FULL_SCAN_INTERVAL_SECS: u64 = 900; // 15 minutes
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

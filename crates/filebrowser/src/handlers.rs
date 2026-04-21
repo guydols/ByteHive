@@ -54,6 +54,10 @@ impl FileBrowserApp {
             Ok(rd) => {
                 for entry in rd.flatten() {
                     let name = entry.file_name().to_string_lossy().to_string();
+                    // Hide the internal .bh_filesync folder from directory listings
+                    if name == ".bh_filesync" {
+                        continue;
+                    }
                     let meta = entry.metadata().ok();
                     let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
                     let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
@@ -233,15 +237,9 @@ impl FileBrowserApp {
             Err(e) => return HttpResponse::bad_request(e),
         };
 
-        let result = if abs.is_dir() {
-            std::fs::remove_dir_all(&abs)
-        } else {
-            std::fs::remove_file(&abs)
-        };
-
-        match result {
+        match crate::fs_util::move_to_bh_trash(&inner.root, &abs) {
             Ok(()) => HttpResponse::ok_json(json!({"ok": true})),
-            Err(e) => HttpResponse::internal_error(e.to_string()),
+            Err(e) => HttpResponse::internal_error(e),
         }
     }
 

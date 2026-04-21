@@ -213,19 +213,19 @@ fn compute_send_list_empty_both_sides() {
 #[test]
 fn build_manifest_excludes_filesync_tmp_dir() {
     let dir = tmp_dir("excl_tmp");
-    std::fs::create_dir_all(dir.join(".filesync_tmp")).unwrap();
-    std::fs::write(dir.join(".filesync_tmp/partial.tmp"), b"temp").unwrap();
+    std::fs::create_dir_all(dir.join(".bh_filesync/transfers")).unwrap();
+    std::fs::write(dir.join(".bh_filesync/transfers/partial.tmp"), b"temp").unwrap();
     std::fs::write(dir.join("real.txt"), b"real").unwrap();
     let m = build_manifest(&dir, "n", &no_exclusions()).unwrap();
     assert!(m.files.contains_key(&PathBuf::from("real.txt")));
     assert!(
-        !m.files.contains_key(&PathBuf::from(".filesync_tmp")),
-        ".filesync_tmp dir must be excluded by default rules"
+        !m.files.contains_key(&PathBuf::from(".bh_filesync")),
+        ".bh_filesync dir must be excluded by default rules"
     );
     assert!(
         !m.files
-            .contains_key(&PathBuf::from(".filesync_tmp/partial.tmp")),
-        "contents of .filesync_tmp must be excluded"
+            .contains_key(&PathBuf::from(".bh_filesync/transfers/partial.tmp")),
+        "contents of .bh_filesync must be excluded"
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }

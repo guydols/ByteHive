@@ -115,6 +115,64 @@ fn hash_file(path: &Path) -> Option<[u8; 32]> {
     Some(hasher.finalize().into())
 }
 
+/// Move a file or directory into the `.bh_filesync/trash` folder.
+/// The item is renamed to `<unix_ms>_<original_name>` inside the trash dir.
+/// If rename fails (e.g. cross-device), falls back to a hard delete.
+fn move_to_trash(root: &Path, full_path: &Path, rel: &Path) {
+    if !full_path.exists() {
+        return;
+    }
+    let trash_dir = root.join(crate::protocol::TRASH_DIR);
+    if fs::create_dir_all(&trash_dir).is_err() {
+        // Can't create trash — fall back to hard delete
+        if full_path.is_dir() {
+            let _ = fs::remove_dir_all(full_path);
+        } else {
+            let _ = fs::remove_file(full_path);
+        }
+        return;
+    }
+
+    let file_name = rel
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("unknown"))
+        .to_string_lossy();
+    let unix_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let trash_dest = trash_dir.join(format!("{unix_ms}_{file_name}"));
+
+    if fs::rename(full_path, &trash_dest).is_err() {
+        // Cross-device or permission issue — fall back to hard delete
+        warn!("trash rename failed for {rel:?}; falling back to delete");
+        if full_path.is_dir() {
+            let _ = fs::remove_dir_all(full_path);
+        } else {
+            let _ = fs::remove_file(full_path);
+        }
+    }
+}
+
+/// Remove empty intermediate directories left behind inside the transfers
+/// folder after a large-file tmp file has been consumed or deleted.
+/// Walks upward from `tmp_path`'s parent, removing directories that are
+/// empty, stopping when it reaches the transfers root or a non-empty dir.
+fn cleanup_transfer_dirs(root: &Path, tmp_path: &Path) {
+    let transfers_dir = root.join(crate::protocol::TMP_DIR);
+    let mut current = tmp_path.parent();
+    while let Some(dir) = current {
+        if dir == transfers_dir || !dir.starts_with(&transfers_dir) {
+            break;
+        }
+        if fs::remove_dir(dir).is_err() {
+            // Non-empty or permission error — stop climbing
+            break;
+        }
+        current = dir.parent();
+    }
+}
+
 impl SyncEngine {
     pub fn new(root: PathBuf, node_id: String, exclusions: Arc<Exclusions>) -> Self {
         log::debug!(
@@ -540,6 +598,7 @@ impl SyncEngine {
         };
 
         fs::rename(&asm.tmp_path, &asm.dst)?;
+        cleanup_transfer_dirs(&self.root, &asm.tmp_path);
 
         let meta = fs::metadata(&asm.dst)?;
         let modified_ms = meta
@@ -579,6 +638,7 @@ impl SyncEngine {
                     warn!("clear_in_progress: removing tmp for {path:?}: {e}");
                 }
             }
+            cleanup_transfer_dirs(&self.root, &asm.tmp_path);
         }
     }
 
@@ -644,7 +704,7 @@ impl SyncEngine {
 
             let full = self.root.join(rel);
             if full.is_dir() {
-                let _ = fs::remove_dir_all(&full);
+                move_to_trash(&self.root, &full, rel);
                 let children: Vec<PathBuf> = self
                     .manifest
                     .read()
@@ -657,11 +717,9 @@ impl SyncEngine {
                 for child in children {
                     m.files.remove(&child);
                 }
-
                 m.files.remove(rel);
             } else {
-                let _ = fs::remove_file(&full);
-                let _ = fs::remove_dir(&full);
+                move_to_trash(&self.root, &full, rel);
                 self.manifest.write().files.remove(rel);
             }
             count += 1;
