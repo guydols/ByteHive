@@ -69,4 +69,4 @@ exclude_regex = [
 
 [apps.filebrowser]
 max_upload_mb = 2048
-allow_delete  = false
+allow_delete  = true

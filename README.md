@@ -92,13 +92,13 @@ A plugin architecture that gives each app its own namespace, message topics, and
 
 ## Quick Start
 
+### From source
 ```bash
 # Prerequisites: Rust stable toolchain, Linux
 cargo build --release
 ./target/release/bytehive --config config.toml
 ```
-
-On first run with no users, navigate to `http://<host>:9000/` - you will be redirected to the setup wizard.
+On first run with no users, navigate to `http://<host>:9000/` you will be redirected to the setup wizard.
 
 <details>
 <summary>Example configuration</summary>
@@ -121,6 +121,16 @@ allow_delete  = true
 ```
 
 </details>
+
+### Docker
+
+1. Edit the `docker-compose.yml` and change the path `./change/me/data` to the folder you want to sync
+2. Run `docker compose up -d`
+3. Navigate to `http://<host>:9000/` and go through the setup wizard
+4. Use your own proxy to force https (this is not included in ByteHive core, Filesync has build in encryption)
+
+
+
 
 ## Documentation
 
