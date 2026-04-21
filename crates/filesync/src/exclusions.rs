@@ -18,8 +18,8 @@ impl Exclusions {
         let mut compiled = Vec::new();
 
         for pat in &[
-            crate::protocol::TMP_DIR,
-            &format!("{}/**", crate::protocol::TMP_DIR),
+            crate::protocol::BH_DIR,
+            &format!("{}/**", crate::protocol::BH_DIR),
         ] {
             let re_src = glob_to_regex(pat);
             if let Ok(re) = Regex::new(&re_src) {

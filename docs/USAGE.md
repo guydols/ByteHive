@@ -497,7 +497,8 @@ The following are **always ignored** regardless of configuration:
 
 - `.git`
 - `.DS_Store`
-- `.filesync_tmp`
+- `.bh_filesync`
+- `.bh_filesync/**`
 
 ### FilesSync API
 

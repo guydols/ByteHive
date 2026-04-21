@@ -11,7 +11,7 @@ const STABLE_POLLS_REQUIRED: usize = 4;
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Walk a directory and return a map of relative paths to their BLAKE3 hashes.
-/// Skips the `.filesync_tmp` directory.
+/// Skips the `.bh_filesync` directory.
 fn hash_directory(root: &Path) -> HashMap<PathBuf, [u8; 32]> {
     let mut map = HashMap::new();
     let walker = walkdir::WalkDir::new(root)
@@ -27,8 +27,8 @@ fn hash_directory(root: &Path) -> HashMap<PathBuf, [u8; 32]> {
             Ok(r) => r.to_path_buf(),
             Err(_) => continue,
         };
-        // Skip the .filesync_tmp directory
-        if rel.components().any(|c| c.as_os_str() == ".filesync_tmp") {
+        // Skip the .bh_filesync directory
+        if rel.components().any(|c| c.as_os_str() == ".bh_filesync") {
             continue;
         }
 
@@ -96,7 +96,7 @@ pub fn check_integrity(source_dir: &Path, dest_dir: &Path) -> IntegrityResult {
     }
 }
 
-/// Count the number of regular files in a directory (excluding .filesync_tmp).
+/// Count the number of regular files in a directory (excluding .bh_filesync).
 pub fn count_files(dir: &Path) -> usize {
     if !dir.exists() {
         return 0;
@@ -109,7 +109,7 @@ pub fn count_files(dir: &Path) -> usize {
                 && !e
                     .path()
                     .components()
-                    .any(|c| c.as_os_str() == ".filesync_tmp")
+                    .any(|c| c.as_os_str() == ".bh_filesync")
         })
         .count()
 }
