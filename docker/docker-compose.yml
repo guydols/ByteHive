@@ -1,0 +1,20 @@
+services:
+  bytehive:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bytehive
+    restart: unless-stopped
+
+    ports:
+      - "9000:9000" # HTTP portal / dashboard
+      - "7878:7878" # FileSync TCP server
+
+    volumes:
+      - ./docker/config:/app/config
+
+      # FileSync data directory, the folder that ByteHive syncs.
+      - ./change/me/data:/data/filesync
+
+    environment:
+      TZ: Europe/Amsterdam
