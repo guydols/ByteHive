@@ -8,6 +8,12 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/guydols/ByteHive/actions/workflows/rust.yml">
+    <img src="https://github.com/guydols/ByteHive/actions/workflows/rust.yml/badge.svg" alt="Build">
+  </a>
+  <a href="https://github.com/guydols/ByteHive/actions/workflows/rust.yml">
+    <img src="https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/guydols/YOUR_GIST_ID/raw/bytehive-coverage.json" alt="Coverage">
+  </a>
   <img src="https://img.shields.io/badge/version-0.1.0-orange" alt="Version">
   <img src="https://img.shields.io/badge/license-GPLv3-blue" alt="License">
   <img src="https://img.shields.io/badge/platform-Linux-lightgrey" alt="Platform">
@@ -17,6 +23,9 @@
 > **Experimental (v0.1.0)** - There can be bugs. Linux only.
 > A stress test has ran for 100 hours without a single failure.
 > Tests do not yet cover all paths and possibilities.
+
+I started making this out of frustration and hubris. I really wanted a faster file based sync solution. I tried Nextcloud, Owncloud, Opencloud, Seafile, Syncthing, Cozycloud, Pydio Cells and maybe some I forgot. None of these had a the aspects I was looking for. Building proof of concepts and redesigning the architecture several times gave me this.
+
 ---
 
 ## Features
