@@ -155,3 +155,109 @@ fn tree_row<'a>(node: &FlatNode) -> Element<'a, Message> {
         })
         .into()
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::gui::state::FileNode;
+
+    // ─── view smoke tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn view_empty_tree_does_not_panic() {
+        let _ = super::view(&[]);
+    }
+
+    #[test]
+    fn view_single_file_does_not_panic() {
+        let nodes = vec![FileNode::file(1, "readme.txt", "/readme.txt")];
+        let _ = super::view(&nodes);
+    }
+
+    #[test]
+    fn view_single_collapsed_dir_does_not_panic() {
+        let mut dir = FileNode::dir(1, "src", "/src", vec![]);
+        dir.expanded = false;
+        let _ = super::view(&[dir]);
+    }
+
+    #[test]
+    fn view_single_expanded_empty_dir_does_not_panic() {
+        let dir = FileNode::dir(1, "src", "/src", vec![]);
+        let _ = super::view(&[dir]);
+    }
+
+    #[test]
+    fn view_expanded_dir_with_children_does_not_panic() {
+        let dir = FileNode::dir(
+            1,
+            "src",
+            "/src",
+            vec![
+                FileNode::file(2, "main.rs", "/src/main.rs"),
+                FileNode::file(3, "lib.rs", "/src/lib.rs"),
+            ],
+        );
+        let _ = super::view(&[dir]);
+    }
+
+    #[test]
+    fn view_excluded_file_does_not_panic() {
+        let mut node = FileNode::file(1, "ignored.log", "/ignored.log");
+        node.included = false;
+        let _ = super::view(&[node]);
+    }
+
+    #[test]
+    fn view_excluded_dir_does_not_panic() {
+        let mut dir = FileNode::dir(1, "build", "/build", vec![]);
+        dir.included = false;
+        let _ = super::view(&[dir]);
+    }
+
+    #[test]
+    fn view_deeply_nested_tree_does_not_panic() {
+        let leaf = FileNode::file(4, "deep.rs", "/a/b/c/deep.rs");
+        let level3 = FileNode::dir(3, "c", "/a/b/c", vec![leaf]);
+        let level2 = FileNode::dir(2, "b", "/a/b", vec![level3]);
+        let root = FileNode::dir(1, "a", "/a", vec![level2]);
+        let _ = super::view(&[root]);
+    }
+
+    #[test]
+    fn view_mixed_files_and_dirs_does_not_panic() {
+        let nodes = vec![
+            FileNode::file(1, "Cargo.toml", "/Cargo.toml"),
+            FileNode::dir(
+                2,
+                "src",
+                "/src",
+                vec![
+                    FileNode::file(3, "main.rs", "/src/main.rs"),
+                    FileNode::file(4, "lib.rs", "/src/lib.rs"),
+                ],
+            ),
+            FileNode::file(5, "README.md", "/README.md"),
+        ];
+        let _ = super::view(&nodes);
+    }
+
+    #[test]
+    fn view_collapsed_dir_with_children_does_not_panic() {
+        let mut dir = FileNode::dir(
+            1,
+            "src",
+            "/src",
+            vec![FileNode::file(2, "main.rs", "/src/main.rs")],
+        );
+        dir.expanded = false;
+        let _ = super::view(&[dir]);
+    }
+
+    #[test]
+    fn view_many_root_level_files_does_not_panic() {
+        let nodes: Vec<FileNode> = (0..20)
+            .map(|i| FileNode::file(i, &format!("file_{i}.txt"), &format!("/file_{i}.txt")))
+            .collect();
+        let _ = super::view(&nodes);
+    }
+}

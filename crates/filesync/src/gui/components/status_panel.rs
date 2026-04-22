@@ -1,8 +1,8 @@
 //! Status panel: sync status indicator, progress bar, pause/resume and open folder buttons.
 
 use iced::{
-    Alignment, Background, Border, Color, Element, Length,
     widget::{button, column, container, row, text, Space},
+    Alignment, Background, Border, Color, Element, Length,
 };
 
 use crate::gui::app::Message;
@@ -30,9 +30,16 @@ pub fn view(snap: &SyncSnapshot, is_paused: bool) -> Element<'_, Message> {
         Space::new().width(0).into()
     };
 
-    let pause_label = if is_paused { "▶  Resume" } else { "⏸  Pause" };
-    let pause_style: fn(&iced::Theme, button::Status) -> button::Style =
-        if is_paused { theme::btn_primary } else { theme::btn_ghost };
+    let pause_label = if is_paused {
+        "▶  Resume"
+    } else {
+        "⏸  Pause"
+    };
+    let pause_style: fn(&iced::Theme, button::Status) -> button::Style = if is_paused {
+        theme::btn_primary
+    } else {
+        theme::btn_ghost
+    };
     let pause_btn = button(text(pause_label).size(12))
         .on_press(Message::TogglePause)
         .style(pause_style)
@@ -109,7 +116,10 @@ fn status_indicator_dot(status: &ConnectionStatus) -> Element<'static, Message> 
             use iced::widget::container;
             container::Style {
                 background: Some(Background::Color(color)),
-                border: Border { radius: 4.0.into(), ..Default::default() },
+                border: Border {
+                    radius: 4.0.into(),
+                    ..Default::default()
+                },
                 ..Default::default()
             }
         })
@@ -127,7 +137,10 @@ fn progress_bar(fraction: f32) -> Element<'static, Message> {
             use iced::widget::container;
             container::Style {
                 background: Some(Background::Color(theme::AMBER)),
-                border: Border { radius: 2.0.into(), ..Default::default() },
+                border: Border {
+                    radius: 2.0.into(),
+                    ..Default::default()
+                },
                 ..Default::default()
             }
         });
@@ -140,7 +153,12 @@ fn progress_bar(fraction: f32) -> Element<'static, Message> {
             .style(|_| {
                 use iced::widget::container;
                 container::Style {
-                    background: Some(Background::Color(Color { r: 0.25, g: 0.25, b: 0.28, a: 1.0 })),
+                    background: Some(Background::Color(Color {
+                        r: 0.25,
+                        g: 0.25,
+                        b: 0.28,
+                        a: 1.0,
+                    })),
                     ..Default::default()
                 }
             })
@@ -158,8 +176,16 @@ fn progress_bar(fraction: f32) -> Element<'static, Message> {
         .style(|_| {
             use iced::widget::container;
             container::Style {
-                background: Some(Background::Color(Color { r: 0.20, g: 0.20, b: 0.23, a: 1.0 })),
-                border: Border { radius: 2.0.into(), ..Default::default() },
+                background: Some(Background::Color(Color {
+                    r: 0.20,
+                    g: 0.20,
+                    b: 0.23,
+                    a: 1.0,
+                })),
+                border: Border {
+                    radius: 2.0.into(),
+                    ..Default::default()
+                },
                 ..Default::default()
             }
         })
@@ -172,5 +198,122 @@ fn fmt_bytes(b: u64) -> String {
         1_024..1_048_576 => format!("{:.1} KiB", b as f64 / 1_024.0),
         1_048_576..1_073_741_824 => format!("{:.1} MiB", b as f64 / 1_048_576.0),
         _ => format!("{:.2} GiB", b as f64 / 1_073_741_824.0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fmt_bytes;
+    use crate::gui::state::{ConnectionStatus, SyncSnapshot};
+
+    // ─── fmt_bytes ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn fmt_bytes_zero() {
+        assert_eq!(fmt_bytes(0), "0 B");
+    }
+
+    #[test]
+    fn fmt_bytes_1023_is_bytes() {
+        assert_eq!(fmt_bytes(1_023), "1023 B");
+    }
+
+    #[test]
+    fn fmt_bytes_exactly_1kib() {
+        assert_eq!(fmt_bytes(1_024), "1.0 KiB");
+    }
+
+    #[test]
+    fn fmt_bytes_1536_is_1_5kib() {
+        assert_eq!(fmt_bytes(1_536), "1.5 KiB");
+    }
+
+    #[test]
+    fn fmt_bytes_exactly_1mib() {
+        assert_eq!(fmt_bytes(1_048_576), "1.0 MiB");
+    }
+
+    #[test]
+    fn fmt_bytes_1_5mib() {
+        assert_eq!(fmt_bytes(1_572_864), "1.5 MiB");
+    }
+
+    #[test]
+    fn fmt_bytes_exactly_1gib() {
+        assert_eq!(fmt_bytes(1_073_741_824), "1.00 GiB");
+    }
+
+    #[test]
+    fn fmt_bytes_2gib() {
+        assert_eq!(fmt_bytes(2_147_483_648), "2.00 GiB");
+    }
+
+    // ─── view smoke tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn view_disconnected_not_paused_does_not_panic() {
+        let _ = super::view(&SyncSnapshot::default(), false);
+    }
+
+    #[test]
+    fn view_paused_does_not_panic() {
+        let mut snap = SyncSnapshot::default();
+        snap.status = ConnectionStatus::Paused;
+        let _ = super::view(&snap, true);
+    }
+
+    #[test]
+    fn view_initial_sync_no_total_does_not_panic() {
+        let mut snap = SyncSnapshot::default();
+        snap.status = ConnectionStatus::InitialSync;
+        snap.transfer_total = 0;
+        let _ = super::view(&snap, false);
+    }
+
+    #[test]
+    fn view_initial_sync_with_total_does_not_panic() {
+        let mut snap = SyncSnapshot::default();
+        snap.status = ConnectionStatus::InitialSync;
+        snap.transfer_total = 10_000;
+        snap.bytes_sent = 3_000;
+        snap.bytes_received = 500;
+        let _ = super::view(&snap, false);
+    }
+
+    #[test]
+    fn view_initial_sync_fully_transferred_does_not_panic() {
+        let mut snap = SyncSnapshot::default();
+        snap.status = ConnectionStatus::InitialSync;
+        snap.transfer_total = 1_000;
+        snap.bytes_sent = 1_000;
+        let _ = super::view(&snap, false);
+    }
+
+    #[test]
+    fn view_idle_does_not_panic() {
+        let mut snap = SyncSnapshot::default();
+        snap.status = ConnectionStatus::Idle;
+        let _ = super::view(&snap, false);
+    }
+
+    #[test]
+    fn view_connecting_does_not_panic() {
+        let mut snap = SyncSnapshot::default();
+        snap.status = ConnectionStatus::Connecting;
+        let _ = super::view(&snap, false);
+    }
+
+    #[test]
+    fn view_error_does_not_panic() {
+        let mut snap = SyncSnapshot::default();
+        snap.status = ConnectionStatus::Error("connection refused".into());
+        let _ = super::view(&snap, false);
+    }
+
+    #[test]
+    fn view_awaiting_approval_does_not_panic() {
+        let mut snap = SyncSnapshot::default();
+        snap.status = ConnectionStatus::AwaitingApproval;
+        let _ = super::view(&snap, false);
     }
 }
