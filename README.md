@@ -8,12 +8,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/guydols/ByteHive/actions/workflows/rust.yml">
-    <img src="https://github.com/guydols/ByteHive/actions/workflows/rust.yml/badge.svg" alt="Build">
-  </a>
-  <a href="https://github.com/guydols/ByteHive/actions/workflows/rust.yml">
-    <img src="https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/guydols/b738608ba7bb63cac21cdbb594fc5761/raw/bytehive-coverage.json" alt="Coverage">
-  </a>
+  <img src="https://github.com/guydols/ByteHive/actions/workflows/rust.yml/badge.svg" alt="Build">
+  <img src="https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/guydols/b738608ba7bb63cac21cdbb594fc5761/raw/bytehive-coverage.json" alt="Coverage">
   <img src="https://img.shields.io/badge/version-0.1.0-orange" alt="Version">
   <img src="https://img.shields.io/badge/license-GPLv3-blue" alt="License">
   <img src="https://img.shields.io/badge/platform-Linux-lightgrey" alt="Platform">
