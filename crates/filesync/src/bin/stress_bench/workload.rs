@@ -277,6 +277,314 @@ pub fn modification_storm(dir: &Path, count: usize) -> WorkloadStats {
     stats
 }
 
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // ── Xorshift64 ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn xorshift64_zero_seed_treated_as_one() {
+        let mut from_zero = Xorshift64::new(0);
+        let mut from_one = Xorshift64::new(1);
+        // Both must produce the same sequence since 0 is remapped to 1
+        assert_eq!(from_zero.next_u64(), from_one.next_u64());
+    }
+
+    #[test]
+    fn xorshift64_deterministic_for_same_seed() {
+        let mut a = Xorshift64::new(12345);
+        let mut b = Xorshift64::new(12345);
+        for _ in 0..20 {
+            assert_eq!(a.next_u64(), b.next_u64());
+        }
+    }
+
+    #[test]
+    fn xorshift64_different_seeds_produce_different_output() {
+        let mut a = Xorshift64::new(1);
+        let mut b = Xorshift64::new(2);
+        assert_ne!(a.next_u64(), b.next_u64());
+    }
+
+    #[test]
+    fn xorshift64_never_produces_zero() {
+        let mut rng = Xorshift64::new(999);
+        for _ in 0..1000 {
+            assert_ne!(rng.next_u64(), 0, "Xorshift64 must never produce zero");
+        }
+    }
+
+    #[test]
+    fn xorshift64_fill_bytes_produces_correct_length() {
+        let mut rng = Xorshift64::new(7);
+        let mut buf = vec![0u8; 37];
+        rng.fill_bytes(&mut buf);
+        assert_eq!(buf.len(), 37);
+    }
+
+    #[test]
+    fn xorshift64_fill_bytes_deterministic() {
+        let mut a = Xorshift64::new(7);
+        let mut b = Xorshift64::new(7);
+        let mut ba = vec![0u8; 64];
+        let mut bb = vec![0u8; 64];
+        a.fill_bytes(&mut ba);
+        b.fill_bytes(&mut bb);
+        assert_eq!(ba, bb);
+    }
+
+    #[test]
+    fn xorshift64_fill_bytes_empty_slice_is_noop() {
+        let mut rng = Xorshift64::new(1);
+        let mut buf: Vec<u8> = vec![];
+        rng.fill_bytes(&mut buf); // must not panic
+    }
+
+    #[test]
+    fn xorshift64_fill_bytes_not_all_zero_for_nonempty_slice() {
+        let mut rng = Xorshift64::new(42);
+        let mut buf = vec![0u8; 16];
+        rng.fill_bytes(&mut buf);
+        // With a good PRNG all-zeros output is astronomically unlikely
+        assert_ne!(buf, vec![0u8; 16]);
+    }
+
+    // ── generate_content ─────────────────────────────────────────────────────
+
+    #[test]
+    fn generate_content_correct_size() {
+        assert_eq!(generate_content(1, 1024).len(), 1024);
+        assert_eq!(generate_content(2, 0).len(), 0);
+        assert_eq!(generate_content(3, 8).len(), 8);
+    }
+
+    #[test]
+    fn generate_content_deterministic() {
+        assert_eq!(generate_content(42, 256), generate_content(42, 256));
+    }
+
+    #[test]
+    fn generate_content_different_seeds_differ() {
+        assert_ne!(generate_content(1, 256), generate_content(2, 256));
+    }
+
+    // ── small_file_flood ─────────────────────────────────────────────────────
+
+    #[test]
+    fn small_file_flood_creates_correct_count() {
+        let tmp = TempDir::new().unwrap();
+        let stats = small_file_flood(tmp.path(), 3);
+        assert_eq!(stats.files_created, 3);
+        assert_eq!(stats.files_modified, 0);
+        assert_eq!(stats.files_deleted, 0);
+        assert!(stats.bytes_written >= 3 * 1024);
+    }
+
+    #[test]
+    fn small_file_flood_creates_files_in_subdir() {
+        let tmp = TempDir::new().unwrap();
+        small_file_flood(tmp.path(), 2);
+        let subdir = tmp.path().join("small_flood");
+        assert!(subdir.is_dir());
+        let file_count = std::fs::read_dir(&subdir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .count();
+        assert_eq!(file_count, 2);
+    }
+
+    // ── large_file_transfer ──────────────────────────────────────────────────
+
+    #[test]
+    fn large_file_transfer_creates_correct_count() {
+        let tmp = TempDir::new().unwrap();
+        let stats = large_file_transfer(tmp.path(), 2, 1);
+        assert_eq!(stats.files_created, 2);
+        assert_eq!(stats.files_modified, 0);
+        assert_eq!(stats.files_deleted, 0);
+        assert!(stats.bytes_written > 0);
+    }
+
+    #[test]
+    fn large_file_transfer_creates_files_in_subdir() {
+        let tmp = TempDir::new().unwrap();
+        large_file_transfer(tmp.path(), 1, 1);
+        assert!(tmp.path().join("large_files").is_dir());
+    }
+
+    // ── mixed_burst ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn mixed_burst_creates_small_and_large_files() {
+        let tmp = TempDir::new().unwrap();
+        // 3 small + 1 large = 4 files total
+        let stats = mixed_burst(tmp.path(), 3, 1, 1);
+        assert_eq!(stats.files_created, 4);
+        assert!(stats.bytes_written > 0);
+    }
+
+    #[test]
+    fn mixed_burst_creates_subdir() {
+        let tmp = TempDir::new().unwrap();
+        mixed_burst(tmp.path(), 2, 0, 1);
+        assert!(tmp.path().join("mixed_burst").is_dir());
+    }
+
+    // ── modification_storm ───────────────────────────────────────────────────
+
+    #[test]
+    fn modification_storm_returns_zero_if_no_source_dir() {
+        let tmp = TempDir::new().unwrap();
+        // small_flood dir does not exist
+        let stats = modification_storm(tmp.path(), 5);
+        assert_eq!(stats.files_modified, 0);
+    }
+
+    #[test]
+    fn modification_storm_modifies_existing_files() {
+        let tmp = TempDir::new().unwrap();
+        small_file_flood(tmp.path(), 5);
+        let stats = modification_storm(tmp.path(), 3);
+        assert_eq!(stats.files_modified, 3);
+        assert!(stats.bytes_written > 0);
+    }
+
+    #[test]
+    fn modification_storm_capped_at_available_file_count() {
+        let tmp = TempDir::new().unwrap();
+        // Create 2 files, try to modify 10 — should only modify the 2 that exist
+        small_file_flood(tmp.path(), 2);
+        let stats = modification_storm(tmp.path(), 10);
+        assert_eq!(stats.files_modified, 2);
+    }
+
+    // ── delete_and_recreate ──────────────────────────────────────────────────
+
+    #[test]
+    fn delete_and_recreate_deletes_and_creates() {
+        let tmp = TempDir::new().unwrap();
+        small_file_flood(tmp.path(), 5);
+        let stats = delete_and_recreate(tmp.path(), 2, 3);
+        assert_eq!(stats.files_deleted, 2);
+        assert_eq!(stats.files_created, 3);
+        assert!(stats.bytes_written > 0);
+    }
+
+    #[test]
+    fn delete_and_recreate_creates_in_recreated_subdir() {
+        let tmp = TempDir::new().unwrap();
+        delete_and_recreate(tmp.path(), 0, 2);
+        let recreate_dir = tmp.path().join("recreated");
+        assert!(recreate_dir.is_dir());
+        let count = std::fs::read_dir(&recreate_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .count();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn delete_and_recreate_no_source_dir_still_creates() {
+        let tmp = TempDir::new().unwrap();
+        // No small_flood dir — delete count should be 0, create count honoured
+        let stats = delete_and_recreate(tmp.path(), 5, 2);
+        assert_eq!(stats.files_deleted, 0);
+        assert_eq!(stats.files_created, 2);
+    }
+
+    // ── sustained_tick ───────────────────────────────────────────────────────
+
+    #[test]
+    fn sustained_tick_creates_10_small_files_for_non_divisible_tick() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("sustained")).unwrap();
+        // tick 1: not divisible by 5 or 20 → 10 small files only
+        let stats = sustained_tick(tmp.path(), 1);
+        assert_eq!(stats.files_created, 10);
+    }
+
+    #[test]
+    fn sustained_tick_5_adds_medium_file() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("sustained")).unwrap();
+        // tick 5: divisible by 5, not 20 → 10 small + 1 medium = 11
+        let stats = sustained_tick(tmp.path(), 5);
+        assert_eq!(stats.files_created, 11);
+    }
+
+    #[test]
+    fn sustained_tick_0_adds_medium_and_large_files() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("sustained")).unwrap();
+        // tick 0: divisible by both 5 and 20 → 10 small + 1 medium + 1 large = 12
+        let stats = sustained_tick(tmp.path(), 0);
+        assert_eq!(stats.files_created, 12);
+    }
+
+    #[test]
+    fn sustained_tick_creates_sustained_dir_if_missing() {
+        let tmp = TempDir::new().unwrap();
+        // Do NOT pre-create the sustained dir — the function should create it
+        sustained_tick(tmp.path(), 1);
+        assert!(tmp.path().join("sustained").is_dir());
+    }
+
+    #[test]
+    fn sustained_tick_bytes_written_is_positive() {
+        let tmp = TempDir::new().unwrap();
+        let stats = sustained_tick(tmp.path(), 2);
+        assert!(stats.bytes_written > 0);
+    }
+
+    // ── prepare_directories ──────────────────────────────────────────────────
+
+    #[test]
+    fn prepare_directories_creates_all_top_level_dirs() {
+        let tmp = TempDir::new().unwrap();
+        prepare_directories(tmp.path());
+        for name in &[
+            "small_flood",
+            "large_files",
+            "mixed_burst",
+            "recreated",
+            "sustained",
+        ] {
+            assert!(
+                tmp.path().join(name).is_dir(),
+                "missing top-level dir: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_directories_creates_mixed_burst_nested_dirs() {
+        let tmp = TempDir::new().unwrap();
+        prepare_directories(tmp.path());
+        for depth in 0..4 {
+            for branch in 0..3 {
+                let p = tmp
+                    .path()
+                    .join(format!("mixed_burst/depth{depth}/branch{branch}"));
+                assert!(p.is_dir(), "missing nested dir: {}", p.display());
+            }
+        }
+    }
+
+    #[test]
+    fn prepare_directories_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        // Calling twice must not panic (create_dir_all / create_dir with .ok() handle exists)
+        prepare_directories(tmp.path());
+        prepare_directories(tmp.path());
+        assert!(tmp.path().join("small_flood").is_dir());
+    }
+}
+
 /// Phase 5: Delete some files and recreate new ones.
 pub fn delete_and_recreate(dir: &Path, delete_count: usize, create_count: usize) -> WorkloadStats {
     let subdir = dir.join("small_flood");

@@ -149,3 +149,177 @@ fn parse_json(path: &Path, data: &str) -> DhatSummary {
         parse_error: None,
     }
 }
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    // ── DhatSummary::error ───────────────────────────────────────────────────
+
+    #[test]
+    fn dhat_summary_error_constructor_sets_all_fields() {
+        let p = Path::new("/tmp/fake.json");
+        let s = DhatSummary::error(p, "test error".to_string());
+        assert_eq!(s.parse_error.as_deref(), Some("test error"));
+        assert_eq!(s.total_bytes, 0);
+        assert_eq!(s.total_blocks, 0);
+        assert_eq!(s.max_site_peak_bytes, 0);
+        assert!(s.top_sites.is_empty());
+        assert!(s.command.is_none());
+        assert!(s.pid.is_none());
+        assert_eq!(s.output_path, p);
+    }
+
+    // ── parse_json ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_json_valid_minimal() {
+        let p = Path::new("/tmp/test.json");
+        let json = r#"{
+            "cmd": "test-cmd",
+            "pid": 1234,
+            "ftbl": ["frame_a", "frame_b"],
+            "pps": [
+                {"tb": 100, "tbk": 5, "mb": 50, "mbk": 2, "rb": 80, "wb": 90, "eb": 10, "fs": [0, 1]}
+            ]
+        }"#;
+        let s = parse_json(p, json);
+        assert!(s.parse_error.is_none());
+        assert_eq!(s.command.as_deref(), Some("test-cmd"));
+        assert_eq!(s.pid, Some(1234));
+        assert_eq!(s.total_bytes, 100);
+        assert_eq!(s.total_blocks, 5);
+        assert_eq!(s.max_site_peak_bytes, 50);
+        assert_eq!(s.top_sites.len(), 1);
+        assert_eq!(
+            s.top_sites[0].frames,
+            vec!["frame_a".to_string(), "frame_b".to_string()]
+        );
+        assert_eq!(s.top_sites[0].bytes_read, 80);
+        assert_eq!(s.top_sites[0].bytes_written, 90);
+        assert_eq!(s.top_sites[0].bytes_never_accessed, 10);
+    }
+
+    #[test]
+    fn parse_json_no_pps_returns_error() {
+        let p = Path::new("/tmp/test.json");
+        let json = r#"{"cmd": "test", "ftbl": []}"#;
+        let s = parse_json(p, json);
+        assert!(s.parse_error.is_some());
+    }
+
+    #[test]
+    fn parse_json_invalid_json_returns_error() {
+        let p = Path::new("/tmp/test.json");
+        let s = parse_json(p, "not valid json{{{");
+        assert!(s.parse_error.is_some());
+    }
+
+    #[test]
+    fn parse_json_empty_pps_returns_empty_summary() {
+        let p = Path::new("/tmp/test.json");
+        let json = r#"{"ftbl": [], "pps": []}"#;
+        let s = parse_json(p, json);
+        assert!(s.parse_error.is_none());
+        assert_eq!(s.total_bytes, 0);
+        assert_eq!(s.total_blocks, 0);
+        assert!(s.top_sites.is_empty());
+        assert_eq!(s.max_site_peak_bytes, 0);
+    }
+
+    #[test]
+    fn parse_json_sorts_by_peak_bytes_descending() {
+        let p = Path::new("/tmp/test.json");
+        let json = r#"{
+            "ftbl": [],
+            "pps": [
+                {"tb": 10, "tbk": 1, "mb": 5,  "mbk": 1, "rb": 0, "wb": 0, "eb": 0, "fs": []},
+                {"tb": 20, "tbk": 1, "mb": 50, "mbk": 1, "rb": 0, "wb": 0, "eb": 0, "fs": []},
+                {"tb": 5,  "tbk": 1, "mb": 10, "mbk": 1, "rb": 0, "wb": 0, "eb": 0, "fs": []}
+            ]
+        }"#;
+        let s = parse_json(p, json);
+        assert!(s.parse_error.is_none());
+        assert_eq!(s.top_sites[0].peak_bytes, 50);
+        assert_eq!(s.top_sites[1].peak_bytes, 10);
+        assert_eq!(s.top_sites[2].peak_bytes, 5);
+    }
+
+    #[test]
+    fn parse_json_top_sites_capped_at_25() {
+        let p = Path::new("/tmp/test.json");
+        let pps_entries: Vec<String> = (0u64..30)
+            .map(|i| {
+                format!(
+                    r#"{{"tb": {i}, "tbk": 1, "mb": {i}, "mbk": 1, "rb": 0, "wb": 0, "eb": 0, "fs": []}}"#
+                )
+            })
+            .collect();
+        let json = format!(r#"{{"ftbl": [], "pps": [{}]}}"#, pps_entries.join(","));
+        let s = parse_json(p, &json);
+        assert!(s.parse_error.is_none());
+        assert_eq!(s.top_sites.len(), 25);
+    }
+
+    #[test]
+    fn parse_json_accumulates_grand_totals_correctly() {
+        let p = Path::new("/tmp/test.json");
+        let json = r#"{
+            "ftbl": [],
+            "pps": [
+                {"tb": 100, "tbk": 3, "mb": 40, "mbk": 1, "rb": 0, "wb": 0, "eb": 0, "fs": []},
+                {"tb": 200, "tbk": 7, "mb": 20, "mbk": 2, "rb": 0, "wb": 0, "eb": 0, "fs": []}
+            ]
+        }"#;
+        let s = parse_json(p, json);
+        assert!(s.parse_error.is_none());
+        assert_eq!(s.total_bytes, 300);
+        assert_eq!(s.total_blocks, 10);
+        // max_site_peak_bytes is the largest single-site peak (40), not the sum
+        assert_eq!(s.max_site_peak_bytes, 40);
+    }
+
+    #[test]
+    fn parse_json_missing_optional_cmd_and_pid() {
+        let p = Path::new("/tmp/test.json");
+        let json = r#"{"ftbl": [], "pps": []}"#;
+        let s = parse_json(p, json);
+        assert!(s.parse_error.is_none());
+        assert!(s.command.is_none());
+        assert!(s.pid.is_none());
+    }
+
+    // ── wait_for_output ──────────────────────────────────────────────────────
+
+    #[test]
+    fn wait_for_output_returns_none_when_file_missing() {
+        let p = Path::new("/tmp/definitely_no_such_dhat_file_xyz_bench_test.json");
+        let result = wait_for_output(p, std::time::Duration::from_millis(300));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn wait_for_output_returns_none_for_empty_file() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("empty_dhat.json");
+        std::fs::write(&p, b"").unwrap();
+        // Empty file (len == 0) should NOT be considered ready
+        let result = wait_for_output(&p, std::time::Duration::from_millis(300));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn wait_for_output_finds_existing_non_empty_file() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("dhat.json");
+        std::fs::write(&p, b"{}").unwrap();
+        // wait_for_output sleeps 500 ms after finding the file, so give it 2 s
+        let result = wait_for_output(&p, std::time::Duration::from_secs(2));
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), p);
+    }
+}
