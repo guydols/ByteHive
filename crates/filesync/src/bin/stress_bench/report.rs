@@ -1523,3 +1523,161 @@ renderLogs();
         html
     }
 }
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Event, EventKind, IntegrityResult};
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    fn empty_report() -> BenchmarkReport {
+        BenchmarkReport::new(
+            Duration::from_secs(30),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            vec![],
+            vec![],
+        )
+    }
+
+    // ── fmt_bytes ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn fmt_bytes_below_kb() {
+        assert_eq!(fmt_bytes(0), "0 B");
+        assert_eq!(fmt_bytes(512), "512 B");
+        assert_eq!(fmt_bytes(1023), "1023 B");
+    }
+
+    #[test]
+    fn fmt_bytes_exactly_one_kb() {
+        assert_eq!(fmt_bytes(1024), "1.0 KB");
+    }
+
+    #[test]
+    fn fmt_bytes_fractional_kb() {
+        assert_eq!(fmt_bytes(1536), "1.5 KB");
+    }
+
+    #[test]
+    fn fmt_bytes_exactly_one_mb() {
+        assert_eq!(fmt_bytes(1024 * 1024), "1.00 MB");
+    }
+
+    #[test]
+    fn fmt_bytes_exactly_one_gb() {
+        assert_eq!(fmt_bytes(1024 * 1024 * 1024), "1.00 GB");
+    }
+
+    #[test]
+    fn fmt_bytes_fractional_gb() {
+        // 1.5 GB
+        assert_eq!(fmt_bytes(1024 * 1024 * 1024 + 512 * 1024 * 1024), "1.50 GB");
+    }
+
+    // ── BenchmarkReport::new ──────────────────────────────────────────────────
+
+    #[test]
+    fn new_stores_duration_and_empty_vecs() {
+        let r = empty_report();
+        assert_eq!(r.total_duration, Duration::from_secs(30));
+        assert!(r.events.is_empty());
+        assert!(r.server_samples.is_empty());
+        assert!(r.client_samples.is_empty());
+        assert!(r.server_logs.is_empty());
+        assert!(r.client_logs.is_empty());
+        assert!(r.integrity_results.is_empty());
+        assert!(r.dhat_server.is_none());
+        assert!(r.dhat_client.is_none());
+    }
+
+    #[test]
+    fn new_stores_events() {
+        let events = vec![Event {
+            elapsed_secs: 1.0,
+            kind: EventKind::Info("hello".to_string()),
+        }];
+        let report = BenchmarkReport::new(
+            Duration::from_secs(10),
+            events,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            vec![],
+            vec![],
+        );
+        assert_eq!(report.events.len(), 1);
+        assert_eq!(report.total_duration, Duration::from_secs(10));
+    }
+
+    // ── generate_html ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn generate_html_creates_nonempty_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("report.html");
+        empty_report().generate_html(&path).unwrap();
+        assert!(path.exists());
+        assert!(std::fs::metadata(&path).unwrap().len() > 0);
+    }
+
+    #[test]
+    fn generate_html_contains_doctype() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("report.html");
+        empty_report().generate_html(&path).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("<!DOCTYPE html>"), "must contain DOCTYPE");
+    }
+
+    #[test]
+    fn generate_html_with_phase_event_includes_phase_name() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("report.html");
+        let report = BenchmarkReport::new(
+            Duration::from_secs(10),
+            vec![Event {
+                elapsed_secs: 2.5,
+                kind: EventKind::PhaseStart("small_flood".to_string()),
+            }],
+            vec![(
+                "small_flood".to_string(),
+                IntegrityResult {
+                    matched: 3,
+                    mismatched: vec![],
+                    missing_from_dest: vec![],
+                    extra_in_dest: vec![],
+                },
+            )],
+            vec![],
+            vec![],
+            None,
+            None,
+            vec![],
+            vec![],
+        );
+        report.generate_html(&path).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("small_flood"),
+            "phase name must appear in HTML report"
+        );
+    }
+
+    #[test]
+    fn generate_html_to_invalid_path_returns_error() {
+        let report = empty_report();
+        let result =
+            report.generate_html(std::path::Path::new("/no_such_dir_bench_test/report.html"));
+        assert!(result.is_err());
+    }
+}

@@ -174,3 +174,305 @@ pub fn load(path: &Path) -> io::Result<LoadedData> {
         completed,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Event, EventKind, IntegrityResult, LogLine, ProcessSample, ThreadSample};
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    fn dummy_sample(elapsed: f64) -> ProcessSample {
+        ProcessSample {
+            elapsed_secs: elapsed,
+            cpu_percent: 0.0,
+            user_cpu_percent: 0.0,
+            sys_cpu_percent: 0.0,
+            rss_bytes: 0,
+            vm_size_bytes: 0,
+            shared_bytes: 0,
+            private_bytes: 0,
+            thread_count: 1,
+            threads: vec![],
+            io_read_bytes: 0,
+            io_write_bytes: 0,
+            net_rx_bytes: 0,
+            net_tx_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn create_produces_a_valid_store() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("data.ndjson");
+        assert!(DataStore::create(&path).is_ok());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn load_empty_store() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("data.ndjson");
+        let store = DataStore::create(&path).unwrap();
+        drop(store);
+        let loaded = load(&path).unwrap();
+        assert!(loaded.events.is_empty());
+        assert!(loaded.server_samples.is_empty());
+        assert!(loaded.client_samples.is_empty());
+        assert!(loaded.server_logs.is_empty());
+        assert!(loaded.client_logs.is_empty());
+        assert!(!loaded.completed);
+    }
+
+    #[test]
+    fn append_event_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("data.ndjson");
+        let store = DataStore::create(&path).unwrap();
+        store.append(&DataRecord::Event {
+            event: Event {
+                elapsed_secs: 1.5,
+                kind: EventKind::PhaseStart("alpha".to_string()),
+            },
+        });
+        drop(store);
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.events.len(), 1);
+        assert_eq!(loaded.events[0].elapsed_secs, 1.5);
+    }
+
+    #[test]
+    fn append_complete_marks_run_as_done() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("data.ndjson");
+        let store = DataStore::create(&path).unwrap();
+        store.append(&DataRecord::Complete {
+            total_duration_secs: 42.0,
+        });
+        drop(store);
+        let loaded = load(&path).unwrap();
+        assert!(loaded.completed);
+        assert_eq!(loaded.total_duration, Duration::from_secs_f64(42.0));
+    }
+
+    #[test]
+    fn append_server_and_client_samples_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("data.ndjson");
+        let store = DataStore::create(&path).unwrap();
+        store.append(&DataRecord::ServerSample {
+            sample: dummy_sample(1.0),
+        });
+        store.append(&DataRecord::ClientSample {
+            sample: dummy_sample(2.0),
+        });
+        drop(store);
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.server_samples.len(), 1);
+        assert_eq!(loaded.client_samples.len(), 1);
+        assert_eq!(loaded.server_samples[0].elapsed_secs, 1.0);
+        assert_eq!(loaded.client_samples[0].elapsed_secs, 2.0);
+    }
+
+    #[test]
+    fn append_logs_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("data.ndjson");
+        let store = DataStore::create(&path).unwrap();
+        store.append(&DataRecord::ServerLog {
+            line: LogLine {
+                elapsed_secs: 0.5,
+                source: "server".to_string(),
+                level: "INFO".to_string(),
+                message: "started".to_string(),
+            },
+        });
+        store.append(&DataRecord::ClientLog {
+            line: LogLine {
+                elapsed_secs: 1.0,
+                source: "client".to_string(),
+                level: "DEBUG".to_string(),
+                message: "connected".to_string(),
+            },
+        });
+        drop(store);
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.server_logs.len(), 1);
+        assert_eq!(loaded.client_logs.len(), 1);
+        assert_eq!(loaded.server_logs[0].message, "started");
+        assert_eq!(loaded.client_logs[0].message, "connected");
+    }
+
+    #[test]
+    fn append_integrity_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("data.ndjson");
+        let store = DataStore::create(&path).unwrap();
+        store.append(&DataRecord::Integrity {
+            phase: "phase1".to_string(),
+            result: IntegrityResult {
+                matched: 10,
+                mismatched: vec![],
+                missing_from_dest: vec![],
+                extra_in_dest: vec![PathBuf::from("extra.dat")],
+            },
+        });
+        drop(store);
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.integrity_results.len(), 1);
+        assert_eq!(loaded.integrity_results[0].0, "phase1");
+        assert_eq!(loaded.integrity_results[0].1.matched, 10);
+    }
+
+    #[test]
+    fn load_skips_malformed_lines() {
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("data.ndjson");
+        let store = DataStore::create(&path).unwrap();
+        store.append(&DataRecord::Event {
+            event: Event {
+                elapsed_secs: 0.1,
+                kind: EventKind::Info("ok".to_string()),
+            },
+        });
+        drop(store);
+        // Append malformed lines after the valid record
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(f, "{{not valid json!!!}}").unwrap();
+        writeln!(f, "garbage line with no json at all").unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.events.len(), 1);
+    }
+
+    #[test]
+    fn load_duration_estimated_from_max_elapsed_when_incomplete() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("data.ndjson");
+        let store = DataStore::create(&path).unwrap();
+        store.append(&DataRecord::ServerSample {
+            sample: dummy_sample(99.5),
+        });
+        store.append(&DataRecord::ClientSample {
+            sample: dummy_sample(50.0),
+        });
+        drop(store);
+        let loaded = load(&path).unwrap();
+        assert!(!loaded.completed);
+        // Duration should be estimated from the max elapsed seen (99.5 s)
+        assert!(loaded.total_duration.as_secs_f64() > 99.0);
+    }
+
+    #[test]
+    fn meta_record_is_accepted_without_error() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("data.ndjson");
+        let store = DataStore::create(&path).unwrap();
+        store.append(&DataRecord::Meta {
+            run_id: "run-001".to_string(),
+            command: "stress-bench --duration 1".to_string(),
+        });
+        drop(store);
+        let loaded = load(&path).unwrap();
+        // Meta records don't populate any output fields but must not cause errors
+        assert!(loaded.events.is_empty());
+    }
+
+    #[test]
+    fn multiple_events_preserve_order_and_count() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("data.ndjson");
+        let store = DataStore::create(&path).unwrap();
+        for i in 0u32..5 {
+            store.append(&DataRecord::Event {
+                event: Event {
+                    elapsed_secs: i as f64,
+                    kind: EventKind::Info(format!("event {i}")),
+                },
+            });
+        }
+        drop(store);
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.events.len(), 5);
+        for (i, ev) in loaded.events.iter().enumerate() {
+            assert_eq!(ev.elapsed_secs, i as f64);
+        }
+    }
+
+    #[test]
+    fn create_truncates_existing_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("data.ndjson");
+        // Write some data first
+        {
+            let store = DataStore::create(&path).unwrap();
+            store.append(&DataRecord::Event {
+                event: Event {
+                    elapsed_secs: 1.0,
+                    kind: EventKind::Info("first run".to_string()),
+                },
+            });
+        }
+        // Create again — should truncate the previous contents
+        {
+            let store = DataStore::create(&path).unwrap();
+            store.append(&DataRecord::Complete {
+                total_duration_secs: 5.0,
+            });
+        }
+        let loaded = load(&path).unwrap();
+        // Only the Complete record from the second run should be present
+        assert!(loaded.events.is_empty());
+        assert!(loaded.completed);
+    }
+
+    #[test]
+    fn phase_end_event_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("data.ndjson");
+        let store = DataStore::create(&path).unwrap();
+        store.append(&DataRecord::Event {
+            event: Event {
+                elapsed_secs: 3.0,
+                kind: EventKind::PhaseEnd("large_files".to_string()),
+            },
+        });
+        drop(store);
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.events.len(), 1);
+        assert!(matches!(
+            &loaded.events[0].kind,
+            EventKind::PhaseEnd(name) if name == "large_files"
+        ));
+    }
+
+    #[test]
+    fn files_created_event_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("data.ndjson");
+        let store = DataStore::create(&path).unwrap();
+        store.append(&DataRecord::Event {
+            event: Event {
+                elapsed_secs: 5.0,
+                kind: EventKind::FilesCreated {
+                    count: 42,
+                    total_bytes: 1_048_576,
+                },
+            },
+        });
+        drop(store);
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.events.len(), 1);
+        assert!(matches!(
+            &loaded.events[0].kind,
+            EventKind::FilesCreated {
+                count: 42,
+                total_bytes: 1_048_576
+            }
+        ));
+    }
+}

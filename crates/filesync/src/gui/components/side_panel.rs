@@ -211,3 +211,82 @@ fn tab_button<'a>(
         .padding(0)
         .into()
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::gui::state::{Conflict, ConflictKind, SideTab, SyncSnapshot};
+
+    // ─── view smoke tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn view_stats_tab_default_snapshot_does_not_panic() {
+        let _ = super::view(&SyncSnapshot::default(), &SideTab::Stats);
+    }
+
+    #[test]
+    fn view_conflicts_tab_no_conflicts_does_not_panic() {
+        let _ = super::view(&SyncSnapshot::default(), &SideTab::Conflicts);
+    }
+
+    #[test]
+    fn view_conflicts_tab_with_one_conflict_does_not_panic() {
+        let mut snap = SyncSnapshot::default();
+        snap.conflicts.push(Conflict {
+            id: 1,
+            filename: "document.txt".into(),
+            folder_path: "/sync/docs".into(),
+            local_modified: "2024-01-01".into(),
+            remote_modified: "2024-01-02".into(),
+            kind: ConflictKind::BothModified,
+        });
+        let _ = super::view(&snap, &SideTab::Conflicts);
+    }
+
+    #[test]
+    fn view_conflicts_tab_with_many_conflicts_does_not_panic() {
+        let mut snap = SyncSnapshot::default();
+        let kinds = [
+            ConflictKind::BothModified,
+            ConflictKind::LocalOnly,
+            ConflictKind::RemoteOnly,
+            ConflictKind::BothCreated,
+        ];
+        for (i, kind) in kinds.into_iter().enumerate() {
+            snap.conflicts.push(Conflict {
+                id: i,
+                filename: format!("file_{i}.txt"),
+                folder_path: "/sync".into(),
+                local_modified: "t1".into(),
+                remote_modified: "t2".into(),
+                kind,
+            });
+        }
+        let _ = super::view(&snap, &SideTab::Conflicts);
+    }
+
+    #[test]
+    fn view_stats_tab_badge_visible_when_conflicts_present_does_not_panic() {
+        // Viewing Stats tab while conflicts exist — the badge count should render without panic.
+        let mut snap = SyncSnapshot::default();
+        snap.conflicts.push(Conflict {
+            id: 1,
+            filename: "x.txt".into(),
+            folder_path: "/sync".into(),
+            local_modified: "t1".into(),
+            remote_modified: "t2".into(),
+            kind: ConflictKind::BothModified,
+        });
+        let _ = super::view(&snap, &SideTab::Stats);
+    }
+
+    #[test]
+    fn view_stats_tab_with_populated_snapshot_does_not_panic() {
+        let mut snap = SyncSnapshot::default();
+        snap.file_count = 1_000;
+        snap.dir_count = 50;
+        snap.total_bytes = 2_147_483_648;
+        snap.bytes_sent = 1_048_576;
+        snap.bytes_received = 524_288;
+        let _ = super::view(&snap, &SideTab::Stats);
+    }
+}

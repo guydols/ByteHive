@@ -148,3 +148,162 @@ fn truncate_path(path: &str, max_len: usize) -> String {
         format!("\u{2026}{trimmed}")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{truncate_path, view};
+    use crate::gui::state::{Conflict, ConflictKind};
+
+    // ─── truncate_path ────────────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_path_short_path_returned_unchanged() {
+        let path = "/home/user/sync";
+        assert_eq!(truncate_path(path, 36), path);
+    }
+
+    #[test]
+    fn truncate_path_exactly_max_len_returned_unchanged() {
+        // Build a path that is exactly 36 ASCII chars.
+        let path = "/home/user/sync/docs/exactly36chars!";
+        assert_eq!(
+            path.len(),
+            36,
+            "test precondition: path must be exactly 36 bytes"
+        );
+        assert_eq!(truncate_path(path, 36), path);
+    }
+
+    #[test]
+    fn truncate_path_long_path_starts_with_ellipsis() {
+        let path = "/very/long/path/that/clearly/exceeds/the/maximum/allowed/length/file.txt";
+        let result = truncate_path(path, 36);
+        assert!(
+            result.starts_with('\u{2026}'),
+            "truncated path must start with the ellipsis character"
+        );
+    }
+
+    #[test]
+    fn truncate_path_long_path_char_count_is_max_len_minus_2() {
+        // The result is "…" (1 char) + last (max_len - 3) bytes = max_len - 2 chars (for ASCII).
+        let path = "/very/long/path/that/clearly/exceeds/the/maximum/allowed/length/file.txt";
+        let max_len = 36usize;
+        let result = truncate_path(path, max_len);
+        let char_count = result.chars().count();
+        assert_eq!(
+            char_count,
+            max_len - 2,
+            "truncated result should be {} chars, got {}",
+            max_len - 2,
+            char_count
+        );
+    }
+
+    #[test]
+    fn truncate_path_long_path_preserves_suffix() {
+        let path = "/very/long/path/that/clearly/exceeds/the/maximum/allowed/length/file.txt";
+        let max_len = 36usize;
+        let result = truncate_path(path, max_len);
+        // The last (max_len - 3) bytes of the original path appear at the end of the result.
+        let expected_suffix = &path[path.len() - (max_len - 3)..];
+        assert!(
+            result.ends_with(expected_suffix),
+            "truncated path must end with '{}', got '{}'",
+            expected_suffix,
+            result
+        );
+    }
+
+    #[test]
+    fn truncate_path_one_byte_over_max_len_is_truncated() {
+        // path.len() == max_len + 1, so it should be truncated.
+        let path = "/home/user/sync/docs/exactly37chars!!";
+        assert_eq!(
+            path.len(),
+            37,
+            "test precondition: path must be exactly 37 bytes"
+        );
+        let result = truncate_path(path, 36);
+        assert!(result.starts_with('\u{2026}'));
+    }
+
+    // ─── view smoke tests ─────────────────────────────────────────────────────
+
+    fn make_conflict(id: usize, kind: ConflictKind) -> Conflict {
+        Conflict {
+            id,
+            filename: format!("file_{id}.txt"),
+            folder_path: "/home/user/sync/docs".into(),
+            local_modified: "2024-06-01 10:00".into(),
+            remote_modified: "2024-06-01 11:30".into(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn view_empty_conflicts_does_not_panic() {
+        let _ = view(&[]);
+    }
+
+    #[test]
+    fn view_single_both_modified_conflict_does_not_panic() {
+        let c = make_conflict(1, ConflictKind::BothModified);
+        let _ = view(&[c]);
+    }
+
+    #[test]
+    fn view_single_local_only_conflict_does_not_panic() {
+        let c = make_conflict(2, ConflictKind::LocalOnly);
+        let _ = view(&[c]);
+    }
+
+    #[test]
+    fn view_single_remote_only_conflict_does_not_panic() {
+        let c = make_conflict(3, ConflictKind::RemoteOnly);
+        let _ = view(&[c]);
+    }
+
+    #[test]
+    fn view_single_both_created_conflict_does_not_panic() {
+        let c = make_conflict(4, ConflictKind::BothCreated);
+        let _ = view(&[c]);
+    }
+
+    #[test]
+    fn view_multiple_conflicts_does_not_panic() {
+        let conflicts = vec![
+            make_conflict(1, ConflictKind::BothModified),
+            make_conflict(2, ConflictKind::LocalOnly),
+            make_conflict(3, ConflictKind::RemoteOnly),
+            make_conflict(4, ConflictKind::BothCreated),
+        ];
+        let _ = view(&conflicts);
+    }
+
+    #[test]
+    fn view_conflict_with_long_folder_path_does_not_panic() {
+        let c = Conflict {
+            id: 99,
+            filename: "report.pdf".into(),
+            folder_path: "/very/deep/nested/directory/structure/that/exceeds/the/maximum/display/width/by/a/lot".into(),
+            local_modified: "2024-01-01".into(),
+            remote_modified: "2024-01-02".into(),
+            kind: ConflictKind::BothModified,
+        };
+        let _ = view(&[c]);
+    }
+
+    #[test]
+    fn view_conflict_with_short_folder_path_does_not_panic() {
+        let c = Conflict {
+            id: 1,
+            filename: "a.txt".into(),
+            folder_path: "/s".into(),
+            local_modified: "t1".into(),
+            remote_modified: "t2".into(),
+            kind: ConflictKind::LocalOnly,
+        };
+        let _ = view(&[c]);
+    }
+}

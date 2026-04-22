@@ -180,6 +180,107 @@ pub struct WorkloadStats {
     pub bytes_written: u64,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    // ── IntegrityResult::passed ───────────────────────────────────────────────
+
+    #[test]
+    fn integrity_result_passed_all_clean() {
+        let r = IntegrityResult {
+            matched: 5,
+            mismatched: vec![],
+            missing_from_dest: vec![],
+            extra_in_dest: vec![],
+        };
+        assert!(r.passed());
+    }
+
+    #[test]
+    fn integrity_result_fails_on_mismatch() {
+        let r = IntegrityResult {
+            matched: 3,
+            mismatched: vec![PathBuf::from("bad.txt")],
+            missing_from_dest: vec![],
+            extra_in_dest: vec![],
+        };
+        assert!(!r.passed());
+    }
+
+    #[test]
+    fn integrity_result_fails_on_missing() {
+        let r = IntegrityResult {
+            matched: 3,
+            mismatched: vec![],
+            missing_from_dest: vec![PathBuf::from("missing.txt")],
+            extra_in_dest: vec![],
+        };
+        assert!(!r.passed());
+    }
+
+    #[test]
+    fn integrity_result_passes_with_extra_only() {
+        // extra_in_dest does NOT cause a failure — passed() only checks
+        // mismatched and missing_from_dest
+        let r = IntegrityResult {
+            matched: 3,
+            mismatched: vec![],
+            missing_from_dest: vec![],
+            extra_in_dest: vec![PathBuf::from("extra.txt")],
+        };
+        assert!(r.passed());
+    }
+
+    #[test]
+    fn integrity_result_fails_on_both_mismatch_and_missing() {
+        let r = IntegrityResult {
+            matched: 1,
+            mismatched: vec![PathBuf::from("bad.txt")],
+            missing_from_dest: vec![PathBuf::from("gone.txt")],
+            extra_in_dest: vec![],
+        };
+        assert!(!r.passed());
+    }
+
+    #[test]
+    fn integrity_result_zero_matched_and_all_empty_passes() {
+        let r = IntegrityResult {
+            matched: 0,
+            mismatched: vec![],
+            missing_from_dest: vec![],
+            extra_in_dest: vec![],
+        };
+        assert!(r.passed());
+    }
+
+    // ── WorkloadStats ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn workload_stats_default_is_all_zero() {
+        let s = WorkloadStats::default();
+        assert_eq!(s.files_created, 0);
+        assert_eq!(s.files_modified, 0);
+        assert_eq!(s.files_deleted, 0);
+        assert_eq!(s.bytes_written, 0);
+    }
+
+    #[test]
+    fn workload_stats_fields_are_independent() {
+        let s = WorkloadStats {
+            files_created: 10,
+            files_modified: 5,
+            files_deleted: 3,
+            bytes_written: 1024,
+        };
+        assert_eq!(s.files_created, 10);
+        assert_eq!(s.files_modified, 5);
+        assert_eq!(s.files_deleted, 3);
+        assert_eq!(s.bytes_written, 1024);
+    }
+}
+
 // ─── Integrity result ───────────────────────────────────────────────────────
 
 /// Result of an integrity check between server and client directories.

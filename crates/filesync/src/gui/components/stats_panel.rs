@@ -149,3 +149,110 @@ fn format_bytes(bytes: u64) -> String {
         format!("{} B", bytes)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{format_bytes, format_count};
+    use crate::gui::state::SyncSnapshot;
+    use std::time::Instant;
+
+    // ─── format_count ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn format_count_zero() {
+        assert_eq!(format_count(0), "0");
+    }
+
+    #[test]
+    fn format_count_three_digits() {
+        assert_eq!(format_count(999), "999");
+    }
+
+    #[test]
+    fn format_count_exactly_1000() {
+        assert_eq!(format_count(1_000), "1,000");
+    }
+
+    #[test]
+    fn format_count_six_digits() {
+        assert_eq!(format_count(123_456), "123,456");
+    }
+
+    #[test]
+    fn format_count_seven_digits() {
+        assert_eq!(format_count(1_000_000), "1,000,000");
+    }
+
+    #[test]
+    fn format_count_large_number() {
+        assert_eq!(format_count(1_234_567_890), "1,234,567,890");
+    }
+
+    // ─── format_bytes ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn format_bytes_zero() {
+        assert_eq!(format_bytes(0), "0 B");
+    }
+
+    #[test]
+    fn format_bytes_below_kb() {
+        assert_eq!(format_bytes(512), "512 B");
+    }
+
+    #[test]
+    fn format_bytes_exactly_1kb() {
+        // {:.0} KB rounds to no decimal places
+        assert_eq!(format_bytes(1_024), "1 KB");
+    }
+
+    #[test]
+    fn format_bytes_2kb() {
+        assert_eq!(format_bytes(2_048), "2 KB");
+    }
+
+    #[test]
+    fn format_bytes_exactly_1mb() {
+        assert_eq!(format_bytes(1_048_576), "1.0 MB");
+    }
+
+    #[test]
+    fn format_bytes_1_5mb() {
+        assert_eq!(format_bytes(1_572_864), "1.5 MB");
+    }
+
+    #[test]
+    fn format_bytes_exactly_1gb() {
+        assert_eq!(format_bytes(1_073_741_824), "1.00 GB");
+    }
+
+    #[test]
+    fn format_bytes_2gb() {
+        assert_eq!(format_bytes(2_147_483_648), "2.00 GB");
+    }
+
+    // ─── view smoke tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn view_default_snapshot_does_not_panic() {
+        let _ = super::view(&SyncSnapshot::default());
+    }
+
+    #[test]
+    fn view_with_nonzero_counts_does_not_panic() {
+        let mut snap = SyncSnapshot::default();
+        snap.file_count = 500;
+        snap.dir_count = 20;
+        snap.total_bytes = 1_073_741_824;
+        snap.bytes_sent = 1_048_576;
+        snap.bytes_received = 524_288;
+        let _ = super::view(&snap);
+    }
+
+    #[test]
+    fn view_with_last_connected_does_not_panic() {
+        let mut snap = SyncSnapshot::default();
+        snap.last_connected = Some(Instant::now());
+        let _ = super::view(&snap);
+    }
+}

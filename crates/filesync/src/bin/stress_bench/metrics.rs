@@ -413,6 +413,20 @@ pub struct MetricsHandle {
     thread: Option<thread::JoinHandle<()>>,
 }
 
+#[cfg(test)]
+impl MetricsHandle {
+    /// Constructs an empty `MetricsHandle` with no background thread.
+    /// Used only in tests to exercise `snapshot` and `stop` without a real PID.
+    fn empty() -> Self {
+        Self {
+            server_samples: Arc::new(Mutex::new(Vec::new())),
+            client_samples: Arc::new(Mutex::new(Vec::new())),
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            thread: None,
+        }
+    }
+}
+
 impl MetricsHandle {
     /// Returns snapshots of all collected samples so far for
     /// (server, client).
@@ -448,5 +462,110 @@ impl MetricsHandle {
             .map(|g| g.clone())
             .unwrap_or_default();
         (srv, cli)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    // ── parse_status_kb ──────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_status_kb_parses_standard_line() {
+        assert_eq!(parse_status_kb("VmRSS:  1024 kB"), 1024);
+    }
+
+    #[test]
+    fn parse_status_kb_parses_large_value() {
+        assert_eq!(parse_status_kb("VmSize:  65536 kB"), 65536);
+    }
+
+    #[test]
+    fn parse_status_kb_returns_zero_for_missing_value() {
+        assert_eq!(parse_status_kb("VmRSS:"), 0);
+    }
+
+    #[test]
+    fn parse_status_kb_returns_zero_for_non_numeric() {
+        assert_eq!(parse_status_kb("VmRSS: abc kB"), 0);
+    }
+
+    #[test]
+    fn parse_status_kb_returns_zero_for_empty_string() {
+        assert_eq!(parse_status_kb(""), 0);
+    }
+
+    #[test]
+    fn parse_status_kb_parses_zero() {
+        assert_eq!(parse_status_kb("VmRSS: 0 kB"), 0);
+    }
+
+    // ── MetricsHandle ────────────────────────────────────────────────────────
+
+    #[test]
+    fn metrics_handle_snapshot_returns_empty_when_no_samples() {
+        let handle = MetricsHandle::empty();
+        let (srv, cli) = handle.snapshot();
+        assert!(srv.is_empty());
+        assert!(cli.is_empty());
+    }
+
+    #[test]
+    fn metrics_handle_stop_returns_empty_and_does_not_panic() {
+        let handle = MetricsHandle::empty();
+        let (srv, cli) = handle.stop();
+        assert!(srv.is_empty());
+        assert!(cli.is_empty());
+    }
+
+    #[test]
+    fn metrics_handle_stop_sets_stop_flag() {
+        let handle = MetricsHandle::empty();
+        // Stopping an already-stopped (no thread) handle must not panic and the
+        // stop_flag should be set to true before the samples are returned.
+        let flag = handle.stop_flag.clone();
+        let _ = handle.stop();
+        assert!(flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn metrics_handle_snapshot_after_manual_push() {
+        let handle = MetricsHandle::empty();
+        {
+            let mut guard = handle.server_samples.lock().unwrap();
+            guard.push(ProcessSample {
+                elapsed_secs: 1.0,
+                cpu_percent: 5.0,
+                user_cpu_percent: 3.0,
+                sys_cpu_percent: 2.0,
+                rss_bytes: 1024,
+                vm_size_bytes: 4096,
+                shared_bytes: 512,
+                private_bytes: 512,
+                thread_count: 2,
+                threads: vec![],
+                io_read_bytes: 0,
+                io_write_bytes: 0,
+                net_rx_bytes: 0,
+                net_tx_bytes: 0,
+            });
+        }
+        let (srv, cli) = handle.snapshot();
+        assert_eq!(srv.len(), 1);
+        assert_eq!(cli.len(), 0);
+        assert_eq!(srv[0].elapsed_secs, 1.0);
+        assert_eq!(srv[0].cpu_percent, 5.0);
+    }
+
+    // ── ProcessMetricsCollector ──────────────────────────────────────────────
+
+    #[test]
+    fn process_metrics_collector_new_stores_interval() {
+        let collector = ProcessMetricsCollector::new(Duration::from_millis(250));
+        // Just verify it can be constructed without panicking; actual sampling
+        // requires live child PIDs and is exercised at integration level.
+        drop(collector);
     }
 }

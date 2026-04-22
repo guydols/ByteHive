@@ -94,3 +94,50 @@ fn connection_badge(status: &ConnectionStatus) -> Element<'_, Message> {
         .align_y(Alignment::Center)
         .into()
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::gui::state::ConnectionStatus;
+
+    // ─── view smoke tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn view_disconnected_does_not_panic() {
+        let _ = super::view(&ConnectionStatus::Disconnected);
+    }
+
+    #[test]
+    fn view_connecting_does_not_panic() {
+        let _ = super::view(&ConnectionStatus::Connecting);
+    }
+
+    #[test]
+    fn view_initial_sync_does_not_panic() {
+        let _ = super::view(&ConnectionStatus::InitialSync);
+    }
+
+    #[test]
+    fn view_idle_does_not_panic() {
+        let _ = super::view(&ConnectionStatus::Idle);
+    }
+
+    #[test]
+    fn view_paused_does_not_panic() {
+        let _ = super::view(&ConnectionStatus::Paused);
+    }
+
+    #[test]
+    fn view_awaiting_approval_does_not_panic() {
+        let _ = super::view(&ConnectionStatus::AwaitingApproval);
+    }
+
+    #[test]
+    fn view_error_does_not_panic() {
+        let _ = super::view(&ConnectionStatus::Error("connection refused".into()));
+    }
+
+    #[test]
+    fn view_error_empty_message_does_not_panic() {
+        let _ = super::view(&ConnectionStatus::Error(String::new()));
+    }
+}

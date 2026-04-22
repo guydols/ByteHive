@@ -182,6 +182,142 @@ fn banner(msg: &str) {
     eprintln!("╚{bar}╝\n");
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── scaled ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn scaled_identity_factor() {
+        assert_eq!(scaled(100, 1.0), 100);
+    }
+
+    #[test]
+    fn scaled_double_factor() {
+        assert_eq!(scaled(50, 2.0), 100);
+    }
+
+    #[test]
+    fn scaled_half_factor() {
+        assert_eq!(scaled(100, 0.5), 50);
+    }
+
+    #[test]
+    fn scaled_minimum_is_one_for_tiny_input() {
+        // Even with a very small scale, result must be at least 1
+        assert_eq!(scaled(1, 0.0001), 1);
+    }
+
+    #[test]
+    fn scaled_minimum_is_one_for_zero_input() {
+        assert_eq!(scaled(0, 5.0), 1);
+    }
+
+    #[test]
+    fn scaled_fractional_rounds_down() {
+        // 7 * 0.5 = 3.5 → truncated to 3
+        assert_eq!(scaled(7, 0.5), 3);
+    }
+
+    // ── human_bytes ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn human_bytes_zero() {
+        assert_eq!(human_bytes(0), "0 B");
+    }
+
+    #[test]
+    fn human_bytes_below_kb() {
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+    }
+
+    #[test]
+    fn human_bytes_exactly_one_kb() {
+        // 1024 bytes → "1 KB" (format is "{:.0} KB", so no decimal)
+        assert_eq!(human_bytes(1024), "1 KB");
+    }
+
+    #[test]
+    fn human_bytes_two_kb() {
+        assert_eq!(human_bytes(2048), "2 KB");
+    }
+
+    #[test]
+    fn human_bytes_exactly_one_mb() {
+        assert_eq!(human_bytes(1_048_576), "1.0 MB");
+    }
+
+    #[test]
+    fn human_bytes_exactly_one_gb() {
+        assert_eq!(human_bytes(1_073_741_824), "1.00 GB");
+    }
+
+    #[test]
+    fn human_bytes_fractional_mb() {
+        // 1.5 MB = 1572864 bytes
+        assert_eq!(human_bytes(1_572_864), "1.5 MB");
+    }
+
+    // ── bench_run_id ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn bench_run_id_has_expected_length() {
+        // Expected format: YYYY-MM-DD_HH-MM-SS (19 chars)
+        let id = bench_run_id();
+        assert_eq!(id.len(), 19, "unexpected id: {id}");
+    }
+
+    #[test]
+    fn bench_run_id_separators_at_correct_positions() {
+        let id = bench_run_id();
+        let chars: Vec<char> = id.chars().collect();
+        assert_eq!(chars[4], '-', "expected '-' at pos 4 in: {id}");
+        assert_eq!(chars[7], '-', "expected '-' at pos 7 in: {id}");
+        assert_eq!(chars[10], '_', "expected '_' at pos 10 in: {id}");
+        assert_eq!(chars[13], '-', "expected '-' at pos 13 in: {id}");
+        assert_eq!(chars[16], '-', "expected '-' at pos 16 in: {id}");
+    }
+
+    #[test]
+    fn bench_run_id_digits_at_non_separator_positions() {
+        let id = bench_run_id();
+        let chars: Vec<char> = id.chars().collect();
+        for i in [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18] {
+            assert!(
+                chars[i].is_ascii_digit(),
+                "expected digit at pos {i} in: {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn bench_run_id_year_is_plausible() {
+        let id = bench_run_id();
+        let year: u32 = id[..4].parse().expect("year must be numeric");
+        assert!(year >= 2024, "year {year} should be at least 2024");
+        assert!(
+            year <= 2100,
+            "year {year} looks unreasonably far in the future"
+        );
+    }
+
+    #[test]
+    fn bench_run_id_two_calls_close_in_time_share_date() {
+        let id1 = bench_run_id();
+        let id2 = bench_run_id();
+        // The date portion (first 10 chars) should be the same when called
+        // back-to-back (unless we're exactly on a midnight boundary, which
+        // is vanishingly unlikely in CI).
+        assert_eq!(
+            &id1[..10],
+            &id2[..10],
+            "date portions differ: {id1} vs {id2}"
+        );
+    }
+}
+
 fn phase_banner(name: &str) {
     eprintln!("┌──────────────────────────────────────────────────────────────");
     eprintln!("│  Phase: {name}");
