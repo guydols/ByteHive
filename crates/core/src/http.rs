@@ -452,7 +452,15 @@ struct LoginBody {
 }
 
 async fn login_handler(State(s): State<ApiState>, Json(body): Json<LoginBody>) -> Response {
-    match s.users.login(&body.username, &body.password) {
+    let users = s.users.clone();
+    let result = tokio::task::spawn_blocking(move || users.login(&body.username, &body.password))
+        .await
+        .unwrap_or_else(|e| {
+            log::error!("login task panicked: {e}");
+            None
+        });
+
+    match result {
         Some(sess) => {
             let groups = s.users.groups_for_user(&sess.username);
             let cookie = format!(
