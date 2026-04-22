@@ -62,7 +62,7 @@ jobs:
           echo "color=${COLOR}" >> $GITHUB_OUTPUT
 
       - name: Update coverage badge
-        uses: Schneegans/dynamic-badges-action@v1.7.0
+        uses: Schneegans/dynamic-badges-action@v1.8.0
         with:
           auth: ${{ secrets.GIST_TOKEN }}
           gistID: a1b2c3d4e5f6789012345678901234567890
