@@ -4,6 +4,7 @@ use crate::manifest;
 use crate::protocol::FILE_STABILITY_MS;
 use crate::protocol::*;
 use crate::transport::Connection;
+use bytehive_core::TrashManager;
 use crossbeam_channel::bounded;
 use log::warn;
 use parking_lot::RwLock;
@@ -63,6 +64,17 @@ struct LargeFileAssembly {
     final_hash_pending: Option<[u8; 32]>,
 }
 
+/// Optional configuration overrides for a [`SyncEngine`] instance.
+#[derive(Debug, Default, Clone)]
+pub struct SyncEngineConfig {
+    /// Automatically purge trash entries older than this many days.
+    /// `None` or `0` disables automatic purging.
+    pub trash_expiry_days: Option<u64>,
+    /// Override for the periodic full-rescan interval in seconds.
+    /// Defaults to `FULL_SCAN_INTERVAL_SECS` (900) when `None`.
+    pub full_scan_interval_secs: Option<u64>,
+}
+
 pub struct SyncEngine {
     root: PathBuf,
     node_id: String,
@@ -75,6 +87,8 @@ pub struct SyncEngine {
     in_progress: RwLock<HashMap<PathBuf, LargeFileAssembly>>,
 
     exclusions: Arc<Exclusions>,
+    trash_manager: Arc<TrashManager>,
+    full_scan_interval_secs: u64,
 }
 
 /// Returns the path that a conflict copy of `rel_path` should use.
@@ -115,45 +129,6 @@ fn hash_file(path: &Path) -> Option<[u8; 32]> {
     Some(hasher.finalize().into())
 }
 
-/// Move a file or directory into the `.bh_filesync/trash` folder.
-/// The item is renamed to `<unix_ms>_<original_name>` inside the trash dir.
-/// If rename fails (e.g. cross-device), falls back to a hard delete.
-fn move_to_trash(root: &Path, full_path: &Path, rel: &Path) {
-    if !full_path.exists() {
-        return;
-    }
-    let trash_dir = root.join(crate::protocol::TRASH_DIR);
-    if fs::create_dir_all(&trash_dir).is_err() {
-        // Can't create trash — fall back to hard delete
-        if full_path.is_dir() {
-            let _ = fs::remove_dir_all(full_path);
-        } else {
-            let _ = fs::remove_file(full_path);
-        }
-        return;
-    }
-
-    let file_name = rel
-        .file_name()
-        .unwrap_or_else(|| std::ffi::OsStr::new("unknown"))
-        .to_string_lossy();
-    let unix_ms = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let trash_dest = trash_dir.join(format!("{unix_ms}_{file_name}"));
-
-    if fs::rename(full_path, &trash_dest).is_err() {
-        // Cross-device or permission issue — fall back to hard delete
-        warn!("trash rename failed for {rel:?}; falling back to delete");
-        if full_path.is_dir() {
-            let _ = fs::remove_dir_all(full_path);
-        } else {
-            let _ = fs::remove_file(full_path);
-        }
-    }
-}
-
 /// Remove empty intermediate directories left behind inside the transfers
 /// folder after a large-file tmp file has been consumed or deleted.
 /// Walks upward from `tmp_path`'s parent, removing directories that are
@@ -175,10 +150,23 @@ fn cleanup_transfer_dirs(root: &Path, tmp_path: &Path) {
 
 impl SyncEngine {
     pub fn new(root: PathBuf, node_id: String, exclusions: Arc<Exclusions>) -> Self {
+        Self::new_configured(root, node_id, exclusions, SyncEngineConfig::default())
+    }
+
+    pub fn new_configured(
+        root: PathBuf,
+        node_id: String,
+        exclusions: Arc<Exclusions>,
+        config: SyncEngineConfig,
+    ) -> Self {
         log::debug!(
             "SyncEngine: {} active exclusion rule(s)",
             exclusions.rule_count()
         );
+        let full_scan_interval_secs = config
+            .full_scan_interval_secs
+            .unwrap_or(FULL_SCAN_INTERVAL_SECS);
+        let trash_manager = TrashManager::new(root.clone(), config.trash_expiry_days);
         Self {
             manifest: RwLock::new(Manifest {
                 files: HashMap::new(),
@@ -190,6 +178,8 @@ impl SyncEngine {
             suppressed_deletes: Arc::new(RwLock::new(HashSet::new())),
             in_progress: RwLock::new(HashMap::new()),
             exclusions,
+            trash_manager,
+            full_scan_interval_secs,
         }
     }
 
@@ -239,6 +229,41 @@ impl SyncEngine {
 
         let age_ms = now_ms.saturating_sub(modified_ms);
         age_ms >= FILE_STABILITY_MS
+    }
+
+    /// Returns the configured full-rescan interval in seconds.
+    pub fn full_scan_interval_secs(&self) -> u64 {
+        self.full_scan_interval_secs
+    }
+
+    /// Returns a reference to the shared trash manager.
+    pub fn trash_manager(&self) -> &Arc<TrashManager> {
+        &self.trash_manager
+    }
+
+    /// List all entries currently in the trash.
+    pub fn list_trash(&self) -> Vec<bytehive_core::TrashEntry> {
+        self.trash_manager.list_trash()
+    }
+
+    /// Restore a trashed entry by its ID back to its original location.
+    pub fn restore_trash_entry(&self, id: &str) -> Result<(), String> {
+        self.trash_manager.restore_entry(id)
+    }
+
+    /// Permanently delete a single trash entry by its ID.
+    pub fn purge_trash_entry(&self, id: &str) -> Result<(), String> {
+        self.trash_manager.purge_entry(id)
+    }
+
+    /// Purge all entries that exceed the configured expiry age.
+    pub fn purge_expired_trash(&self) -> usize {
+        self.trash_manager.purge_expired()
+    }
+
+    /// Empty the entire trash bin. Returns the number of entries removed.
+    pub fn empty_trash(&self) -> usize {
+        self.trash_manager.empty()
     }
 
     pub fn scan(&self) -> std::io::Result<Manifest> {
@@ -704,7 +729,7 @@ impl SyncEngine {
 
             let full = self.root.join(rel);
             if full.is_dir() {
-                move_to_trash(&self.root, &full, rel);
+                self.trash_manager.move_to_trash(&full, rel, &self.node_id);
                 let children: Vec<PathBuf> = self
                     .manifest
                     .read()
@@ -719,7 +744,7 @@ impl SyncEngine {
                 }
                 m.files.remove(rel);
             } else {
-                move_to_trash(&self.root, &full, rel);
+                self.trash_manager.move_to_trash(&full, rel, &self.node_id);
                 self.manifest.write().files.remove(rel);
             }
             count += 1;

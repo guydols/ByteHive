@@ -11,8 +11,8 @@ use crate::gui::tray::{TrayEvent, TrayHandle};
 use crate::gui::{components, theme};
 
 use iced::{
-    widget::{button, column, container, row, text, text_input, Space},
-    window, Alignment, Background, Element, Length, Size, Subscription, Task, Theme,
+    widget::{button, column, container, row, text, text_editor, text_input, Space},
+    window, Alignment, Background, Element, Font, Length, Size, Subscription, Task, Theme,
 };
 
 use std::collections::HashMap;
@@ -38,6 +38,7 @@ pub fn run(tray: TrayHandle) -> iced::Result {
         resizable: true,
         decorations: true,
         exit_on_close_request: false,
+        icon: load_window_icon(),
         ..Default::default()
     })
     .run()
@@ -55,13 +56,31 @@ fn load_window_icon() -> Option<window::Icon> {
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
-#[derive(Default)]
 struct SetupState {
     step: SetupStep,
     folder_input: String,
     server_input: String,
     token_input: String,
+    // ── Step 3: Configure ────────────────────────────────────────────────────
+    /// Raw TOML text being edited by the user.
+    config_editor: text_editor::Content,
+    /// Validated config produced when the user clicks Next on the Configure step.
+    parsed_config: Option<GuiConfig>,
     error: Option<String>,
+}
+
+impl Default for SetupState {
+    fn default() -> Self {
+        Self {
+            step: SetupStep::default(),
+            folder_input: String::new(),
+            server_input: String::new(),
+            token_input: String::new(),
+            config_editor: text_editor::Content::new(),
+            parsed_config: None,
+            error: None,
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -69,6 +88,8 @@ enum SetupStep {
     #[default]
     Folder,
     Server,
+    /// Step 3: exclusions and any future per-install settings.
+    Configure,
     Review,
 }
 
@@ -104,6 +125,8 @@ pub enum Message {
     FolderPicked(Option<PathBuf>),
     ServerInput(String),
     TokenInput(String),
+    // Configure step
+    ConfigEditorAction(text_editor::Action),
     SetupNext,
     SetupBack,
     SetupConnect,
@@ -212,6 +235,13 @@ impl FileSyncGui {
                 Task::none()
             }
 
+            Message::ConfigEditorAction(action) => {
+                if let Screen::Setup(s) = &mut self.screen {
+                    s.config_editor.perform(action);
+                }
+                Task::none()
+            }
+
             Message::SetupNext => {
                 if let Screen::Setup(s) = &mut self.screen {
                     match s.step {
@@ -230,7 +260,34 @@ impl FileSyncGui {
                                 s.error = Some("Please enter your auth token.".into());
                             } else {
                                 s.error = None;
-                                s.step = SetupStep::Review;
+                                // Regenerate the TOML template from the latest inputs every
+                                // time the user advances to the Configure step so that edits
+                                // to folder / server / token are always reflected.
+                                let toml = config_toml_template(
+                                    s.folder_input.trim(),
+                                    s.server_input.trim(),
+                                    s.token_input.trim(),
+                                );
+                                s.config_editor = text_editor::Content::with_text(&toml);
+                                s.step = SetupStep::Configure;
+                            }
+                        }
+                        SetupStep::Configure => {
+                            let raw = s.config_editor.text();
+                            match toml::from_str::<GuiConfig>(&raw) {
+                                Ok(cfg) if cfg.is_complete() => {
+                                    s.parsed_config = Some(cfg);
+                                    s.error = None;
+                                    s.step = SetupStep::Review;
+                                }
+                                Ok(_) => {
+                                    s.error = Some(
+                                        "Config is incomplete — server_addr, sync_root and auth_token are required.".into(),
+                                    );
+                                }
+                                Err(e) => {
+                                    s.error = Some(format!("Invalid TOML: {e}"));
+                                }
                             }
                         }
                         SetupStep::Review => {}
@@ -243,7 +300,8 @@ impl FileSyncGui {
                 if let Screen::Setup(s) = &mut self.screen {
                     match s.step {
                         SetupStep::Server => s.step = SetupStep::Folder,
-                        SetupStep::Review => s.step = SetupStep::Server,
+                        SetupStep::Configure => s.step = SetupStep::Server,
+                        SetupStep::Review => s.step = SetupStep::Configure,
                         _ => {}
                     }
                     s.error = None;
@@ -253,11 +311,9 @@ impl FileSyncGui {
 
             Message::SetupConnect => {
                 if let Screen::Setup(s) = &mut self.screen {
-                    let cfg = GuiConfig {
-                        sync_root: PathBuf::from(s.folder_input.trim()),
-                        server_addr: s.server_input.trim().to_string(),
-                        auth_token: s.token_input.trim().to_string(),
-                        ..Default::default()
+                    let cfg = match s.parsed_config.clone() {
+                        Some(c) => c,
+                        None => return Task::none(),
                     };
                     if let Err(e) = cfg.save() {
                         s.error = Some(format!("Failed to save config: {e}"));
@@ -465,7 +521,8 @@ fn view_setup(s: &SetupState) -> Element<'_, Message> {
     let step_num = match s.step {
         SetupStep::Folder => 1u8,
         SetupStep::Server => 2,
-        SetupStep::Review => 3,
+        SetupStep::Configure => 3,
+        SetupStep::Review => 4,
     };
 
     let header = column![
@@ -475,7 +532,7 @@ fn view_setup(s: &SetupState) -> Element<'_, Message> {
                 color: Some(theme::TEXT_PRIMARY),
             }),
         vspace(4),
-        text(format!("Setup  \u{2014}  Step {step_num} of 3"))
+        text(format!("Setup  \u{2014}  Step {step_num} of 4"))
             .size(14)
             .style(theme::secondary),
         vspace(16),
@@ -486,6 +543,7 @@ fn view_setup(s: &SetupState) -> Element<'_, Message> {
     let body: Element<Message> = match s.step {
         SetupStep::Folder => view_setup_folder(s),
         SetupStep::Server => view_setup_server(s),
+        SetupStep::Configure => view_setup_configure(s),
         SetupStep::Review => view_setup_review(s),
     };
 
@@ -502,7 +560,7 @@ fn view_setup(s: &SetupState) -> Element<'_, Message> {
 }
 
 fn step_dots(active: u8) -> Element<'static, Message> {
-    let dots: Vec<Element<Message>> = (1u8..=3)
+    let dots: Vec<Element<Message>> = (1u8..=4)
         .map(|i| {
             let colour = if i <= active {
                 theme::AMBER
@@ -625,7 +683,82 @@ fn view_setup_server(s: &SetupState) -> Element<'_, Message> {
     setup_card(inner.into())
 }
 
+fn view_setup_configure(s: &SetupState) -> Element<'_, Message> {
+    let editor = text_editor(&s.config_editor)
+        .on_action(Message::ConfigEditorAction)
+        .font(Font::MONOSPACE)
+        .size(13)
+        .padding(12)
+        .height(Length::Fill);
+
+    let mut content = column![
+        text("Configure Settings")
+            .size(18)
+            .style(|_: &Theme| iced::widget::text::Style {
+                color: Some(theme::TEXT_PRIMARY),
+            }),
+        vspace(6),
+        text(
+            "Edit the full configuration that will be saved to disk. \
+             The TOML is pre-filled from your earlier inputs — \
+             adjust exclusions, log level, or any other field before continuing."
+        )
+        .size(13)
+        .style(theme::secondary),
+        vspace(16),
+        editor,
+    ]
+    .spacing(0)
+    .height(Length::Fill);
+
+    if let Some(e) = &s.error {
+        content = content
+            .push(vspace(8))
+            .push(text(e.as_str()).size(13).style(theme::red_text));
+    }
+    content = content.push(vspace(16)).push(row![
+        button("\u{2190} Back")
+            .on_press(Message::SetupBack)
+            .padding([10, 18])
+            .style(theme::btn_ghost),
+        hspace_fill(),
+        button("Next \u{2192}")
+            .on_press(Message::SetupNext)
+            .padding([10, 24])
+            .style(theme::btn_primary),
+    ]);
+
+    container(content)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(20)
+        .style(theme::panel)
+        .into()
+}
+
 fn view_setup_review(s: &SetupState) -> Element<'_, Message> {
+    // Read the validated config produced by the Configure step.
+    let cfg = match &s.parsed_config {
+        Some(c) => c,
+        None => return text("No configuration available.").into(),
+    };
+
+    let excl_glob = if cfg.exclude_patterns.is_empty() {
+        "None".to_string()
+    } else {
+        cfg.exclude_patterns.join(", ")
+    };
+    let excl_regex = if cfg.exclude_regex.is_empty() {
+        "None".to_string()
+    } else {
+        cfg.exclude_regex.join(", ")
+    };
+    let log_level = cfg
+        .log_level
+        .as_deref()
+        .unwrap_or("info (default)")
+        .to_string();
+
     let mut inner = column![
         text("Review & Connect")
             .size(18)
@@ -637,14 +770,20 @@ fn view_setup_review(s: &SetupState) -> Element<'_, Message> {
             .size(13)
             .style(theme::secondary),
         vspace(20),
-        review_row("Sync folder", s.folder_input.clone()),
+        review_row("Sync folder", cfg.sync_root.to_string_lossy().into_owned()),
         vspace(10),
-        review_row("Server", s.server_input.clone()),
+        review_row("Server", cfg.server_addr.clone()),
         vspace(10),
         review_row(
             "Auth token",
             "\u{25CF}\u{25CF}\u{25CF}\u{25CF}\u{25CF}\u{25CF}\u{25CF}\u{25CF}".to_owned()
         ),
+        vspace(10),
+        review_row("Glob exclusions", excl_glob),
+        vspace(10),
+        review_row("Regex exclusions", excl_regex),
+        vspace(10),
+        review_row("Log level", log_level),
         vspace(16),
         thin_rule(),
     ]
@@ -844,6 +983,46 @@ fn refresh_file_tree(old_tree: &[FileNode], root: &std::path::Path) -> Vec<FileN
     let mut new_tree = scan_file_tree(root);
     apply_tree_state(&mut new_tree, &state_map);
     new_tree
+}
+
+// ─── Config template ─────────────────────────────────────────────────────────
+
+/// Escapes a bare string value for embedding inside a TOML double-quoted string.
+fn toml_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Generates the pre-filled, commented TOML template shown in the Configure step.
+fn config_toml_template(folder: &str, server: &str, token: &str) -> String {
+    format!(
+        r#"# ByteHive FileSync — client configuration
+# Edit any value below, then click Next to validate and continue.
+
+server_addr = "{server}"
+sync_root   = "{folder}"
+auth_token  = "{token}"
+
+# ── Exclusions ──────────────────────────────────────────────────────────────
+# Glob patterns — files and folders matching these will be skipped during sync.
+# Each pattern is matched against the relative path inside the sync root.
+# Segments: *  matches anything within one path segment.
+#           ** matches across directory boundaries.
+# Examples: "*.tmp", "node_modules", "build/**", ".git", "**/.DS_Store"
+exclude_patterns = []
+
+# Raw regular expressions for more precise exclusion rules.
+# Matched against the forward-slash-separated relative path.
+# Examples: "\\.pyc$", "^\\.DS_Store$", "^__pycache__"
+exclude_regex = []
+
+# ── Advanced ───────────────────────────────────────────────────────────────
+# Minimum log verbosity.  One of: "error", "warn", "info", "debug", "trace"
+# log_level = "info"
+"#,
+        server = toml_escape(server),
+        folder = toml_escape(folder),
+        token = toml_escape(token),
+    )
 }
 
 // ─── Setup helpers ────────────────────────────────────────────────────────────

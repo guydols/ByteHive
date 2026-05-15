@@ -237,10 +237,9 @@ impl FileBrowserApp {
             Err(e) => return HttpResponse::bad_request(e),
         };
 
-        match crate::fs_util::move_to_bh_trash(&inner.root, &abs) {
-            Ok(()) => HttpResponse::ok_json(json!({"ok": true})),
-            Err(e) => HttpResponse::internal_error(e),
-        }
+        let rel = abs.strip_prefix(&inner.root).unwrap_or(&abs).to_path_buf();
+        inner.trash_manager.move_to_trash(&abs, &rel, "filebrowser");
+        HttpResponse::ok_json(json!({"ok": true}))
     }
 
     pub fn handle_rename(&self, req: &HttpRequest) -> HttpResponse {
@@ -716,5 +715,73 @@ impl FileBrowserApp {
             "size":         size,
             "is_dir":       is_dir,
         }))
+    }
+
+    pub fn handle_trash_list(&self) -> HttpResponse {
+        let guard = self.inner.read();
+        let inner = match guard.as_ref() {
+            Some(i) => i,
+            None => return HttpResponse::internal_error("not running"),
+        };
+        let entries: Vec<_> = inner
+            .trash_manager
+            .list_trash()
+            .into_iter()
+            .map(|e| {
+                json!({
+                    "id":            e.id,
+                    "original_path": e.original_path,
+                    "deleted_at_ms": e.deleted_at_ms,
+                    "size":          e.size,
+                    "is_dir":        e.is_dir,
+                    "deleted_by":    e.deleted_by,
+                })
+            })
+            .collect();
+        HttpResponse::ok_json(json!({ "entries": entries }))
+    }
+
+    pub fn handle_trash_restore(&self, id: &str) -> HttpResponse {
+        let guard = self.inner.read();
+        let inner = match guard.as_ref() {
+            Some(i) => i,
+            None => return HttpResponse::internal_error("not running"),
+        };
+        match inner.trash_manager.restore_entry(id) {
+            Ok(()) => HttpResponse::ok_json(json!({ "ok": true })),
+            Err(e) => HttpResponse::bad_request(e),
+        }
+    }
+
+    pub fn handle_trash_purge_entry(&self, id: &str) -> HttpResponse {
+        let guard = self.inner.read();
+        let inner = match guard.as_ref() {
+            Some(i) => i,
+            None => return HttpResponse::internal_error("not running"),
+        };
+        match inner.trash_manager.purge_entry(id) {
+            Ok(()) => HttpResponse::ok_json(json!({ "ok": true })),
+            Err(e) => HttpResponse::not_found(e),
+        }
+    }
+
+    pub fn handle_trash_empty(&self) -> HttpResponse {
+        let guard = self.inner.read();
+        let inner = match guard.as_ref() {
+            Some(i) => i,
+            None => return HttpResponse::internal_error("not running"),
+        };
+        let count = inner.trash_manager.empty();
+        HttpResponse::ok_json(json!({ "ok": true, "purged": count }))
+    }
+
+    pub fn handle_trash_purge_expired(&self) -> HttpResponse {
+        let guard = self.inner.read();
+        let inner = match guard.as_ref() {
+            Some(i) => i,
+            None => return HttpResponse::internal_error("not running"),
+        };
+        let count = inner.trash_manager.purge_expired();
+        HttpResponse::ok_json(json!({ "ok": true, "purged": count }))
     }
 }

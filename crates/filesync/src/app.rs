@@ -2,7 +2,7 @@ use crate::client::Client;
 use crate::exclusions::{ExclusionConfig, Exclusions};
 use crate::known_hosts::{ClientStatus, KnownClients};
 use crate::server::Server;
-use crate::sync_engine::SyncEngine;
+use crate::sync_engine::{SyncEngine, SyncEngineConfig};
 use crate::{cert_fingerprint, timestamp_id};
 
 use bytehive_core::{
@@ -44,6 +44,16 @@ pub struct FileSyncConfig {
 
     #[serde(default)]
     pub exclude_regex: Vec<String>,
+
+    /// Automatically purge trash entries older than this many days.
+    /// Set to 0 or omit to disable automatic purging.
+    #[serde(default)]
+    pub trash_expiry_days: Option<u64>,
+
+    /// Override for the periodic full-rescan interval in seconds.
+    /// Defaults to 900 seconds (15 minutes) when not set.
+    #[serde(default)]
+    pub full_scan_interval_secs: Option<u64>,
 }
 
 impl FileSyncConfig {
@@ -147,7 +157,15 @@ impl App for FileSyncApp {
             exclusions.rule_count()
         );
 
-        let engine = Arc::new(SyncEngine::new(cfg.root.clone(), node_id, exclusions));
+        let engine = Arc::new(SyncEngine::new_configured(
+            cfg.root.clone(),
+            node_id,
+            exclusions,
+            SyncEngineConfig {
+                trash_expiry_days: cfg.trash_expiry_days,
+                full_scan_interval_secs: cfg.full_scan_interval_secs,
+            },
+        ));
 
         {
             let eng = Arc::clone(&engine);
@@ -163,6 +181,18 @@ impl App for FileSyncApp {
                     Err(e) => {
                         log::warn!("filesync: initial scan failed (metrics will show 0 until next scan): {e}");
                     }
+                })
+                .map_err(CoreError::Io)?;
+        }
+
+        // Spawn trash GC thread if expiry is configured
+        if cfg.trash_expiry_days.map(|d| d > 0).unwrap_or(false) {
+            let eng = Arc::clone(&engine);
+            thread::Builder::new()
+                .name("filesync-trash-gc".into())
+                .spawn(move || loop {
+                    thread::sleep(Duration::from_secs(3600));
+                    eng.purge_expired_trash();
                 })
                 .map_err(CoreError::Io)?;
         }
@@ -476,6 +506,58 @@ impl App for FileSyncApp {
                         "no client with fingerprint {fp}"
                     )))
                 }
+            }
+
+            // ── trash management ──────────────────────────────────────────────────
+            ("GET", "/trash") => {
+                let entries: Vec<_> = state
+                    .engine
+                    .list_trash()
+                    .into_iter()
+                    .map(|e| {
+                        json!({
+                            "id":             e.id,
+                            "original_path":  e.original_path,
+                            "deleted_at_ms":  e.deleted_at_ms,
+                            "size":           e.size,
+                            "is_dir":         e.is_dir,
+                            "deleted_by":     e.deleted_by,
+                        })
+                    })
+                    .collect();
+                Some(HttpResponse::ok_json(json!({ "entries": entries })))
+            }
+
+            ("POST", sub) if sub.starts_with("/trash/") && sub.ends_with("/restore") => {
+                let id = sub
+                    .trim_start_matches("/trash/")
+                    .trim_end_matches("/restore");
+                match state.engine.restore_trash_entry(id) {
+                    Ok(()) => Some(HttpResponse::ok_json(json!({ "ok": true }))),
+                    Err(e) => Some(HttpResponse::bad_request(e)),
+                }
+            }
+
+            ("DELETE", sub) if sub.starts_with("/trash/") => {
+                let id = sub.trim_start_matches("/trash/");
+                match state.engine.purge_trash_entry(id) {
+                    Ok(()) => Some(HttpResponse::ok_json(json!({ "ok": true }))),
+                    Err(e) => Some(HttpResponse::not_found(e)),
+                }
+            }
+
+            ("DELETE", "/trash") => {
+                let count = state.engine.empty_trash();
+                Some(HttpResponse::ok_json(
+                    json!({ "ok": true, "purged": count }),
+                ))
+            }
+
+            ("POST", "/trash/purge-expired") => {
+                let count = state.engine.purge_expired_trash();
+                Some(HttpResponse::ok_json(
+                    json!({ "ok": true, "purged": count }),
+                ))
             }
 
             _ => None,

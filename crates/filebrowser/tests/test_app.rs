@@ -21,6 +21,7 @@ fn make_app(tmp: &TempDir, allow_delete: bool) -> std::sync::Arc<FileBrowserApp>
         root: tmp.path().to_path_buf(),
         max_upload_bytes: 10 * 1024 * 1024,
         allow_delete,
+        trash_manager: bytehive_core::TrashManager::new(tmp.path().to_path_buf(), None),
     });
     app
 }

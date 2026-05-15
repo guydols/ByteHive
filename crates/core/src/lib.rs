@@ -6,6 +6,7 @@ pub mod error;
 pub mod html;
 pub mod http;
 pub mod registry;
+pub mod trash;
 pub mod users;
 
 pub use app::{App, AppContext, AppManifest};
@@ -15,6 +16,7 @@ pub use config::{AppConfig, FrameworkConfig};
 pub use error::CoreError;
 pub use http::{ApiServer, HttpRequest, HttpResponse};
 pub use registry::{AppInfo, AppRegistry, AppStatus};
+pub use trash::{TrashEntry, TrashManager};
 pub use users::{
     ApiKey, ApiKeyInfo, AuthContext, AuthMethod, Group, Session, UserEntry, UserInfo, UserStore,
     GROUP_ADMIN, GROUP_USER,

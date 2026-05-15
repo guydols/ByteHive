@@ -91,6 +91,8 @@ fn filesync_config_exclusions_compiles_glob_rules() {
         auth_token: None,
         exclude_patterns: vec!["*.log".to_string(), "build/**".to_string()],
         exclude_regex: vec![],
+        trash_expiry_days: None,
+        full_scan_interval_secs: None,
     };
     let ex = cfg.exclusions();
     assert_eq!(ex.rule_count(), 4); // 2 explicit + 2 default rules
@@ -109,6 +111,8 @@ fn filesync_config_exclusions_compiles_regex_rules() {
         auth_token: None,
         exclude_patterns: vec![],
         exclude_regex: vec![r".*\.(tmp|bak)$".to_string()],
+        trash_expiry_days: None,
+        full_scan_interval_secs: None,
     };
     let ex = cfg.exclusions();
     assert_eq!(ex.rule_count(), 3); // 1 explicit + 2 default rules
@@ -127,6 +131,8 @@ fn filesync_config_empty_exclusions() {
         auth_token: None,
         exclude_patterns: vec![],
         exclude_regex: vec![],
+        trash_expiry_days: None,
+        full_scan_interval_secs: None,
     };
     let ex = cfg.exclusions();
     assert_eq!(ex.rule_count(), 2); // 2 default rules
