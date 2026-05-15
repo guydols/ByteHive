@@ -43,6 +43,16 @@ pub fn run(tray: TrayHandle) -> iced::Result {
     .run()
 }
 
+fn load_window_icon() -> Option<window::Icon> {
+    const ICON_PNG: &[u8] =
+        include_bytes!("../../../core/assets/bytehive_icon_128x128.png");
+    let img = image::load_from_memory(ICON_PNG)
+        .ok()?
+        .into_rgba8();
+    let (w, h) = img.dimensions();
+    window::icon::from_rgba(img.into_raw(), w, h).ok()
+}
+
 // ─── State ────────────────────────────────────────────────────────────────────
 
 #[derive(Default)]
