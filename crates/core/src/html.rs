@@ -25,3 +25,6 @@ pub const SHARE_ERROR: &str = include_str!("../assets/share_error.html");
 pub const PASSWORD_SHARE_ERROR: &str = r#"<p class="err">Incorrect password — try again.</p>"#;
 
 pub const PASSWORD_SHARE: &str = include_str!("../assets/password_share.html");
+
+pub const BYTEHIVE_ICON_32_PNG: &[u8] = include_bytes!("../assets/bytehive_icon_32x32.png");
+pub const BYTEHIVE_ICON_64_PNG: &[u8] = include_bytes!("../assets/bytehive_icon_64x64.png");

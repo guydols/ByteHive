@@ -29,6 +29,7 @@ fn make_app_with_limit(
         root: tmp.path().to_path_buf(),
         max_upload_bytes,
         allow_delete,
+        trash_manager: bytehive_core::TrashManager::new(tmp.path().to_path_buf(), None),
     });
     app
 }

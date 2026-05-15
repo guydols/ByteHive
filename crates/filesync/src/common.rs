@@ -139,7 +139,7 @@ impl PendingChanges {
     /// since the last one.  Any newly-discovered changes or deletions are
     /// folded into the pending sets.
     pub fn periodic_rescan(&mut self, engine: &SyncEngine, label: &str) {
-        if self.last_full_scan.elapsed().as_secs() < FULL_SCAN_INTERVAL_SECS {
+        if self.last_full_scan.elapsed().as_secs() < engine.full_scan_interval_secs() {
             return;
         }
         info!("{label}: periodic full re-scan starting …");

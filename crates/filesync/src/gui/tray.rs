@@ -72,41 +72,10 @@ pub fn setup_tray() -> TrayHandle {
 }
 
 fn make_icon() -> Icon {
-    const SIZE: usize = 22;
-    let mut px = vec![0u8; SIZE * SIZE * 4];
-
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let dx = x as f32 - 10.5;
-            let dy = y as f32 - 10.5;
-            let r = (dx * dx + dy * dy).sqrt();
-
-            let i = (y * SIZE + x) * 4;
-
-            if r > 10.2 {
-                continue;
-            }
-
-            px[i] = 0x3B;
-            px[i + 1] = 0x82;
-            px[i + 2] = 0xF6;
-            px[i + 3] = 255;
-
-            let angle = dy.atan2(dx);
-            let in_arc =
-                !(angle > std::f32::consts::FRAC_PI_4 && angle < std::f32::consts::FRAC_PI_2 * 1.5);
-            if r > 5.5 && r < 8.0 && in_arc {
-                px[i] = 255;
-                px[i + 1] = 255;
-                px[i + 2] = 255;
-            }
-
-            if dx > 0.5 && dy > -2.0 && dy < 2.0 && r < 8.0 && r > 4.0 {
-                px[i] = 255;
-                px[i + 1] = 255;
-                px[i + 2] = 255;
-            }
-        }
-    }
-    Icon::from_rgba(px, SIZE as u32, SIZE as u32).expect("create tray icon pixels")
+    const ICON_PNG: &[u8] = include_bytes!("../../../core/assets/bytehive_icon_32x32.png");
+    let img = image::load_from_memory(ICON_PNG)
+        .expect("decode tray icon PNG")
+        .into_rgba8();
+    let (w, h) = img.dimensions();
+    Icon::from_rgba(img.into_raw(), w, h).expect("create tray icon")
 }

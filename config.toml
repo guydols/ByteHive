@@ -173,6 +173,21 @@ bind_addr = "0.0.0.0:7878"
 # Authentication: server validates clients via the framework UserStore.
 # No extra config needed for the server.  Clients set auth_token below.
 
+# Trash settings
+# ──────────────
+# When a file is deleted it is moved into .bh_filesync/trash/ under the root,
+# mirroring the original folder structure.  An index.json inside the trash
+# directory records metadata (original path, deletion time, size, …) for
+# every entry so files can be listed and restored via the API.
+#
+# trash_expiry_days — automatically purge entries older than N days.
+#   0 or omitted → keep forever (manual purge only).
+# trash_expiry_days = 30
+
+# full_scan_interval_secs — how often to do a full filesystem re-scan to
+#   catch changes that inotify may have missed.  Default: 900 (15 minutes).
+# full_scan_interval_secs = 900
+
 exclude_patterns = [
     # ── Python ────────────────────────────────────────────────
     "**/venv/**",

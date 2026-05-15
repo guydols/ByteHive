@@ -1,6 +1,8 @@
 use crate::auth::Auth;
 use crate::bus::{BusMessage, MessageBus};
-use crate::html::{ADMIN_DASHBOARD_HTML, PORTAL_HTML, SETUP_HTML};
+use crate::html::{
+    ADMIN_DASHBOARD_HTML, BYTEHIVE_ICON_32_PNG, BYTEHIVE_ICON_64_PNG, PORTAL_HTML, SETUP_HTML,
+};
 use crate::registry::AppRegistry;
 use crate::users::{AuthContext, AuthMethod, Group, UserEntry, UserStore};
 
@@ -270,6 +272,8 @@ fn build_router(state: ApiState) -> Router {
         .route("/", get(portal_handler))
         .route("/bytehive-icon.svg", get(bytehive_icon_handler))
         .route("/bytehive-logo-full.svg", get(bytehive_logo_full_handler))
+        .route("/bytehive_icon_32x32.png", get(bytehive_icon_32_handler))
+        .route("/bytehive_icon_64x64.png", get(bytehive_icon_64_handler))
         .route("/web/*path", get(static_handler))
         .route("/s/:token", get(share_handler).post(share_handler))
         .nest("/api/auth", public_auth.merge(authenticated_auth))
@@ -630,6 +634,20 @@ async fn bytehive_logo_full_handler() -> impl IntoResponse {
     (
         [(axum::http::header::CONTENT_TYPE, "image/svg+xml")],
         BYTEHIVE_LOGO_FULL_SVG,
+    )
+}
+
+async fn bytehive_icon_32_handler() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "image/png")],
+        BYTEHIVE_ICON_32_PNG,
+    )
+}
+
+async fn bytehive_icon_64_handler() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "image/png")],
+        BYTEHIVE_ICON_64_PNG,
     )
 }
 

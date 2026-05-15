@@ -3,6 +3,13 @@
     <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width,initial-scale=1" />
+        <link rel="icon" type="image/svg+xml" href="/bytehive-icon.svg" />
+        <link
+            rel="icon"
+            type="image/png"
+            sizes="32x32"
+            href="/bytehive_icon_32x32.png"
+        />
         <title>Bytehive</title>
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -688,7 +695,10 @@
                             id="inp-user"
                             autocomplete="username"
                             placeholder="username"
-                            onkeydown="if(event.key==='Enter')document.getElementById('inp-pass').focus()"
+                            onkeydown="
+                                if (event.key === 'Enter')
+                                    document.getElementById('inp-pass').focus();
+                            "
                         />
                     </div>
                     <div class="lfield">
@@ -698,7 +708,7 @@
                             id="inp-pass"
                             autocomplete="current-password"
                             placeholder="••••••••"
-                            onkeydown="if(event.key==='Enter')doLogin()"
+                            onkeydown="if (event.key === 'Enter') doLogin();"
                         />
                     </div>
                     <button
@@ -920,8 +930,9 @@
                 const r = document.getElementById("sb-role");
                 r.textContent = grps.length ? grps.join(", ") : "(no groups)";
                 r.className = "sb-user-role " + topGroup;
-                document.getElementById("sb-admin-link").style.display =
-                    isAdmin ? "block" : "none";
+                document.getElementById("sb-admin-link").style.display = isAdmin
+                    ? "block"
+                    : "none";
             }
 
             async function loadNav() {

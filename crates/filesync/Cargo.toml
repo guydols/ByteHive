@@ -37,6 +37,7 @@ toml.workspace = true
 tray-icon = "0.21.3"
 iced = { version = "0.14.0", features = ["tokio", "svg"] }
 glib = "0.21.5"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 clap        = { workspace = true }
 
