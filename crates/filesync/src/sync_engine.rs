@@ -60,6 +60,10 @@ struct LargeFileAssembly {
     expected_hash: [u8; 32],
     dst: PathBuf,
     file_size: u64,
+    /// Original modification timestamp (ms since Unix epoch) from the sender.
+    /// Restored onto the destination file after the transfer is committed so
+    /// that the receiver's filesystem mtime matches the sender's.
+    modified_ms: u64,
 
     final_hash_pending: Option<[u8; 32]>,
 }
@@ -353,6 +357,10 @@ impl SyncEngine {
     pub fn apply_bundle(&self, bundle: &FileBundle) -> std::io::Result<ApplyResult> {
         let mut written = Vec::new();
         let mut result = ApplyResult::default();
+        // Collect (absolute_path, modified_ms) for directories so we can stamp
+        // them *after* all their contents have been written.  Writing files into
+        // a directory updates the directory's mtime, so we must restore it last.
+        let mut dir_mtimes: Vec<(PathBuf, u64)> = Vec::new();
 
         for fd in &bundle.files {
             if !safe_relative(&fd.metadata.rel_path) {
@@ -396,17 +404,28 @@ impl SyncEngine {
                 }
             }
 
-            // --- Apply the incoming file ---
+            // --- Apply the incoming entry ---
             self.suppressed.write().insert(fd.metadata.rel_path.clone());
             written.push(fd.metadata.rel_path.clone());
 
             if fd.metadata.is_dir {
                 fs::create_dir_all(&full)?;
+                // Defer mtime restoration until after all files in this bundle
+                // have been written, otherwise child-file writes will clobber it.
+                dir_mtimes.push((full.clone(), fd.metadata.modified_ms));
             } else {
                 if let Some(parent) = full.parent() {
                     fs::create_dir_all(parent)?;
                 }
                 fs::write(&full, &fd.content)?;
+                // Restore the sender's modification timestamp on the file.
+                let mtime = filetime::FileTime::from_unix_time(
+                    (fd.metadata.modified_ms / 1000) as i64,
+                    ((fd.metadata.modified_ms % 1000) * 1_000_000) as u32,
+                );
+                if let Err(e) = filetime::set_file_mtime(&full, mtime) {
+                    warn!("failed to set mtime on {:?}: {e}", full);
+                }
             }
 
             self.manifest
@@ -414,6 +433,20 @@ impl SyncEngine {
                 .files
                 .insert(fd.metadata.rel_path.clone(), fd.metadata.clone());
             result.written += 1;
+        }
+
+        // Restore directory mtimes deepest-first so that stamping a child
+        // directory does not update its parent's mtime before we stamp the
+        // parent too.
+        dir_mtimes.sort_by(|a, b| b.0.components().count().cmp(&a.0.components().count()));
+        for (path, modified_ms) in dir_mtimes {
+            let mtime = filetime::FileTime::from_unix_time(
+                (modified_ms / 1000) as i64,
+                ((modified_ms % 1000) * 1_000_000) as u32,
+            );
+            if let Err(e) = filetime::set_file_mtime(&path, mtime) {
+                warn!("failed to set mtime on dir {:?}: {e}", path);
+            }
         }
 
         self.schedule_unsuppress(written);
@@ -472,6 +505,7 @@ impl SyncEngine {
                 expected_hash: metadata.hash,
                 dst,
                 file_size: metadata.size,
+                modified_ms: metadata.modified_ms,
                 final_hash_pending: None,
             },
         );
@@ -625,19 +659,22 @@ impl SyncEngine {
         fs::rename(&asm.tmp_path, &asm.dst)?;
         cleanup_transfer_dirs(&self.root, &asm.tmp_path);
 
-        let meta = fs::metadata(&asm.dst)?;
-        let modified_ms = meta
-            .modified()
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        // Restore the sender's original modification timestamp.  The rename
+        // above (and the OS itself) would otherwise stamp the file with the
+        // current time.
+        let mtime = filetime::FileTime::from_unix_time(
+            (asm.modified_ms / 1000) as i64,
+            ((asm.modified_ms % 1000) * 1_000_000) as u32,
+        );
+        if let Err(e) = filetime::set_file_mtime(&asm.dst, mtime) {
+            warn!("failed to set mtime on large file {:?}: {e}", asm.dst);
+        }
 
         let file_meta = FileMetadata {
             rel_path: path.clone(),
-            size: meta.len(),
+            size: asm.file_size,
             hash: final_hash,
-            modified_ms,
+            modified_ms: asm.modified_ms,
             is_dir: false,
         };
         self.manifest.write().files.insert(path.clone(), file_meta);
