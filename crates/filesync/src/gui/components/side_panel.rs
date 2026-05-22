@@ -1,9 +1,3 @@
-//! Side panel with a two-tab bar: Stats and Conflicts.
-//!
-//! The tab bar sits at the top of the panel. Each tab button is styled as
-//! active (amber underline + bright text) or inactive (muted). An amber
-//! badge on the Conflicts tab shows the pending conflict count when > 0.
-
 use iced::{
     widget::{button, column, container, row, text, Space},
     Alignment, Background, Border, Color, Element, Length,
@@ -33,8 +27,6 @@ pub fn view<'a>(snap: &'a SyncSnapshot, active_tab: &'a SideTab) -> Element<'a, 
         .style(theme::panel)
         .into()
 }
-
-// ─── Tab bar ─────────────────────────────────────────────────────────────────
 
 fn build_tab_bar<'a>(snap: &'a SyncSnapshot, active_tab: &'a SideTab) -> Element<'a, Message> {
     let conflict_count = snap.conflicts.len();
@@ -69,8 +61,6 @@ fn build_tab_bar<'a>(snap: &'a SyncSnapshot, active_tab: &'a SideTab) -> Element
     .into()
 }
 
-/// A single tab button. Active tabs get an amber bottom bar and full-bright
-/// text; inactive tabs are muted with a subtle hover.
 fn tab_button<'a>(
     label: &'a str,
     tab: SideTab,
@@ -92,7 +82,6 @@ fn tab_button<'a>(
                 color: Some(label_color),
             });
 
-    // Optional badge showing conflict count.
     let badge: Element<Message> = if badge_count > 0 {
         let badge_color = if is_active {
             theme::AMBER
@@ -153,7 +142,6 @@ fn tab_button<'a>(
         .align_y(Alignment::Center)
         .spacing(0);
 
-    // The amber underline for the active tab
     let underline: Element<Message> = if is_active {
         container(Space::new().height(0))
             .width(Length::Fill)
@@ -216,8 +204,6 @@ fn tab_button<'a>(
 mod tests {
     use crate::gui::state::{Conflict, ConflictKind, SideTab, SyncSnapshot};
 
-    // ─── view smoke tests ─────────────────────────────────────────────────────
-
     #[test]
     fn view_stats_tab_default_snapshot_does_not_panic() {
         let _ = super::view(&SyncSnapshot::default(), &SideTab::Stats);
@@ -266,7 +252,6 @@ mod tests {
 
     #[test]
     fn view_stats_tab_badge_visible_when_conflicts_present_does_not_panic() {
-        // Viewing Stats tab while conflicts exist — the badge count should render without panic.
         let mut snap = SyncSnapshot::default();
         snap.conflicts.push(Conflict {
             id: 1,

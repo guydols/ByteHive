@@ -19,8 +19,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-// ─── CLI (orchestrator mode) ────────────────────────────────────────────────
-
 #[derive(Parser)]
 #[command(
     name = "stress-bench",
@@ -98,10 +96,6 @@ struct Cli {
     dhat: bool,
 }
 
-// ─── helpers ────────────────────────────────────────────────────────────────
-
-/// Converts the current wall-clock time into a `YYYY-MM-DD_HH-MM-SS` string
-/// for use as a unique run-directory name, without any extra dependencies.
 fn bench_run_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
@@ -186,8 +180,6 @@ fn banner(msg: &str) {
 mod tests {
     use super::*;
 
-    // ── scaled ────────────────────────────────────────────────────────────────
-
     #[test]
     fn scaled_identity_factor() {
         assert_eq!(scaled(100, 1.0), 100);
@@ -219,8 +211,6 @@ mod tests {
         // 7 * 0.5 = 3.5 → truncated to 3
         assert_eq!(scaled(7, 0.5), 3);
     }
-
-    // ── human_bytes ───────────────────────────────────────────────────────────
 
     #[test]
     fn human_bytes_zero() {
@@ -259,8 +249,6 @@ mod tests {
         // 1.5 MB = 1572864 bytes
         assert_eq!(human_bytes(1_572_864), "1.5 MB");
     }
-
-    // ── bench_run_id ──────────────────────────────────────────────────────────
 
     #[test]
     fn bench_run_id_has_expected_length() {
@@ -354,10 +342,6 @@ fn record_workload_event(acc: &mut DataAccumulator, start: &Instant, stats: &Wor
     }
 }
 
-// ─── DataAccumulator ────────────────────────────────────────────────────────
-
-/// Collects benchmark events and integrity results while simultaneously
-/// appending each record to the crash-safe `data.ndjson` store.
 struct DataAccumulator {
     events: Vec<Event>,
     integrity_results: Vec<(String, types::IntegrityResult)>,
@@ -451,7 +435,6 @@ fn wait_and_verify(
     acc.push_integrity(phase_name.to_string(), result);
 }
 
-// ─── Subprocess: __server ───────────────────────────────────────────────────
 //
 // Usage: stress-bench __server <dir> <port-file>
 //
@@ -474,7 +457,6 @@ fn run_server_subprocess(args: &[String]) {
     listener.set_nonblocking(true).expect("set nonblocking");
     let port = listener.local_addr().expect("local addr").port();
 
-    // Write the port so the orchestrator can read it.
     fs::write(&port_file, port.to_string()).expect("write port file");
 
     eprintln!(
@@ -482,7 +464,6 @@ fn run_server_subprocess(args: &[String]) {
         std::process::id()
     );
 
-    // Build the server using the library types.
     use bytehive_core::MessageBus;
     use bytehive_filesync::app::build_server_tls_config;
     use bytehive_filesync::exclusions::{ExclusionConfig, Exclusions};
@@ -496,8 +477,7 @@ fn run_server_subprocess(args: &[String]) {
     let exclusions = Arc::new(Exclusions::compile(&ExclusionConfig::default()));
     let engine = Arc::new(SyncEngine::new(dir, id, exclusions));
     let bus = MessageBus::new();
-    // Stress bench uses a temp dir for the server identity cert and an
-    // in-memory known_clients that auto-approves everyone.
+    // Temp dir for the server identity cert; known_clients auto-approves everyone.
     let bench_state_dir = std::env::temp_dir().join(format!("bh_bench_srv_{port}"));
     std::fs::create_dir_all(&bench_state_dir).expect("create bench state dir");
     let tls = build_server_tls_config(&bench_state_dir).expect("server TLS config");
@@ -542,7 +522,6 @@ fn run_server_subprocess(args: &[String]) {
     eprintln!("[server-subprocess] exited cleanly");
 }
 
-// ─── Subprocess: __client ───────────────────────────────────────────────────
 //
 // Usage: stress-bench __client <dir> <server-addr>
 
@@ -609,8 +588,6 @@ fn run_client_subprocess(args: &[String]) {
     std::process::exit(0);
 }
 
-// ─── main ───────────────────────────────────────────────────────────────────
-
 fn init_subprocess_logger() {
     // Use a compact format whose first token is always the level word so the
     // orchestrator's log-reader thread can parse it reliably:
@@ -631,7 +608,7 @@ fn init_subprocess_logger() {
 }
 
 fn main() {
-    // ── Subprocess dispatch MUST come before env_logger::init() ─────────
+    // Subprocess dispatch must come before env_logger::init()
     // Each subprocess configures its own logger (custom compact format +
     // level from the RUST_LOG env var the orchestrator sets).
     let raw_args: Vec<String> = std::env::args().collect();
@@ -684,7 +661,6 @@ fn main() {
         return;
     }
 
-    // ── Normal orchestrator mode ────────────────────────────────────────
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let cli = Cli::parse();
     let bench_start = Instant::now();
@@ -692,18 +668,13 @@ fn main() {
     let sync_timeout = Duration::from_secs(cli.sync_timeout);
     let scale = cli.scale;
 
-    // ── output / run directory ───────────────────────────────────────────
-    // Every invocation gets its own timestamped sub-directory so results from
-    // multiple runs never overwrite each other.
     let run_id = bench_run_id();
     let run_dir = cli.output.join(&run_id);
     fs::create_dir_all(&run_dir).expect("create run output dir");
 
-    // Persist the exact command line so the run is reproducible.
     let command_line = raw_args.join(" ");
     fs::write(run_dir.join("command.txt"), &command_line).expect("write command.txt");
 
-    // ── crash-safe data store ────────────────────────────────────────────────
     let data_store =
         data_store::DataStore::create(&run_dir.join("data.ndjson")).expect("create data store");
     data_store.append(&data_store::DataRecord::Meta {
@@ -712,14 +683,12 @@ fn main() {
     });
     let mut acc = DataAccumulator::new(data_store.clone());
 
-    // ── temp directories ────────────────────────────────────────────────
     let base = std::env::temp_dir().join(format!("filesync_bench_{}", std::process::id()));
     let server_dir = base.join("server");
     let client_dir = base.join("client");
     fs::create_dir_all(&server_dir).expect("create server dir");
     fs::create_dir_all(&client_dir).expect("create client dir");
 
-    // ── DHAT output paths ────────────────────────────────────────────────
     let (server_dhat_path, client_dhat_path): (Option<PathBuf>, Option<PathBuf>) = if cli.dhat {
         let dhat_dir = run_dir.join("dhat");
         fs::create_dir_all(&dhat_dir).expect("create dhat output dir");
@@ -754,7 +723,6 @@ fn main() {
     }
     eprintln!();
 
-    // ── start server & client as subprocesses ───────────────────────────
     eprintln!("🚀 Starting server subprocess…");
     let mut server = harness::BenchServer::start(
         server_dir.clone(),
@@ -777,8 +745,6 @@ fn main() {
     );
     eprintln!("   Client PID: {}", client.pid());
 
-    // ── start per-process metrics collector ──────────────────────────────
-    // Start AFTER subprocesses are up so the first sample captures real data.
     let metrics_handle = ProcessMetricsCollector::new(Duration::from_secs(1)).start(
         server.pid(),
         client.pid(),
@@ -815,13 +781,9 @@ fn main() {
     // Give the inotify watcher a moment to fully initialise
     std::thread::sleep(Duration::from_secs(1));
 
-    // Pre-create all phase directories so the watcher is already tracking them
-    // before any files land.
     eprintln!("📁 Pre-creating phase directories…");
     workload::prepare_directories(&server_dir);
-    eprintln!("  Done — watcher should be tracking all sub-directories.\n");
 
-    // ── Phase 1: Small File Flood ───────────────────────────────────────
     if bench_start.elapsed() < total_budget {
         let phase = "small_file_flood";
         phase_banner(phase);
@@ -857,7 +819,6 @@ fn main() {
         });
     }
 
-    // ── Phase 2: Large File Transfer ────────────────────────────────────
     if bench_start.elapsed() < total_budget {
         let phase = "large_file_transfer";
         phase_banner(phase);
@@ -896,7 +857,6 @@ fn main() {
         });
     }
 
-    // ── Phase 3: Mixed Burst ────────────────────────────────────────────
     if bench_start.elapsed() < total_budget {
         let phase = "mixed_burst";
         phase_banner(phase);
@@ -936,7 +896,6 @@ fn main() {
         });
     }
 
-    // ── Phase 4: Modification Storm ─────────────────────────────────────
     if bench_start.elapsed() < total_budget {
         let phase = "modification_storm";
         phase_banner(phase);
@@ -972,7 +931,6 @@ fn main() {
         });
     }
 
-    // ── Phase 5: Delete & Recreate ──────────────────────────────────────
     if bench_start.elapsed() < total_budget {
         let phase = "delete_and_recreate";
         phase_banner(phase);
@@ -995,7 +953,6 @@ fn main() {
         );
         record_workload_event(&mut acc, &bench_start, &stats);
 
-        // Deletes take a bit longer to propagate; give extra settle time
         eprintln!("  Allowing extra settle time for delete propagation…");
         std::thread::sleep(Duration::from_secs(5));
 
@@ -1014,7 +971,6 @@ fn main() {
         });
     }
 
-    // ── Phase 6: Sustained Mixed Load ───────────────────────────────────
     if bench_start.elapsed() < total_budget {
         let phase = "sustained_load";
         phase_banner(phase);
@@ -1053,12 +1009,10 @@ fn main() {
                 );
             }
 
-            // Record workload event every 10 ticks to keep the event log manageable
             if tick % 10 == 0 {
                 record_workload_event(&mut acc, &bench_start, &stats);
             }
 
-            // Periodic integrity check during sustained load
             if last_integrity_check.elapsed() >= integrity_interval {
                 eprintln!("  📋 Periodic integrity check at tick {tick}…");
                 // Brief wait for sync to catch up before checking
@@ -1103,7 +1057,6 @@ fn main() {
             std::thread::sleep(tick_interval);
         }
 
-        // Record the cumulative stats for sustained phase
         acc.push_event(Event {
             elapsed_secs: bench_start.elapsed().as_secs_f64(),
             kind: EventKind::FilesCreated {
@@ -1112,7 +1065,6 @@ fn main() {
             },
         });
 
-        // Final integrity check for sustained phase
         eprintln!("  Final sustained-phase integrity check…");
         wait_and_verify(
             phase,
@@ -1129,7 +1081,6 @@ fn main() {
         });
     }
 
-    // ── Shutdown ────────────────────────────────────────────────────────
     banner("Benchmark Complete — Generating Report");
 
     // Stop metrics collection first so we capture the final samples before
@@ -1154,7 +1105,6 @@ fn main() {
     eprintln!("  Shutting down client subprocess…");
     let client_logs = client.shutdown_and_collect_logs();
 
-    // ── DHAT analysis ────────────────────────────────────────────────────
     // valgrind writes the DHAT JSON file after the monitored process exits.
     // Poll for it, then parse the allocation-site breakdown.
     let dhat_timeout = Duration::from_secs(120);
@@ -1193,12 +1143,10 @@ fn main() {
         kind: EventKind::Info("Benchmark finished".into()),
     });
 
-    // Mark the run as cleanly completed in the data store.
     data_store.append(&data_store::DataRecord::Complete {
         total_duration_secs: total_duration.as_secs_f64(),
     });
 
-    // ── Build report ────────────────────────────────────────────────────
     let report = BenchmarkReport::new(
         total_duration,
         acc.events,
@@ -1216,7 +1164,6 @@ fn main() {
         .generate_html(&report_path)
         .expect("generate HTML report");
 
-    // ── Summary ─────────────────────────────────────────────────────────
     let all_passed = report.integrity_results.iter().all(|(_, r)| r.passed());
     let total_files: usize = report
         .events
@@ -1289,7 +1236,6 @@ fn main() {
     );
     eprintln!();
 
-    // ── Cleanup ─────────────────────────────────────────────────────────
     if !cli.keep_dirs {
         eprintln!("  Cleaning up temp directories…");
         let _ = fs::remove_dir_all(&base);

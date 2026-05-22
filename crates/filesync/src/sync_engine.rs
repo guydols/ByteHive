@@ -34,7 +34,6 @@ pub enum FinishResult {
     MissingChunks(Vec<u32>),
 }
 
-/// Information about a conflict that was resolved by creating a conflict copy.
 #[derive(Debug, Clone)]
 pub struct ConflictInfo {
     /// Original file path (incoming file applied here).
@@ -43,7 +42,6 @@ pub struct ConflictInfo {
     pub conflict_copy_path: PathBuf,
 }
 
-/// Result of applying a bundle.
 #[derive(Debug, Default)]
 pub struct ApplyResult {
     /// Number of entries actually written (files + dirs).
@@ -68,7 +66,6 @@ struct LargeFileAssembly {
     final_hash_pending: Option<[u8; 32]>,
 }
 
-/// Optional configuration overrides for a [`SyncEngine`] instance.
 #[derive(Debug, Default, Clone)]
 pub struct SyncEngineConfig {
     /// Automatically purge trash entries older than this many days.
@@ -95,10 +92,6 @@ pub struct SyncEngine {
     full_scan_interval_secs: u64,
 }
 
-/// Returns the path that a conflict copy of `rel_path` should use.
-///
-/// Format: `{dir}/{stem} (conflict {unix_secs} {node_id}).{ext}`
-/// If the file has no extension the extension suffix is omitted.
 pub fn conflict_copy_name(rel_path: &Path, node_id: &str, unix_secs: u64) -> PathBuf {
     let stem = rel_path
         .file_stem()
@@ -235,37 +228,30 @@ impl SyncEngine {
         age_ms >= FILE_STABILITY_MS
     }
 
-    /// Returns the configured full-rescan interval in seconds.
     pub fn full_scan_interval_secs(&self) -> u64 {
         self.full_scan_interval_secs
     }
 
-    /// Returns a reference to the shared trash manager.
     pub fn trash_manager(&self) -> &Arc<TrashManager> {
         &self.trash_manager
     }
 
-    /// List all entries currently in the trash.
     pub fn list_trash(&self) -> Vec<bytehive_core::TrashEntry> {
         self.trash_manager.list_trash()
     }
 
-    /// Restore a trashed entry by its ID back to its original location.
     pub fn restore_trash_entry(&self, id: &str) -> Result<(), String> {
         self.trash_manager.restore_entry(id)
     }
 
-    /// Permanently delete a single trash entry by its ID.
     pub fn purge_trash_entry(&self, id: &str) -> Result<(), String> {
         self.trash_manager.purge_entry(id)
     }
 
-    /// Purge all entries that exceed the configured expiry age.
     pub fn purge_expired_trash(&self) -> usize {
         self.trash_manager.purge_expired()
     }
 
-    /// Empty the entire trash bin. Returns the number of entries removed.
     pub fn empty_trash(&self) -> usize {
         self.trash_manager.empty()
     }

@@ -30,10 +30,6 @@ pub struct Server {
     engine: Arc<SyncEngine>,
     bind_addr: String,
     bus: Option<Arc<MessageBus>>,
-    /// Server-side known-hosts table.  Every connecting client must have its
-    /// certificate fingerprint in this table with status `Allowed` before
-    /// it can sync.  Unknown clients are added as `Pending` and an approval
-    /// bus event is published.
     known_clients: Arc<Mutex<KnownClients>>,
     stopped: Arc<AtomicBool>,
     peers: Arc<RwLock<HashMap<String, Peer>>>,

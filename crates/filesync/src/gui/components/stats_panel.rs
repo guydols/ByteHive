@@ -1,8 +1,3 @@
-//! Sync statistics panel — displayed in the Stats tab of the side panel.
-//!
-//! Shows totals for files, directories, transfer volume, and the last
-//! activity timestamp. Each stat is rendered as a labelled card.
-
 use iced::{
     widget::{column, container, row, text, Space},
     Alignment, Background, Border, Color, Element, Length,
@@ -42,7 +37,6 @@ pub fn view(snap: &SyncSnapshot) -> Element<'static, Message> {
         .into()
 }
 
-// ─── Individual card ──────────────────────────────────────────────────────────
 
 fn stat_card(label: &'static str, value: String, value_color: Color) -> Element<'static, Message> {
     let value_widget =
@@ -109,7 +103,6 @@ fn last_active_card(timestamp: String) -> Element<'static, Message> {
         .into()
 }
 
-/// Lays two cards side by side with equal width.
 fn stat_row(
     left: Element<'static, Message>,
     right: Element<'static, Message>,
@@ -120,7 +113,6 @@ fn stat_row(
         .into()
 }
 
-// ─── Formatting helpers ───────────────────────────────────────────────────────
 
 fn format_count(n: u64) -> String {
     let s = n.to_string();
@@ -156,7 +148,6 @@ mod tests {
     use crate::gui::state::SyncSnapshot;
     use std::time::Instant;
 
-    // ─── format_count ─────────────────────────────────────────────────────────
 
     #[test]
     fn format_count_zero() {
@@ -188,7 +179,6 @@ mod tests {
         assert_eq!(format_count(1_234_567_890), "1,234,567,890");
     }
 
-    // ─── format_bytes ─────────────────────────────────────────────────────────
 
     #[test]
     fn format_bytes_zero() {
@@ -231,7 +221,6 @@ mod tests {
         assert_eq!(format_bytes(2_147_483_648), "2.00 GB");
     }
 
-    // ─── view smoke tests ─────────────────────────────────────────────────────
 
     #[test]
     fn view_default_snapshot_does_not_panic() {

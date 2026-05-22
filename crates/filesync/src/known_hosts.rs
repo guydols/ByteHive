@@ -1,42 +1,6 @@
-//! Persistent known-host tables for the filesync TLS identity model.
-//!
-//! # Server side — `KnownClients`
-//! The server stores each client's certificate fingerprint directly inside
-//! the main `config.toml` under `[[filesync_known_clients]]` array-of-tables
-//! sections.  Writes splice the section in-place so that the rest of the
-//! config file (e.g. `[framework]`, `[[users]]`, `[apps.filesync]`, …) is
-//! preserved verbatim.
-//!
-//! Each entry can be in one of three states:
-//!
-//! * `Pending`  — the client has connected at least once but has not yet
-//!               been approved by an administrator.
-//! * `Allowed`  — an administrator explicitly approved this client; it may
-//!               sync freely.
-//! * `Rejected` — an administrator explicitly rejected this client; it is
-//!               turned away at the door.
-//!
-//! When a client in `Pending` or `Rejected` state tries to connect the
-//! server sends back a `Message::ApprovalPending` or `Message::Rejected`
-//! application-layer message and closes the connection.  The client retries
-//! with back-off until it is `Allowed`.
-//!
-//! # Client side — `KnownServers`
-//! The client uses a simple Trust-On-First-Use (TOFU) model.  On the first
-//! successful TLS handshake with a given server address the server's
-//! certificate fingerprint is recorded in a separate `known_servers.toml`
-//! file.  On every subsequent connection the stored fingerprint must match;
-//! a mismatch aborts the session with an error (possible MITM or cert
-//! rotation).
-//!
-//! Deleting `known_servers.toml` re-enables TOFU for all servers (useful
-//! when a server has legitimately regenerated its certificate).
-
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-// ── helpers ──────────────────────────────────────────────────────────────────
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -45,18 +9,11 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ClientStatus
-// ─────────────────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientStatus {
-    /// Seen but not yet approved.
     Pending,
-    /// Explicitly approved by an administrator.
     Allowed,
-    /// Explicitly rejected by an administrator.
     Rejected,
 }
 
@@ -70,78 +27,41 @@ impl ClientStatus {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// KnownClient
-// ─────────────────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnownClient {
-    /// The node_id the client reported in its Hello message.
     pub node_id: String,
-
-    /// BLAKE3 hex fingerprint of the client's DER certificate.
     pub fingerprint: String,
-
-    /// Optional human-friendly label (editable by the admin).
     #[serde(default)]
     pub label: String,
-
-    /// Current authorization state.
     pub status: ClientStatus,
-
-    /// Last observed remote address (IP:port).
     #[serde(default)]
     pub addr: String,
-
-    /// Unix-millisecond timestamp of the first connection attempt.
     pub first_seen_ms: u64,
-
-    /// Unix-millisecond timestamp of the most recent connection attempt.
     pub last_seen_ms: u64,
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// KnownClients (server-side store) — reads/writes [[filesync_known_clients]]
-// inside the main config.toml via the splice mechanism.
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Wrapper used to deserialise `[[filesync_known_clients]]` out of the full
-/// config file.  All other keys in the file are ignored.
 #[derive(serde::Deserialize, Default)]
 struct KnownClientsRaw {
     #[serde(default)]
     filesync_known_clients: Vec<KnownClient>,
 }
 
-/// Wrapper used to serialise only the `[[filesync_known_clients]]` section
-/// so that `toml::to_string_pretty` emits the correct array-of-tables header.
 #[derive(serde::Serialize)]
 struct FilesyncKnownClientsSection {
     filesync_known_clients: Vec<KnownClient>,
 }
 
 pub struct KnownClients {
-    /// Full path to the main `config.toml` that holds the
-    /// `[[filesync_known_clients]]` entries alongside all other config.
     config_path: PathBuf,
     clients: Vec<KnownClient>,
-    /// When `true`, unknown clients are immediately approved instead of placed
-    /// in the `Pending` state.  Only intended for benchmarks and tests.
     auto_approve: bool,
 }
 
 impl KnownClients {
-    /// Load the known-clients list from the `[[filesync_known_clients]]`
-    /// sections inside `config_path` (the main `config.toml`).  If the file
-    /// does not exist or contains no such sections, the store starts empty.
-    /// Parse errors are logged and fall back to empty.
     pub fn load_from_config(config_path: impl Into<PathBuf>) -> Self {
         Self::load_inner(config_path.into(), false)
     }
 
-    /// Like `load_from_config`, but any unknown client is automatically
-    /// approved without requiring admin action.  Intended for benchmarks and
-    /// integration tests only — do not use in production.
     pub fn load_from_config_permissive(config_path: impl Into<PathBuf>) -> Self {
         Self::load_inner(config_path.into(), true)
     }
@@ -173,9 +93,6 @@ impl KnownClients {
         }
     }
 
-    // ── queries ──────────────────────────────────────────────────────────────
-
-    /// Return the current status of a fingerprint, or `None` if unknown.
     pub fn status(&self, fingerprint: &str) -> Option<ClientStatus> {
         self.clients
             .iter()
@@ -183,12 +100,10 @@ impl KnownClients {
             .map(|c| c.status.clone())
     }
 
-    /// Immutable view of all known clients.
     pub fn list(&self) -> &[KnownClient] {
         &self.clients
     }
 
-    /// Number of clients currently in `Pending` state.
     pub fn pending_count(&self) -> usize {
         self.clients
             .iter()
@@ -196,14 +111,6 @@ impl KnownClients {
             .count()
     }
 
-    // ── mutations ────────────────────────────────────────────────────────────
-
-    /// Record a new connection attempt.
-    ///
-    /// * If the fingerprint is already in the table, update `last_seen_ms`
-    ///   and return `false` (not new).
-    /// * If the fingerprint is new, insert a `Pending` entry and return
-    ///   `true` (new — caller should publish an approval-needed bus event).
     pub fn upsert_pending(&mut self, node_id: &str, fingerprint: &str, addr: &str) -> bool {
         let now = now_ms();
         if let Some(c) = self
@@ -221,8 +128,6 @@ impl KnownClients {
             self.save();
             false
         } else {
-            // In permissive/bench mode, skip the pending state and approve
-            // the client immediately.
             let status = if self.auto_approve {
                 ClientStatus::Allowed
             } else {
@@ -242,9 +147,6 @@ impl KnownClients {
         }
     }
 
-    /// Change the status of a client identified by its fingerprint.
-    ///
-    /// Returns `true` on success, `false` if the fingerprint was not found.
     pub fn set_status(&mut self, fingerprint: &str, status: ClientStatus) -> bool {
         match self
             .clients
@@ -260,7 +162,6 @@ impl KnownClients {
         }
     }
 
-    /// Update the human-readable label for a client.
     pub fn set_label(&mut self, fingerprint: &str, label: &str) -> bool {
         match self
             .clients
@@ -276,9 +177,6 @@ impl KnownClients {
         }
     }
 
-    /// Remove a client entry entirely.
-    ///
-    /// Returns `true` if an entry was removed.
     pub fn remove(&mut self, fingerprint: &str) -> bool {
         let before = self.clients.len();
         self.clients.retain(|c| c.fingerprint != fingerprint);
@@ -289,11 +187,7 @@ impl KnownClients {
         changed
     }
 
-    // ── persistence ──────────────────────────────────────────────────────────
-
     fn save(&self) {
-        // Read the current config file so we can splice the new section in
-        // while preserving all other content.
         let original = if self.config_path.exists() {
             match std::fs::read_to_string(&self.config_path) {
                 Ok(s) => s,
@@ -330,17 +224,6 @@ impl KnownClients {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// splice_known_clients — in-place rewrite of [[filesync_known_clients]] blocks
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Rewrite the `[[filesync_known_clients]]` array-of-tables sections inside
-/// `original` (a full `config.toml` string) with freshly serialised `clients`,
-/// leaving every other line untouched.
-///
-/// * If `clients` is empty the section is removed entirely.
-/// * The function mirrors the logic of `splice_auth_sections` in
-///   `crates/core/src/users.rs` but targets a single section name.
 fn splice_known_clients(original: &str, clients: &[KnownClient]) -> String {
     // Build the replacement section text up front.
     let new_section = if clients.is_empty() {
@@ -417,8 +300,6 @@ fn splice_known_clients(original: &str, clients: &[KnownClient]) -> String {
         }
     }
 
-    // ── reassemble ───────────────────────────────────────────────────────────
-
     let before_str = before.join("\n");
     let after_str = after.join("\n");
 
@@ -447,19 +328,10 @@ fn splice_known_clients(original: &str, clients: &[KnownClient]) -> String {
     out
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// KnownServer / KnownServers  (client-side TOFU)
-// ─────────────────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnownServer {
-    /// The `host:port` address the client connected to.
     pub addr: String,
-
-    /// BLAKE3 hex fingerprint of the server's DER certificate.
     pub fingerprint: String,
-
-    /// Unix-millisecond timestamp of the first time this server was trusted.
     pub first_seen_ms: u64,
 }
 
@@ -475,8 +347,6 @@ pub struct KnownServers {
 }
 
 impl KnownServers {
-    /// Load the store from `path` (a dedicated `known_servers.toml`),
-    /// creating an empty store if the file does not yet exist.
     pub fn load_or_create(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         let inner = if path.exists() {
@@ -500,11 +370,6 @@ impl KnownServers {
         Self { path, inner }
     }
 
-    // ── queries ──────────────────────────────────────────────────────────────
-
-    /// Look up the pinned fingerprint for a server address.
-    ///
-    /// Returns `None` if the server has never been trusted (TOFU first-use).
     pub fn get_fingerprint(&self, addr: &str) -> Option<&str> {
         self.inner
             .servers
@@ -513,17 +378,10 @@ impl KnownServers {
             .map(|s| s.fingerprint.as_str())
     }
 
-    /// Immutable view of all known servers.
     pub fn list(&self) -> &[KnownServer] {
         &self.inner.servers
     }
 
-    // ── mutations ────────────────────────────────────────────────────────────
-
-    /// Pin (or re-pin) the fingerprint for a server address.
-    ///
-    /// If the address is already in the table the fingerprint is updated and
-    /// the `first_seen_ms` timestamp is preserved.
     pub fn pin(&mut self, addr: &str, fingerprint: &str) {
         if let Some(s) = self.inner.servers.iter_mut().find(|s| s.addr == addr) {
             s.fingerprint = fingerprint.to_string();
@@ -537,7 +395,6 @@ impl KnownServers {
         self.save();
     }
 
-    /// Remove a server entry (use after cert rotation to re-enable TOFU).
     pub fn remove(&mut self, addr: &str) -> bool {
         let before = self.inner.servers.len();
         self.inner.servers.retain(|s| s.addr != addr);
@@ -547,8 +404,6 @@ impl KnownServers {
         }
         changed
     }
-
-    // ── persistence ──────────────────────────────────────────────────────────
 
     fn save(&self) {
         if let Some(parent) = self.path.parent() {
@@ -575,10 +430,6 @@ impl KnownServers {
         }
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Unit tests
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

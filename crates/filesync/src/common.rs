@@ -1,12 +1,3 @@
-//! Shared helpers used by both the filesync **client** and **server**.
-//!
-//! Includes preemptive disk-space checking via [`check_disk_space`] /
-//! [`available_disk_space`], which are called after a manifest exchange to
-//! abort the sync early when the local filesystem has insufficient room.
-//!
-//! Everything that was duplicated between `client.rs` and `server.rs` lives
-//! here so that bug-fixes and behavioural changes only need to happen once.
-
 use crate::protocol::*;
 use crate::sync_engine::{ChunkResult, ConflictInfo, FinishResult, SyncEngine};
 use crate::transport::Connection;
@@ -21,21 +12,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-// ── Disk-space helpers ────────────────────────────────────────────────────
-
-/// Returns the number of bytes currently available on the filesystem that
-/// contains `path`.  Thin wrapper over [`fs2::available_space`].
 pub fn available_disk_space(path: &Path) -> io::Result<u64> {
     fs2::available_space(path)
 }
 
-/// Asserts that at least `required_bytes` are available on the filesystem
-/// that contains `path`.
-///
-/// * `Ok(available)` – there is enough space; `available` is the free-byte
-///   count at the time of the check.
-/// * `Err(StorageFull)` – not enough space; the error message includes both
-///   the available and required byte counts.
 pub fn check_disk_space(path: &Path, required_bytes: u64) -> io::Result<u64> {
     let available = available_disk_space(path)?;
     if available < required_bytes {
@@ -51,25 +31,14 @@ pub fn check_disk_space(path: &Path, required_bytes: u64) -> io::Result<u64> {
     }
 }
 
-// ── Pending-changes accumulator ──────────────────────────────────────────
-
 const MAX_BATCH_MS: u64 = 2_000;
 
-/// Accumulates filesystem events and decides when they should be flushed to
-/// the network.  Used identically by the client send-loop and the server
-/// local-change broadcaster.
 pub struct PendingChanges {
-    /// Paths that have been *changed* but may not yet be stable on disk.
     pub changes: HashSet<PathBuf>,
-    /// Paths whose writes are complete (ready to send immediately).
     pub ready: HashSet<PathBuf>,
-    /// Paths that have been deleted locally.
     pub deletes: HashSet<PathBuf>,
-    /// Rename pairs `(from, to)`.
     pub renames: Vec<(PathBuf, PathBuf)>,
-    /// Timestamp of the most recent event (used for debouncing).
     pub last_event: Instant,
-    /// Timestamp of the most recent periodic full re-scan.
     pub last_full_scan: Instant,
 }
 
@@ -85,9 +54,6 @@ impl PendingChanges {
         }
     }
 
-    // ── event collection ─────────────────────────────────────────────
-
-    /// Incorporate a single filesystem event into the pending sets.
     pub fn collect_event(&mut self, engine: &SyncEngine, event: FsEvent) {
         match event {
             FsEvent::Changed(p) => {
@@ -133,11 +99,6 @@ impl PendingChanges {
         }
     }
 
-    // ── periodic re-scan ─────────────────────────────────────────────
-
-    /// Run a full re-scan of the root directory if enough time has elapsed
-    /// since the last one.  Any newly-discovered changes or deletions are
-    /// folded into the pending sets.
     pub fn periodic_rescan(&mut self, engine: &SyncEngine, label: &str) {
         if self.last_full_scan.elapsed().as_secs() < engine.full_scan_interval_secs() {
             return;
@@ -177,32 +138,23 @@ impl PendingChanges {
         self.last_full_scan = Instant::now();
     }
 
-    // ── flush helpers ────────────────────────────────────────────────
-
-    /// Returns `true` when enough time has elapsed since the last event to
-    /// justify a network flush.
     pub fn should_flush(&self) -> bool {
         let elapsed = self.last_event.elapsed().as_millis() as u64;
         elapsed >= DEBOUNCE_MS || elapsed >= MAX_BATCH_MS
     }
 
-    /// Reset the event timer (call after a successful flush).
     pub fn reset_timer(&mut self) {
         self.last_event = Instant::now();
     }
 
-    /// Drain all pending renames.
     pub fn take_renames(&mut self) -> Vec<(PathBuf, PathBuf)> {
         std::mem::take(&mut self.renames)
     }
 
-    /// Drain all ready (write-complete) paths.
     pub fn take_ready(&mut self) -> Vec<PathBuf> {
         self.ready.drain().collect()
     }
 
-    /// Drain changed paths whose files are *stable* on disk.
-    /// Unstable paths are returned to the `changes` set for a later flush.
     pub fn take_stable_changes(&mut self, engine: &SyncEngine) -> Vec<PathBuf> {
         let paths: Vec<PathBuf> = self.changes.drain().collect();
         let mut stable = Vec::new();
@@ -216,9 +168,6 @@ impl PendingChanges {
         stable
     }
 
-    /// Drain all pending deletes, expanding empty ancestor directories.
-    /// Returns `(expanded_paths, original_count)` so callers that need the
-    /// pre-expansion count (e.g. for stats) can use it.
     pub fn take_deletes(&mut self, root: &Path) -> (Vec<PathBuf>, usize) {
         let original_count = self.deletes.len();
         let mut paths: Vec<PathBuf> = self.deletes.drain().collect();
@@ -227,11 +176,6 @@ impl PendingChanges {
     }
 }
 
-// ── Shared utilities ─────────────────────────────────────────────────────
-
-/// Walk up from each deleted path and add any ancestor directories that no
-/// longer exist on disk.  This ensures that empty parent directories created
-/// solely by sync are cleaned up on the remote side as well.
 pub fn expand_deleted_ancestors(root: &Path, paths: &mut Vec<PathBuf>) {
     let mut extra = HashSet::new();
     for p in paths.iter() {
@@ -249,7 +193,6 @@ pub fn expand_deleted_ancestors(root: &Path, paths: &mut Vec<PathBuf>) {
     paths.extend(extra);
 }
 
-/// Count the files, directories, and total bytes in a manifest snapshot.
 pub fn count_manifest(manifest: &Manifest) -> (usize, usize, u64) {
     let mut files = 0usize;
     let mut dirs = 0usize;
@@ -265,7 +208,6 @@ pub fn count_manifest(manifest: &Manifest) -> (usize, usize, u64) {
     (files, dirs, bytes)
 }
 
-/// Publish a `filesync.file_changed` bus event for every file in a bundle.
 pub fn publish_changed(bus: &Option<Arc<MessageBus>>, bundle: &FileBundle, node: &str) {
     if let Some(ref bus) = bus {
         for fd in &bundle.files {
@@ -278,47 +220,24 @@ pub fn publish_changed(bus: &Option<Arc<MessageBus>>, bundle: &FileBundle, node:
     }
 }
 
-// ── Incoming-message handler return types ─────────────────────────────────
-
-/// Statistics returned after applying a received bundle.
 pub struct BundleApplied {
-    /// Number of entries the engine actually wrote (from `apply_bundle`).
     pub applied: usize,
-    /// Number of non-directory files in the bundle.
     pub files_count: usize,
-    /// Number of directories in the bundle.
     pub dirs_count: usize,
-    /// Total bytes across all entries in the bundle.
     pub bytes: u64,
-    /// Conflict copies created while applying this bundle.
     pub conflicts: Vec<ConflictInfo>,
 }
 
-/// Outcome of processing a `LargeFileChunk` message.
 pub enum ChunkOutcome {
-    /// More chunks are expected.
     Pending,
-    /// All chunks received; the file has been committed.
     Committed,
 }
 
-/// Outcome of processing a `LargeFileEnd` message.
 pub enum LargeFileEndOutcome {
-    /// The large file was successfully committed to disk.
     Committed,
-    /// Some chunks were lost in transit and must be retransmitted.
     MissingChunks(Vec<u32>),
 }
 
-// ── Incoming-message handlers ────────────────────────────────────────────
-//
-// Each handler performs the engine operation, logs the result, and publishes
-// relevant bus events.  The caller is responsible for any additional actions
-// such as broadcasting to other peers (server) or updating GUI state
-// (client).
-
-/// Apply a received `Bundle` to the engine.  Publishes `file_changed` and
-/// `incremental_stats` bus events.
 pub fn handle_recv_bundle(
     engine: &SyncEngine,
     bundle: &FileBundle,
@@ -381,7 +300,6 @@ pub fn handle_recv_bundle(
     })
 }
 
-/// Begin tracking a new large-file transfer.  Logs on error.
 pub fn handle_recv_large_file_start(
     engine: &SyncEngine,
     metadata: FileMetadata,
@@ -397,8 +315,6 @@ pub fn handle_recv_large_file_start(
         })
 }
 
-/// Process a single large-file chunk.  If all chunks are now present the
-/// file is committed automatically.
 pub fn handle_recv_large_file_chunk(
     engine: &SyncEngine,
     path: &PathBuf,
@@ -429,7 +345,6 @@ pub fn handle_recv_large_file_chunk(
     }
 }
 
-/// Finalise a large-file transfer.  Publishes bus events on success.
 pub fn handle_recv_large_file_end(
     engine: &SyncEngine,
     path: &PathBuf,
@@ -503,8 +418,6 @@ pub fn handle_recv_large_file_end(
     }
 }
 
-/// Apply incoming deletes.  Publishes `file_deleted` and
-/// `incremental_stats` bus events.
 pub fn handle_recv_delete(
     engine: &SyncEngine,
     paths: &[PathBuf],
@@ -533,7 +446,6 @@ pub fn handle_recv_delete(
     Ok(n)
 }
 
-/// Apply an incoming rename.  Publishes a `file_renamed` bus event.
 pub fn handle_recv_rename(
     engine: &SyncEngine,
     from: &PathBuf,
@@ -558,7 +470,6 @@ pub fn handle_recv_rename(
     Ok(())
 }
 
-/// Send a `RequestChunks` message for a large file that is missing data.
 pub fn request_retransmit(conn: &Connection, path: &PathBuf, indices: Vec<u32>, log_prefix: &str) {
     if let Err(e) = conn.send(&Message::RequestChunks {
         path: path.clone(),

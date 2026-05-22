@@ -10,8 +10,6 @@ const STABLE_POLLS_REQUIRED: usize = 4;
 /// Interval between polls during the wait loop.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Walk a directory and return a map of relative paths to their BLAKE3 hashes.
-/// Skips the `.bh_filesync` directory.
 fn hash_directory(root: &Path) -> HashMap<PathBuf, [u8; 32]> {
     let mut map = HashMap::new();
     let walker = walkdir::WalkDir::new(root)
@@ -27,7 +25,6 @@ fn hash_directory(root: &Path) -> HashMap<PathBuf, [u8; 32]> {
             Ok(r) => r.to_path_buf(),
             Err(_) => continue,
         };
-        // Skip the .bh_filesync directory
         if rel.components().any(|c| c.as_os_str() == ".bh_filesync") {
             continue;
         }
@@ -39,7 +36,6 @@ fn hash_directory(root: &Path) -> HashMap<PathBuf, [u8; 32]> {
     map
 }
 
-/// Compute BLAKE3 hash of a file using streaming reads.
 fn hash_file(path: &Path) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     let mut file = match std::fs::File::open(path) {
@@ -57,8 +53,6 @@ fn hash_file(path: &Path) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-/// Compare the contents of a source directory against a destination directory.
-/// Returns an IntegrityResult describing matches, mismatches, missing, and extra files.
 pub fn check_integrity(source_dir: &Path, dest_dir: &Path) -> IntegrityResult {
     let source_hashes = hash_directory(source_dir);
     let dest_hashes = hash_directory(dest_dir);
@@ -96,7 +90,6 @@ pub fn check_integrity(source_dir: &Path, dest_dir: &Path) -> IntegrityResult {
     }
 }
 
-/// Count the number of regular files in a directory (excluding .bh_filesync).
 pub fn count_files(dir: &Path) -> usize {
     if !dir.exists() {
         return 0;
@@ -114,8 +107,6 @@ pub fn count_files(dir: &Path) -> usize {
         .count()
 }
 
-/// Wait until the destination directory has at least `expected_count` files,
-/// or until timeout. Returns true if the count was reached.
 pub fn wait_for_file_count(dest_dir: &Path, expected_count: usize, timeout: Duration) -> bool {
     let start = Instant::now();
     loop {
@@ -133,13 +124,10 @@ pub fn wait_for_file_count(dest_dir: &Path, expected_count: usize, timeout: Dura
     }
 }
 
-/// Wait for the destination to have the same number of files as the source.
-///
-/// Instead of a single settle sleep, this uses **progressive settling**: the
-/// destination file-count must match the source for `STABLE_POLLS_REQUIRED`
-/// consecutive polls before we declare sync complete.  This handles large
-/// file transfers that arrive in chunks as well as delete propagation where
-/// the dest count temporarily overshoots.
+/// Uses **progressive settling**: the destination file-count must match the
+/// source for `STABLE_POLLS_REQUIRED` consecutive polls before declaring sync
+/// complete.  This handles large transfers arriving in chunks and delete
+/// propagation where the dest count temporarily overshoots.
 pub fn wait_for_sync(source_dir: &Path, dest_dir: &Path, timeout: Duration) -> bool {
     let start = Instant::now();
     let mut stable_streak: usize = 0;
@@ -181,8 +169,6 @@ pub fn wait_for_sync(source_dir: &Path, dest_dir: &Path, timeout: Duration) -> b
     }
 }
 
-// ─── Tests ───────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,8 +178,6 @@ mod tests {
     fn write(dir: &std::path::Path, name: &str, data: &[u8]) {
         std::fs::write(dir.join(name), data).unwrap();
     }
-
-    // ── count_files ──────────────────────────────────────────────────────────
 
     #[test]
     fn count_files_empty_directory() {
@@ -240,8 +224,6 @@ mod tests {
         assert_eq!(count_files(tmp.path()), 2);
     }
 
-    // ── hash_file ─────────────────────────────────────────────────────────────
-
     #[test]
     fn hash_file_is_consistent() {
         let tmp = TempDir::new().unwrap();
@@ -286,8 +268,6 @@ mod tests {
         let expected: [u8; 32] = *blake3::hash(b"").as_bytes();
         assert_eq!(hash_file(&p), expected);
     }
-
-    // ── check_integrity ───────────────────────────────────────────────────────
 
     #[test]
     fn check_integrity_identical_dirs_pass() {
@@ -376,8 +356,6 @@ mod tests {
         assert!(r.passed());
     }
 
-    // ── wait_for_file_count ───────────────────────────────────────────────────
-
     #[test]
     fn wait_for_file_count_immediate_success() {
         let tmp = TempDir::new().unwrap();
@@ -414,8 +392,6 @@ mod tests {
         write(tmp.path(), "only.txt", b"x");
         assert!(wait_for_file_count(tmp.path(), 1, Duration::from_secs(1)));
     }
-
-    // ── wait_for_sync ─────────────────────────────────────────────────────────
 
     #[test]
     fn wait_for_sync_both_empty_times_out() {

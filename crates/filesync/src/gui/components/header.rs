@@ -1,5 +1,3 @@
-//! Top header bar: ByteHive logo, application title, and connection badge.
-
 use iced::{
     widget::{container, row, svg, text, Space},
     Alignment, Element, Length,
@@ -59,7 +57,6 @@ pub fn view(status: &ConnectionStatus) -> Element<'_, Message> {
         .into()
 }
 
-/// Small status dot + text label indicating connection status.
 fn connection_badge(status: &ConnectionStatus) -> Element<'_, Message> {
     let (dot_color, label_style): (iced::Color, fn(&iced::Theme) -> iced::widget::text::Style) =
         match status {
@@ -98,8 +95,6 @@ fn connection_badge(status: &ConnectionStatus) -> Element<'_, Message> {
 #[cfg(test)]
 mod tests {
     use crate::gui::state::ConnectionStatus;
-
-    // ─── view smoke tests ─────────────────────────────────────────────────────
 
     #[test]
     fn view_disconnected_does_not_panic() {

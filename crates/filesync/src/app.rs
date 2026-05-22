@@ -22,10 +22,6 @@ use std::time::Duration;
 
 const METRICS_INTERVAL_SECS: u64 = 60;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Config
-// ─────────────────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct FileSyncConfig {
     pub root: PathBuf,
@@ -33,9 +29,6 @@ pub struct FileSyncConfig {
     pub bind_addr: Option<String>,
     pub server_addr: Option<String>,
 
-    /// Kept for backward compatibility with existing config files.
-    /// No longer used for TCP authentication; identity is now established via
-    /// the mutual-TLS certificate fingerprint stored in `known_clients.toml`.
     #[serde(default)]
     pub auth_token: Option<String>,
 
@@ -45,13 +38,9 @@ pub struct FileSyncConfig {
     #[serde(default)]
     pub exclude_regex: Vec<String>,
 
-    /// Automatically purge trash entries older than this many days.
-    /// Set to 0 or omit to disable automatic purging.
     #[serde(default)]
     pub trash_expiry_days: Option<u64>,
 
-    /// Override for the periodic full-rescan interval in seconds.
-    /// Defaults to 900 seconds (15 minutes) when not set.
     #[serde(default)]
     pub full_scan_interval_secs: Option<u64>,
 }
@@ -64,10 +53,6 @@ impl FileSyncConfig {
         }))
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// App state
-// ─────────────────────────────────────────────────────────────────────────────
 
 enum ShutdownHandle {
     Server(Arc<Server>),
@@ -84,10 +69,6 @@ struct State {
     #[allow(dead_code)]
     filesync_dir: PathBuf,
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// FileSyncApp
-// ─────────────────────────────────────────────────────────────────────────────
 
 pub struct FileSyncApp {
     state: RwLock<Option<Arc<State>>>,
@@ -134,9 +115,6 @@ impl App for FileSyncApp {
             .get()
             .map_err(|e| CoreError::Config(format!("filesync config: {e}")))?;
 
-        // Filesync-specific state directory lives under the main config dir.
-        // Future server path:  /etc/bytehive/filesync/
-        // Future client path:  /home/$USER/.config/bytehive/filesync/
         let filesync_dir = ctx.config_dir().join("filesync");
         std::fs::create_dir_all(&filesync_dir).map_err(|e| {
             CoreError::Io(std::io::Error::new(
@@ -185,7 +163,6 @@ impl App for FileSyncApp {
                 .map_err(CoreError::Io)?;
         }
 
-        // Spawn trash GC thread if expiry is configured
         if cfg.trash_expiry_days.map(|d| d > 0).unwrap_or(false) {
             let eng = Arc::clone(&engine);
             thread::Builder::new()
@@ -313,7 +290,6 @@ impl App for FileSyncApp {
         let sub = req.path.strip_prefix("/api/filesync").unwrap_or(&req.path);
 
         match (req.method.as_str(), sub) {
-            // ── status & manifest ──────────────────────────────────────────
             ("GET", "" | "/" | "/status") => {
                 let manifest = state.engine.get_manifest();
                 let (file_count, dir_count, total_bytes) = crate::client::count_manifest(&manifest);
@@ -367,7 +343,6 @@ impl App for FileSyncApp {
                 Err(e) => Some(HttpResponse::internal_error(e.to_string())),
             },
 
-            // ── known-clients (server mode only) ──────────────────────────
             ("GET", "/known-clients") => {
                 let Some(ref kc_arc) = state.known_clients else {
                     return Some(HttpResponse::ok_json(json!({
@@ -508,7 +483,6 @@ impl App for FileSyncApp {
                 }
             }
 
-            // ── trash management ──────────────────────────────────────────────────
             ("GET", "/trash") => {
                 let entries: Vec<_> = state
                     .engine
@@ -567,10 +541,6 @@ impl App for FileSyncApp {
     fn on_message(&self, _msg: &Arc<BusMessage>) {}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Metrics
-// ─────────────────────────────────────────────────────────────────────────────
-
 fn spawn_metrics_thread(engine: Arc<SyncEngine>, bus: Arc<MessageBus>, mode: String) {
     thread::Builder::new()
         .name("filesync-metrics".into())
@@ -601,10 +571,6 @@ fn metrics_loop(engine: Arc<SyncEngine>, bus: Arc<MessageBus>, mode: String) {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// TLS helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
 fn strong_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::CryptoProvider {
         cipher_suites: vec![TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256],
@@ -612,13 +578,6 @@ fn strong_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     })
 }
 
-/// Load a certificate + private key pair from `{dir}/{name}.der` and
-/// `{dir}/{name}.key.der`.  If either file is missing a fresh ECDSA P-384
-/// self-signed keypair is generated, saved, and returned.
-///
-/// This gives every node a *stable* long-lived identity that survives
-/// process restarts.  The certificate fingerprint is what the known-hosts
-/// system uses to identify peers.
 fn load_or_generate_identity(
     dir: &Path,
     name: &str,
@@ -684,13 +643,6 @@ fn generate_self_signed_cert(
     Ok((cert_der, key_der))
 }
 
-/// Build the server TLS config.
-///
-/// * Stable ECDSA P-384 self-signed certificate (persisted in
-///   `{filesync_dir}/server.der` + `server.key.der`).
-/// * Mutual TLS mandatory: every connecting client must present a certificate.
-///   The TLS layer accepts any cert; the application layer checks the
-///   fingerprint against `known_clients.toml`.
 pub fn build_server_tls_config(filesync_dir: &Path) -> Result<Arc<rustls::ServerConfig>, String> {
     let (cert, key) = load_or_generate_identity(filesync_dir, "server")?;
 
@@ -704,12 +656,6 @@ pub fn build_server_tls_config(filesync_dir: &Path) -> Result<Arc<rustls::Server
     Ok(Arc::new(config))
 }
 
-/// Build a client TLS config with an ephemeral (in-memory only) certificate.
-///
-/// Used as a fallback when the identity directory cannot be created or written
-/// (e.g. during tests or in restricted environments).  The client will still
-/// be able to connect but will not have a stable fingerprint — the server will
-/// treat it as a new unknown client on every restart.
 pub fn build_ephemeral_client_tls_config() -> Arc<rustls::ClientConfig> {
     let (cert, key) = generate_self_signed_cert().expect("ephemeral cert generation failed");
     rustls::ClientConfig::builder_with_provider(strong_crypto_provider())
@@ -722,14 +668,6 @@ pub fn build_ephemeral_client_tls_config() -> Arc<rustls::ClientConfig> {
         .into()
 }
 
-/// Build the client TLS config.
-///
-/// * Stable ECDSA P-384 self-signed certificate (persisted in
-///   `{filesync_dir}/client.der` + `client.key.der`).  Presented to the
-///   server during the mutual-TLS handshake (proves key ownership).
-/// * `AcceptAnyCert` for the server-cert verifier: the TLS layer accepts
-///   any server certificate; the application layer verifies the fingerprint
-///   against `known_servers.toml` (TOFU model).
 pub fn build_client_tls_config(filesync_dir: &Path) -> Result<Arc<rustls::ClientConfig>, String> {
     let (cert, key) = load_or_generate_identity(filesync_dir, "client")?;
 
@@ -744,14 +682,6 @@ pub fn build_client_tls_config(filesync_dir: &Path) -> Result<Arc<rustls::Client
     Ok(Arc::new(config))
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// TLS certificate verifiers
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Client-side verifier: accepts any server certificate at the TLS layer.
-///
-/// The actual server fingerprint check (TOFU) is performed at the application
-/// layer in `Client::session()` *after* the handshake completes.
 #[derive(Debug)]
 struct AcceptAnyCert;
 
@@ -797,12 +727,6 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
     }
 }
 
-/// Server-side verifier: accepts any client certificate at the TLS layer.
-///
-/// Accepting any cert allows the TLS handshake to complete, giving us
-/// encryption + proof-of-key-ownership via the TLS 1.3 signature.  The
-/// application layer then checks the fingerprint against `known_clients.toml`
-/// and rejects, pends, or allows the client accordingly.
 #[derive(Debug)]
 struct AcceptAnyClientCert;
 

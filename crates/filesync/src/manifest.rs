@@ -118,12 +118,6 @@ pub fn compute_send_list(local: &Manifest, remote: &Manifest, is_server: bool) -
     out
 }
 
-/// Compares two manifests and returns the paths that differ.
-///
-/// Returns `(changed_or_added, deleted)` where:
-/// - `changed_or_added` contains every path that is new in `new` or whose hash
-///   differs from `old`.
-/// - `deleted` contains every path present in `old` but absent in `new`.
 pub fn diff_manifests(old: &Manifest, new: &Manifest) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut changed = Vec::new();
     let mut deleted = Vec::new();

@@ -16,7 +16,6 @@ pub struct BenchmarkReport {
     pub client_logs: Vec<LogLine>,
 }
 
-/// Format a byte count as a human-readable string (B / KB / MB / GB).
 fn fmt_bytes(b: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
@@ -57,8 +56,6 @@ impl BenchmarkReport {
         }
     }
 
-    /// Construct a `BenchmarkReport` from data loaded from a `data.ndjson` file.
-    ///
     /// DHAT fields are always `None` because DHAT output is only available
     /// after a clean valgrind run (not stored in the crash-safe data file).
     pub fn from_loaded_data(data: super::data_store::LoadedData) -> Self {
@@ -354,7 +351,6 @@ function externalTooltipHandler(context) {{
     return;
   }}
 
-  // ── build inner HTML ─────────────────────────────────────
   const titleText = (tooltip.title || []).join(' ');
   let html = '<div class="gtt-title">' + escapeHtml(titleText) + '</div>';
 
@@ -387,7 +383,6 @@ function externalTooltipHandler(context) {{
 
   el.innerHTML = html;
 
-  // ── position ─────────────────────────────────────────────
   const rect = chart.canvas.getBoundingClientRect();
   const cx   = rect.left + window.scrollX + tooltip.caretX;
   const cy   = rect.top  + window.scrollY + tooltip.caretY;
@@ -841,9 +836,6 @@ renderLogs();
         format!("[{}]", json_items.join(","))
     }
 
-    // ── JSON serialisation helpers ───────────────────────────────────────
-
-    /// Generate a JSON object with time-series arrays for a process's basic metrics.
     fn process_metrics_to_json(&self, samples: &[ProcessSample]) -> String {
         let times: Vec<String> = samples
             .iter()
@@ -886,7 +878,6 @@ renderLogs();
         )
     }
 
-    /// Generate a JSON object with per-thread CPU time-series for a process.
     fn thread_breakdown_to_json(&self, samples: &[ProcessSample]) -> String {
         // Collect all unique thread names across every sample.
         let mut all_names = BTreeSet::new();
@@ -942,7 +933,6 @@ renderLogs();
         )
     }
 
-    /// Generate JSON with disk I/O rates for both server and client.
     fn disk_io_to_json(&self) -> String {
         // We merge server and client onto a common time axis.
         // Use the longer sample set's timestamps as the axis, padding the shorter
@@ -1141,8 +1131,6 @@ renderLogs();
         }
         format!("[{}]", items.join(","))
     }
-
-    // ── HTML fragment helpers ────────────────────────────────────────────
 
     fn events_to_html(&self) -> String {
         let mut rows = String::new();
@@ -1359,8 +1347,6 @@ renderLogs();
         peak
     }
 
-    // ── DHAT report sections ─────────────────────────────────────────────
-
     /// Generates the DHAT sections for the HTML report.
     /// Returns an empty string when neither server nor client was profiled.
     fn dhat_to_html(&self) -> String {
@@ -1524,8 +1510,6 @@ renderLogs();
     }
 }
 
-// ─── Tests ───────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1546,8 +1530,6 @@ mod tests {
             vec![],
         )
     }
-
-    // ── fmt_bytes ─────────────────────────────────────────────────────────────
 
     #[test]
     fn fmt_bytes_below_kb() {
@@ -1581,8 +1563,6 @@ mod tests {
         // 1.5 GB
         assert_eq!(fmt_bytes(1024 * 1024 * 1024 + 512 * 1024 * 1024), "1.50 GB");
     }
-
-    // ── BenchmarkReport::new ──────────────────────────────────────────────────
 
     #[test]
     fn new_stores_duration_and_empty_vecs() {
@@ -1618,8 +1598,6 @@ mod tests {
         assert_eq!(report.events.len(), 1);
         assert_eq!(report.total_duration, Duration::from_secs(10));
     }
-
-    // ── generate_html ─────────────────────────────────────────────────────────
 
     #[test]
     fn generate_html_creates_nonempty_file() {

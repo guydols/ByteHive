@@ -1,5 +1,3 @@
-//! ByteHive brand colours and iced style helpers.
-
 use iced::{
     theme::Palette,
     widget::{button, container, text},
@@ -347,7 +345,6 @@ mod tests {
     use super::*;
     use iced::widget::button;
 
-    // ─── Color constant properties ────────────────────────────────────────────
 
     #[test]
     fn all_surface_colors_are_fully_opaque() {
@@ -414,14 +411,12 @@ mod tests {
         assert_ne!(AMBER_LIGHT, AMBER_DARK);
     }
 
-    // ─── bytehive_theme ───────────────────────────────────────────────────────
 
     #[test]
     fn bytehive_theme_does_not_panic() {
         let _ = bytehive_theme();
     }
 
-    // ─── Container styles ─────────────────────────────────────────────────────
 
     #[test]
     fn panel_style_has_background() {
@@ -468,7 +463,6 @@ mod tests {
         );
     }
 
-    // ─── Text styles ──────────────────────────────────────────────────────────
 
     #[test]
     fn muted_text_returns_muted_color() {
@@ -526,7 +520,6 @@ mod tests {
         }
     }
 
-    // ─── Button styles ────────────────────────────────────────────────────────
 
     #[test]
     fn btn_primary_active_background_is_amber() {

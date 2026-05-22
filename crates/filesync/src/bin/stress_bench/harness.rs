@@ -26,12 +26,6 @@ pub struct BenchServer {
 }
 
 impl BenchServer {
-    /// Start the server subprocess, optionally wrapped with dhat.
-    ///
-    /// When `dhat_path` is `Some(path)`, the server is launched as:
-    /// ```
-    /// valgrind --tool=dhat --dhat-out-file=<path> <exe> __server <dir> <port-file>
-    /// ```
     pub fn start(
         dir: PathBuf,
         dhat_path: Option<PathBuf>,
@@ -43,7 +37,6 @@ impl BenchServer {
 
         let port_file = dir.join(".bench_port");
 
-        // Remove stale port file from a previous run
         if port_file.exists() {
             fs::remove_file(&port_file).expect("remove stale port file");
         }
@@ -89,7 +82,6 @@ impl BenchServer {
 
         let pid = child.id();
 
-        // Spawn log reader thread for server stderr.
         let stderr_handle = child.stderr.take().expect("server stderr should be piped");
         let stdout_handle = child.stdout.take().expect("server stdout should be piped");
         let source_tag = "server";
@@ -176,7 +168,6 @@ impl BenchServer {
                 .expect(&format!("spawn {source_tag}-stdout-log-reader"))
         };
 
-        // Wait for the port file to appear and contain a valid port number.
         let port = {
             let start = Instant::now();
             let timeout = Duration::from_secs(15);
@@ -198,7 +189,6 @@ impl BenchServer {
             }
         };
 
-        // Wait for the server to accept TCP connections.
         {
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let start = Instant::now();
@@ -234,7 +224,6 @@ impl BenchServer {
         self.pid
     }
 
-    /// Returns the dhat output path that was passed to `start()`, if dhat was enabled.
     pub fn dhat_path(&self) -> Option<&Path> {
         self.dhat_path.as_deref()
     }
@@ -278,12 +267,6 @@ pub struct BenchClient {
 }
 
 impl BenchClient {
-    /// Start the client subprocess, optionally wrapped with dhat.
-    ///
-    /// When `dhat_path` is `Some(path)`, the client is launched as:
-    /// ```
-    /// valgrind --tool=dhat --dhat-out-file=<path> <exe> __client <dir> <server-addr>
-    /// ```
     pub fn start(
         dir: PathBuf,
         server_addr: String,
@@ -332,7 +315,6 @@ impl BenchClient {
 
         let pid = child.id();
 
-        // Spawn log reader thread for client stderr.
         let stderr_handle = child.stderr.take().expect("client stderr should be piped");
         let stdout_handle = child.stdout.take().expect("client stdout should be piped");
         let source_tag = "client";
@@ -432,7 +414,6 @@ impl BenchClient {
         self.pid
     }
 
-    /// Returns the dhat output path that was passed to `start()`, if dhat was enabled.
     pub fn dhat_path(&self) -> Option<&Path> {
         self.dhat_path.as_deref()
     }
@@ -467,8 +448,6 @@ impl BenchClient {
     }
 }
 
-/// Write a marker file to the server directory and wait for it to appear
-/// in the client directory.  This confirms the sync pipeline is working.
 pub fn wait_for_connection(server_dir: &Path, client_dir: &Path, timeout: Duration) -> bool {
     let marker = ".bench_connection_marker";
     let marker_content = b"filesync-bench-connection-test";

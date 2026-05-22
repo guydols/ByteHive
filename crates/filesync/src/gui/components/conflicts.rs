@@ -1,5 +1,3 @@
-//! Conflicts panel — shown alongside stats when conflicts exist.
-
 use iced::{
     widget::{button, column, container, row, scrollable, text, Space},
     Alignment, Background, Border, Color, Element, Length,
@@ -27,7 +25,6 @@ pub fn view(conflicts: &[Conflict]) -> Element<'_, Message> {
         .into()
 }
 
-/// A single conflict resolution card.
 fn conflict_card(conflict: &Conflict) -> Element<'_, Message> {
     let id = conflict.id;
 
@@ -139,7 +136,6 @@ fn conflict_card(conflict: &Conflict) -> Element<'_, Message> {
         .into()
 }
 
-/// Shortens a path so it fits inside the conflict card.
 fn truncate_path(path: &str, max_len: usize) -> String {
     if path.len() <= max_len {
         path.to_string()
@@ -153,8 +149,6 @@ fn truncate_path(path: &str, max_len: usize) -> String {
 mod tests {
     use super::{truncate_path, view};
     use crate::gui::state::{Conflict, ConflictKind};
-
-    // ─── truncate_path ────────────────────────────────────────────────────────
 
     #[test]
     fn truncate_path_short_path_returned_unchanged() {
@@ -227,8 +221,6 @@ mod tests {
         let result = truncate_path(path, 36);
         assert!(result.starts_with('\u{2026}'));
     }
-
-    // ─── view smoke tests ─────────────────────────────────────────────────────
 
     fn make_conflict(id: usize, kind: ConflictKind) -> Conflict {
         Conflict {

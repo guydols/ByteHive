@@ -1,8 +1,3 @@
-//! Sync-folder tree view.
-//!
-//! Renders a flat list of [`FlatNode`]s derived from the recursive tree,
-//! with indentation, expand/collapse arrows, and per-node inclusion checkboxes.
-
 use iced::{
     widget::{button, checkbox, column, container, row, scrollable, text, Space},
     Alignment, Background, Border, Color, Element, Length,
@@ -35,11 +30,9 @@ pub fn view(file_tree: &[FileNode]) -> Element<'_, Message> {
         .into()
 }
 
-/// Renders a single row in the tree.
 fn tree_row<'a>(node: &FlatNode) -> Element<'a, Message> {
     let indent = Space::new().width(Length::Fixed((node.depth as f32) * 20.0));
 
-    // Expand/collapse arrow for directories, fixed-width spacer for files.
     let toggle: Element<Message> = if node.is_dir {
         let arrow = if node.expanded {
             "\u{25BE}"
@@ -74,7 +67,6 @@ fn tree_row<'a>(node: &FlatNode) -> Element<'a, Message> {
             color: Some(icon_color),
         });
 
-    // Node label — greyed out when excluded.
     let label_color = if node.included {
         theme::TEXT_PRIMARY
     } else {
@@ -86,7 +78,6 @@ fn tree_row<'a>(node: &FlatNode) -> Element<'a, Message> {
             color: Some(label_color),
         });
 
-    // Excluded badge.
     let excluded_badge: Element<Message> = if !node.included {
         container(text("excluded").size(10).style(theme::muted))
             .padding(iced::Padding::from([2, 6]))
@@ -120,7 +111,6 @@ fn tree_row<'a>(node: &FlatNode) -> Element<'a, Message> {
     let node_id = node.id;
     let included = node.included;
 
-    // Inclusion checkbox.
     let chk: Element<Message> = checkbox(included)
         .on_toggle(move |_| Message::ToggleNodeIncluded(node_id))
         .size(14)
@@ -159,8 +149,6 @@ fn tree_row<'a>(node: &FlatNode) -> Element<'a, Message> {
 #[cfg(test)]
 mod tests {
     use crate::gui::state::FileNode;
-
-    // ─── view smoke tests ─────────────────────────────────────────────────────
 
     #[test]
     fn view_empty_tree_does_not_panic() {

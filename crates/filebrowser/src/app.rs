@@ -21,8 +21,6 @@ pub struct FileBrowserApp {
 
     pub shares: Arc<RwLock<HashMap<String, Share>>>,
     filesync_root: Option<PathBuf>,
-    /// Inherited from [apps.filesync] trash_expiry_days so both apps share
-    /// one setting.
     filesync_trash_expiry_days: Option<u64>,
 }
 

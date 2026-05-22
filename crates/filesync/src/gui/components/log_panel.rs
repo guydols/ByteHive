@@ -1,8 +1,3 @@
-//! Collapsible log panel.
-//!
-//! Collapsed: shows only a clickable toggle bar with the last log message.
-//! Expanded: shows a fixed-height scrollable list of all log entries.
-
 use iced::{
     widget::{button, column, container, row, scrollable, text, Space},
     Alignment, Background, Border, Color, Element, Length,
@@ -50,8 +45,6 @@ pub fn view(log: &EventLog, expanded: bool) -> Element<'_, Message> {
 #[cfg(test)]
 mod tests {
     use crate::gui::state::EventLog;
-
-    // ─── view smoke tests ─────────────────────────────────────────────────────
 
     #[test]
     fn view_empty_log_collapsed_does_not_panic() {
@@ -133,7 +126,6 @@ fn toggle_bar(log: &EventLog, expanded: bool) -> Element<'_, Message> {
         .size(12)
         .style(theme::muted);
 
-    // Show the last log line as a preview when collapsed.
     let preview: Element<Message> = if !expanded {
         if let Some(last) = log.entries().last() {
             text(last.clone()).size(11).style(theme::muted).into()
