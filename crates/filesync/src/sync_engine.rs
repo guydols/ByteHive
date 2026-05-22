@@ -337,6 +337,9 @@ impl SyncEngine {
         if on_disk_hash == manifest_hash {
             return None; // local never changed — no conflict
         }
+        if &on_disk_hash == incoming_hash {
+            return None;
+        }
         Some(manifest_hash)
     }
 
@@ -600,7 +603,7 @@ impl SyncEngine {
             if let Some(manifest_hash) = manifest_hash {
                 if final_hash != manifest_hash {
                     if let Some(on_disk_hash) = hash_file(&asm.dst) {
-                        if on_disk_hash != manifest_hash {
+                        if on_disk_hash != manifest_hash && on_disk_hash != final_hash {
                             let unix_secs = SystemTime::now()
                                 .duration_since(SystemTime::UNIX_EPOCH)
                                 .unwrap_or_default()
@@ -614,7 +617,7 @@ impl SyncEngine {
                                 Ok(_) => {
                                     log::info!(
                                         "conflict: large file {:?} diverged; \
-                                         local copy saved as {:?}",
+                                        local copy saved as {:?}",
                                         path,
                                         conflict_rel
                                     );
