@@ -309,6 +309,15 @@ impl Client {
                 }
                 // Approved — clear the awaiting flag.
                 self.awaiting_approval.store(false, Ordering::SeqCst);
+                if let Some(ref gs) = self.gui_state {
+                    let mut s = gs.write();
+                    s.status = ConnectionStatus::InitialSync;
+                    s.bytes_received = 0;
+                    s.bytes_sent = 0;
+                    s.files_received = 0;
+                    s.files_sent = 0;
+                    s.transfer_total = 0;
+                }
                 info!("filesync: server node_id={node_id}");
                 debug!(
                     "filesync session: protocol version agreed: {protocol_version} with server {node_id}"
@@ -470,13 +479,7 @@ impl Client {
         );
 
         if let Some(ref gs) = self.gui_state {
-            let mut s = gs.write();
-            s.status = ConnectionStatus::InitialSync;
-            s.bytes_received = 0;
-            s.bytes_sent = 0;
-            s.files_received = 0;
-            s.files_sent = 0;
-            s.transfer_total = transfer_total;
+            gs.write().transfer_total = transfer_total;
         }
 
         let sync_start = Instant::now();
