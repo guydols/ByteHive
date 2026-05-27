@@ -138,3 +138,153 @@ fn filesync_config_empty_exclusions() {
     assert_eq!(ex.rule_count(), 2); // 2 default rules
     assert!(!ex.is_excluded(Path::new("any_file.txt")));
 }
+
+#[test]
+fn full_scan_interval_secs_is_deserialized_from_toml() {
+    let toml_str = r#"
+root = "/tmp"
+mode = "server"
+bind_addr = "0.0.0.0:7878"
+full_scan_interval_secs = 86400
+trash_expiry_days = 30
+"#;
+    let val: toml::Value = toml::from_str(toml_str).expect("TOML parse failed");
+    let cfg: FileSyncConfig = val.try_into().expect("FileSyncConfig deserialize failed");
+    assert_eq!(
+        cfg.full_scan_interval_secs,
+        Some(86400),
+        "full_scan_interval_secs should be Some(86400), got {:?}",
+        cfg.full_scan_interval_secs
+    );
+}
+
+#[test]
+fn full_config_chain_parses_full_scan_interval_secs() {
+    use bytehive_core::config::FrameworkConfig;
+
+    let toml_content = r#"
+[framework]
+http_addr = "0.0.0.0:9000"
+
+[apps.filesync]
+root = "/tmp"
+mode = "server"
+bind_addr = "0.0.0.0:7878"
+full_scan_interval_secs = 86400
+trash_expiry_days = 30
+"#;
+
+    let fw: FrameworkConfig = toml::from_str(toml_content).expect("FrameworkConfig parse failed");
+    let app_cfg = fw.app_config("filesync");
+    let fs_cfg: FileSyncConfig = app_cfg.get().expect("FileSyncConfig get() failed");
+
+    assert_eq!(
+        fs_cfg.full_scan_interval_secs,
+        Some(86400),
+        "full_scan_interval_secs should be Some(86400) via the full chain, got {:?}",
+        fs_cfg.full_scan_interval_secs
+    );
+}
+
+#[test]
+fn sync_engine_respects_full_scan_interval_from_config() {
+    use bytehive_core::config::FrameworkConfig;
+    use bytehive_filesync::exclusions::{ExclusionConfig, Exclusions};
+    use bytehive_filesync::sync_engine::{SyncEngine, SyncEngineConfig};
+    use std::sync::Arc;
+
+    let dir = std::env::temp_dir().join(format!("bh_test_{}", line!()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let toml_content = r#"
+[framework]
+http_addr = "0.0.0.0:9000"
+
+[apps.filesync]
+root = "/tmp"
+mode = "server"
+bind_addr = "0.0.0.0:7878"
+full_scan_interval_secs = 86400
+"#;
+    let fw: FrameworkConfig = toml::from_str(toml_content).unwrap();
+    let app_cfg = fw.app_config("filesync");
+    let fs_cfg: FileSyncConfig = app_cfg.get().unwrap();
+
+    let exclusions = Arc::new(Exclusions::compile(&ExclusionConfig::default()));
+    let engine = SyncEngine::new_configured(
+        dir.clone(),
+        "test-node".into(),
+        exclusions,
+        SyncEngineConfig {
+            trash_expiry_days: fs_cfg.trash_expiry_days,
+            full_scan_interval_secs: fs_cfg.full_scan_interval_secs,
+        },
+    );
+
+    assert_eq!(
+        engine.full_scan_interval_secs(),
+        86400,
+        "SyncEngine should use configured value 86400, got {}",
+        engine.full_scan_interval_secs()
+    );
+}
+
+#[test]
+fn sync_engine_zero_interval_falls_back_to_default() {
+    use bytehive_filesync::exclusions::{ExclusionConfig, Exclusions};
+    use bytehive_filesync::protocol::FULL_SCAN_INTERVAL_SECS;
+    use bytehive_filesync::sync_engine::{SyncEngine, SyncEngineConfig};
+    use std::sync::Arc;
+
+    let dir = std::env::temp_dir().join(format!("bh_test_{}", line!()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let exclusions = Arc::new(Exclusions::compile(&ExclusionConfig::default()));
+    let engine = SyncEngine::new_configured(
+        dir,
+        "test-node".into(),
+        exclusions,
+        SyncEngineConfig {
+            trash_expiry_days: None,
+            full_scan_interval_secs: Some(0), // 0 should fall back to the default
+        },
+    );
+
+    assert_eq!(
+        engine.full_scan_interval_secs(),
+        FULL_SCAN_INTERVAL_SECS,
+        "full_scan_interval_secs = 0 should fall back to default {}, got {}",
+        FULL_SCAN_INTERVAL_SECS,
+        engine.full_scan_interval_secs()
+    );
+}
+
+#[test]
+fn sync_engine_absent_interval_falls_back_to_default() {
+    use bytehive_filesync::exclusions::{ExclusionConfig, Exclusions};
+    use bytehive_filesync::protocol::FULL_SCAN_INTERVAL_SECS;
+    use bytehive_filesync::sync_engine::{SyncEngine, SyncEngineConfig};
+    use std::sync::Arc;
+
+    let dir = std::env::temp_dir().join(format!("bh_test_{}", line!()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let exclusions = Arc::new(Exclusions::compile(&ExclusionConfig::default()));
+    let engine = SyncEngine::new_configured(
+        dir,
+        "test-node".into(),
+        exclusions,
+        SyncEngineConfig {
+            trash_expiry_days: None,
+            full_scan_interval_secs: None, // absent → use default
+        },
+    );
+
+    assert_eq!(
+        engine.full_scan_interval_secs(),
+        FULL_SCAN_INTERVAL_SECS,
+        "absent full_scan_interval_secs should fall back to default {}, got {}",
+        FULL_SCAN_INTERVAL_SECS,
+        engine.full_scan_interval_secs()
+    );
+}

@@ -162,7 +162,21 @@ impl SyncEngine {
         );
         let full_scan_interval_secs = config
             .full_scan_interval_secs
+            .filter(|&v| v > 0)
             .unwrap_or(FULL_SCAN_INTERVAL_SECS);
+        log::info!(
+            "SyncEngine: full_scan_interval_secs = {}s ({})",
+            full_scan_interval_secs,
+            if config
+                .full_scan_interval_secs
+                .map(|v| v > 0)
+                .unwrap_or(false)
+            {
+                "from config"
+            } else {
+                "default"
+            }
+        );
         let trash_manager = TrashManager::new(root.clone(), config.trash_expiry_days);
         Self {
             manifest: RwLock::new(Manifest {
