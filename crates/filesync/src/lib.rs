@@ -8,6 +8,7 @@ pub mod known_hosts;
 pub mod manifest;
 pub mod protocol;
 pub mod server;
+pub mod suspend_detector;
 pub mod sync_engine;
 pub mod transport;
 pub mod watcher;

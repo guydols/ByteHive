@@ -340,6 +340,8 @@ channel-based send/receive over TLS:
   - Normal failures: **1 s → 60 s**.
   - Rejected by server: **300 s**.
   - Pending approval: **30 s**.
+- **Suspend/resume detection** (GUI mode): Monitors system uptime to reconnect
+  immediately after suspend.
 - Shutdown check granularity: **100 ms**.
 - **Initial sync order:** receive server files first, then send local files.
 - A dedicated **`recv-srv` thread** handles incoming messages during live sync.
