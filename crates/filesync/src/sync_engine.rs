@@ -40,6 +40,38 @@ pub struct ConflictInfo {
     pub original_path: PathBuf,
     /// Path where the diverged local copy was saved.
     pub conflict_copy_path: PathBuf,
+
+    // ── Diagnostic fields ──────────────────────────────────────────────────
+    /// BLAKE3 hash recorded in the manifest (the last-agreed-upon state).
+    pub manifest_hash: [u8; 32],
+    /// BLAKE3 hash of the incoming (remote) file.
+    pub incoming_hash: [u8; 32],
+    /// BLAKE3 hash of the on-disk (local) file at the moment of detection.
+    pub on_disk_hash: [u8; 32],
+    /// Size of the incoming file in bytes.
+    pub file_size: u64,
+    /// Modification timestamp of the incoming file (ms since Unix epoch).
+    pub incoming_modified_ms: u64,
+    /// Node ID of the local sync engine.
+    pub local_node_id: String,
+    /// Unix timestamp (seconds) when the conflict was detected.
+    pub detected_at_unix_secs: u64,
+    /// Which protocol path triggered the conflict.
+    pub transfer_kind: TransferKind,
+}
+
+/// Indicates which protocol path triggered the conflict.
+#[derive(Debug, Clone, serde::Serialize)]
+pub enum TransferKind {
+    Bundle,
+    LargeFile,
+}
+
+/// Hashes captured by `detect_conflict`, returned as a unit so both values
+/// survive into the caller without re-computing them.
+struct ConflictHashes {
+    manifest_hash: [u8; 32],
+    on_disk_hash: [u8; 32],
 }
 
 #[derive(Debug, Default)]
@@ -331,7 +363,7 @@ impl SyncEngine {
             .collect()
     }
 
-    /// Returns `Some(manifest_hash)` when both the on-disk file and the incoming
+    /// Returns `Some(ConflictHashes)` when both the on-disk file and the incoming
     /// file have diverged from the recorded manifest hash (i.e. a genuine
     /// two-sided conflict).  Returns `None` when there is no conflict.
     fn detect_conflict(
@@ -339,7 +371,7 @@ impl SyncEngine {
         rel_path: &Path,
         full_path: &Path,
         incoming_hash: &[u8; 32],
-    ) -> Option<[u8; 32]> {
+    ) -> Option<ConflictHashes> {
         // Must be a known file (present in our manifest)
         let manifest_hash = self.manifest.read().files.get(rel_path).map(|m| m.hash)?;
         // The incoming file must differ from the last-synced state
@@ -354,7 +386,10 @@ impl SyncEngine {
         if &on_disk_hash == incoming_hash {
             return None;
         }
-        Some(manifest_hash)
+        Some(ConflictHashes {
+            manifest_hash,
+            on_disk_hash,
+        })
     }
 
     pub fn apply_bundle(&self, bundle: &FileBundle) -> std::io::Result<ApplyResult> {
@@ -375,7 +410,7 @@ impl SyncEngine {
 
             // --- Conflict detection (files only) ---
             if !fd.metadata.is_dir {
-                if let Some(_ancestor_hash) =
+                if let Some(hashes) =
                     self.detect_conflict(&fd.metadata.rel_path, &full, &fd.metadata.hash)
                 {
                     let unix_secs = SystemTime::now()
@@ -398,6 +433,14 @@ impl SyncEngine {
                             result.conflicts.push(ConflictInfo {
                                 original_path: fd.metadata.rel_path.clone(),
                                 conflict_copy_path: conflict_rel,
+                                manifest_hash: hashes.manifest_hash,
+                                incoming_hash: fd.metadata.hash,
+                                on_disk_hash: hashes.on_disk_hash,
+                                file_size: fd.metadata.size,
+                                incoming_modified_ms: fd.metadata.modified_ms,
+                                local_node_id: self.node_id.clone(),
+                                detected_at_unix_secs: unix_secs,
+                                transfer_kind: TransferKind::Bundle,
                             });
                         }
                         Err(e) => {
@@ -638,6 +681,14 @@ impl SyncEngine {
                                     Some(ConflictInfo {
                                         original_path: path.clone(),
                                         conflict_copy_path: conflict_rel,
+                                        manifest_hash,
+                                        incoming_hash: final_hash,
+                                        on_disk_hash,
+                                        file_size: asm.file_size,
+                                        incoming_modified_ms: asm.modified_ms,
+                                        local_node_id: self.node_id.clone(),
+                                        detected_at_unix_secs: unix_secs,
+                                        transfer_kind: TransferKind::LargeFile,
                                     })
                                 }
                                 Err(e) => {

@@ -12,6 +12,43 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+fn to_hex(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn write_conflict_report(root: &Path, ci: &ConflictInfo, peer: &str) {
+    let conflict_copy_abs = root.join(&ci.conflict_copy_path);
+    let mut report_path = conflict_copy_abs.clone();
+    report_path.set_extension("conflict_report.json");
+
+    let report = serde_json::json!({
+        "report_version": 1,
+        "detected_at_unix_secs": ci.detected_at_unix_secs,
+        "transfer_kind": format!("{:?}", ci.transfer_kind),
+        "original_path": ci.original_path,
+        "conflict_copy_path": ci.conflict_copy_path,
+        "local_node_id": ci.local_node_id,
+        "remote_peer": peer,
+        "incoming_file_size_bytes": ci.file_size,
+        "incoming_modified_ms": ci.incoming_modified_ms,
+        "hashes": {
+            "format": "blake3-hex",
+            "last_synced_manifest": to_hex(&ci.manifest_hash),
+            "incoming_remote": to_hex(&ci.incoming_hash),
+            "local_on_disk": to_hex(&ci.on_disk_hash)
+        },
+        "explanation": "Both the local and remote nodes modified this file since the last sync point. The incoming remote version was applied to the original path, and the local version was preserved as a conflict copy."
+    });
+
+    match serde_json::to_string_pretty(&report) {
+        Ok(json_str) => match std::fs::write(&report_path, json_str) {
+            Ok(()) => info!("conflict report written: {:?}", report_path),
+            Err(e) => warn!("failed to write conflict report {:?}: {e}", report_path),
+        },
+        Err(e) => warn!("failed to write conflict report {:?}: {e}", report_path),
+    }
+}
+
 pub fn available_disk_space(path: &Path) -> io::Result<u64> {
     fs2::available_space(path)
 }
@@ -273,6 +310,7 @@ pub fn handle_recv_bundle(
                 }),
             );
         }
+        write_conflict_report(engine.root(), ci, peer);
     }
 
     if files_count > 0 {
@@ -335,6 +373,7 @@ pub fn handle_recv_large_file_chunk(
                         "{log_prefix}: conflict copy during retransmit commit: {:?} → {:?}",
                         ci.original_path, ci.conflict_copy_path
                     );
+                    write_conflict_report(engine.root(), &ci, peer);
                 }
                 FinishResult::MissingChunks(_) => {}
             }
@@ -406,6 +445,7 @@ pub fn handle_recv_large_file_end(
                     }),
                 );
             }
+            write_conflict_report(engine.root(), &ci, peer);
             Ok(LargeFileEndOutcome::Committed)
         }
         FinishResult::MissingChunks(indices) => {
