@@ -2,6 +2,7 @@ use crate::client::Client;
 use crate::exclusions::{ExclusionConfig, Exclusions};
 use crate::gui::config::GuiConfig;
 use crate::gui::state::{ConnectionStatus, SharedState};
+use crate::suspend_detector::SuspendDetector;
 use crate::sync_engine::SyncEngine;
 use crate::timestamp_id;
 use std::path::PathBuf;
@@ -84,6 +85,8 @@ fn session_loop(
         }
     }
 
+    let mut suspend_detector = SuspendDetector::new();
+
     loop {
         if stopped.load(Ordering::SeqCst) {
             break;
@@ -91,6 +94,7 @@ fn session_loop(
 
         if paused.load(Ordering::SeqCst) {
             thread::sleep(Duration::from_millis(250));
+            let _ = suspend_detector.check_for_resume();
             continue;
         }
 
@@ -100,9 +104,6 @@ fn session_loop(
             s.log_event(format!("Connecting to {} …", cfg.server_addr));
         }
 
-        // The stable identity certificate and known_servers.toml live in a
-        // "filesync" sub-directory under the GUI's config directory.
-        // Future path: ~/.config/bytehive/filesync/
         let identity_dir: PathBuf = GuiConfig::config_dir().join("filesync");
 
         let client = Client::new_standalone(
@@ -140,7 +141,15 @@ fn session_loop(
             if stopped.load(Ordering::SeqCst) || paused.load(Ordering::SeqCst) {
                 break;
             }
-            thread::sleep(Duration::from_millis(200));
+
+            if suspend_detector.check_for_resume() {
+                state
+                    .write()
+                    .log_event("System resumed from suspend — reconnecting immediately.");
+                break;
+            }
+
+            thread::sleep(Duration::from_millis(1000));
         }
     }
 
