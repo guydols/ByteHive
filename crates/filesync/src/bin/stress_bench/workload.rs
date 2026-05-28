@@ -13,18 +13,12 @@ fn settle() {
     thread::sleep(Duration::from_millis(DIR_SETTLE_MS));
 }
 
-/// Pre-create every sub-directory the workload phases will use so that the
-/// inotify watcher is already watching them before any files are written.
-///
-/// Directories are created **one level at a time** with a sleep between each
-/// level.  This is necessary because inotify only fires a `CREATE+ISDIR`
-/// event on the *parent* directory's watch.  If a child directory is created
-/// before the watcher has processed the parent's event and added a watch for
-/// it, the child's creation is silently lost and no watch is ever added.
-///
-/// Call this once during setup, **before** any phase starts.
+/// Pre-creates every sub-directory the workload phases will use, one level
+/// at a time with a sleep between each level.  inotify only fires a
+/// `CREATE+ISDIR` event on the *parent* directory's watch, so child
+/// directories must be created after the parent's watch is registered.
+/// Call once during setup, before any phase starts.
 pub fn prepare_directories(dir: &Path) {
-    // ── Level 0: top-level phase directories (parent = root, already watched) ──
     let level0 = [
         "small_flood",
         "large_files",
@@ -38,14 +32,12 @@ pub fn prepare_directories(dir: &Path) {
     // Wait for the watcher to process CREATE events and add watches for each.
     thread::sleep(Duration::from_millis(400));
 
-    // ── Level 1: depth dirs under mixed_burst ──
     for depth in 0..4 {
         let p = dir.join(format!("mixed_burst/depth{depth}"));
         fs::create_dir(p).ok(); // ok() — already exists is fine
     }
     thread::sleep(Duration::from_millis(400));
 
-    // ── Level 2: branch dirs under each depth ──
     for depth in 0..4 {
         for branch in 0..3 {
             let p = dir.join(format!("mixed_burst/depth{depth}/branch{branch}"));
@@ -137,7 +129,7 @@ pub fn large_file_transfer(dir: &Path, count: usize, size_mb: usize) -> Workload
     settle();
 
     let mut stats = WorkloadStats::default();
-    let chunk_size = 1024 * 1024; // Write 1MB at a time
+    let chunk_size = 1024 * 1024;
 
     for i in 0..count {
         // Vary sizes: 50% to 150% of the given size
@@ -277,14 +269,10 @@ pub fn modification_storm(dir: &Path, count: usize) -> WorkloadStats {
     stats
 }
 
-// ─── Tests ───────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
-
-    // ── Xorshift64 ───────────────────────────────────────────────────────────
 
     #[test]
     fn xorshift64_zero_seed_treated_as_one() {
@@ -353,8 +341,6 @@ mod tests {
         assert_ne!(buf, vec![0u8; 16]);
     }
 
-    // ── generate_content ─────────────────────────────────────────────────────
-
     #[test]
     fn generate_content_correct_size() {
         assert_eq!(generate_content(1, 1024).len(), 1024);
@@ -371,8 +357,6 @@ mod tests {
     fn generate_content_different_seeds_differ() {
         assert_ne!(generate_content(1, 256), generate_content(2, 256));
     }
-
-    // ── small_file_flood ─────────────────────────────────────────────────────
 
     #[test]
     fn small_file_flood_creates_correct_count() {
@@ -398,8 +382,6 @@ mod tests {
         assert_eq!(file_count, 2);
     }
 
-    // ── large_file_transfer ──────────────────────────────────────────────────
-
     #[test]
     fn large_file_transfer_creates_correct_count() {
         let tmp = TempDir::new().unwrap();
@@ -417,8 +399,6 @@ mod tests {
         assert!(tmp.path().join("large_files").is_dir());
     }
 
-    // ── mixed_burst ──────────────────────────────────────────────────────────
-
     #[test]
     fn mixed_burst_creates_small_and_large_files() {
         let tmp = TempDir::new().unwrap();
@@ -434,8 +414,6 @@ mod tests {
         mixed_burst(tmp.path(), 2, 0, 1);
         assert!(tmp.path().join("mixed_burst").is_dir());
     }
-
-    // ── modification_storm ───────────────────────────────────────────────────
 
     #[test]
     fn modification_storm_returns_zero_if_no_source_dir() {
@@ -462,8 +440,6 @@ mod tests {
         let stats = modification_storm(tmp.path(), 10);
         assert_eq!(stats.files_modified, 2);
     }
-
-    // ── delete_and_recreate ──────────────────────────────────────────────────
 
     #[test]
     fn delete_and_recreate_deletes_and_creates() {
@@ -496,8 +472,6 @@ mod tests {
         assert_eq!(stats.files_deleted, 0);
         assert_eq!(stats.files_created, 2);
     }
-
-    // ── sustained_tick ───────────────────────────────────────────────────────
 
     #[test]
     fn sustained_tick_creates_10_small_files_for_non_divisible_tick() {
@@ -540,8 +514,6 @@ mod tests {
         let stats = sustained_tick(tmp.path(), 2);
         assert!(stats.bytes_written > 0);
     }
-
-    // ── prepare_directories ──────────────────────────────────────────────────
 
     #[test]
     fn prepare_directories_creates_all_top_level_dirs() {
@@ -638,7 +610,6 @@ pub fn sustained_tick(dir: &Path, tick: usize) -> WorkloadStats {
     let mut stats = WorkloadStats::default();
     let mut size_rng = Xorshift64::new(0x6000_0000 + tick as u64);
 
-    // 10 small files per tick
     for i in 0..10 {
         let size = 1024 + (size_rng.next_u64() % (50 * 1024)) as usize;
         let content = generate_content(0x6000_0000 + tick as u64 * 1000 + i as u64, size);

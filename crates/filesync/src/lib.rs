@@ -44,11 +44,6 @@ pub fn hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Compute the BLAKE3 fingerprint of a DER-encoded certificate.
-///
-/// The result is a 64-character lowercase hex string that uniquely identifies
-/// the certificate.  This is used for both client and server identity checks
-/// in the known-hosts system.
 pub fn cert_fingerprint(cert_der: &[u8]) -> String {
     blake3::hash(cert_der).to_hex().to_string()
 }

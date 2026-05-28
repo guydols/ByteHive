@@ -64,8 +64,6 @@ impl EventLog {
     }
 }
 
-// ─── Conflicts ───────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConflictKind {
     BothModified,
@@ -95,8 +93,6 @@ pub struct Conflict {
     pub remote_modified: String,
     pub kind: ConflictKind,
 }
-
-// ─── File tree ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct FileNode {
@@ -137,7 +133,6 @@ impl FileNode {
     }
 }
 
-/// A flattened, renderable representation of a single tree row.
 #[derive(Debug, Clone)]
 pub struct FlatNode {
     pub id: usize,
@@ -174,8 +169,6 @@ fn flatten_recursive(nodes: &[FileNode], depth: usize, out: &mut Vec<FlatNode>) 
         }
     }
 }
-
-// ─── Side panel tabs ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SideTab {

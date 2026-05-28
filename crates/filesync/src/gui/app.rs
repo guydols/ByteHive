@@ -1,9 +1,3 @@
-//! Core application wiring — window settings, update loop, top-level view.
-//!
-//! Uses the ByteHive dark theme, header bar, status panel, stats/conflicts
-//! main content area, and collapsible log panel from the component modules.
-//! All real functionality (SyncManager, tray, config, etc.) is preserved.
-
 use crate::gui::config::GuiConfig;
 use crate::gui::manager::SyncManager;
 use crate::gui::state::{new_shared_state, FileNode, SharedState, SideTab, SyncSnapshot};
@@ -19,8 +13,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-
-// ─── Entry point ──────────────────────────────────────────────────────────────
 
 pub fn run(tray: TrayHandle) -> iced::Result {
     let tray_arc = Arc::new(Mutex::new(tray));
@@ -45,23 +37,18 @@ pub fn run(tray: TrayHandle) -> iced::Result {
 }
 
 fn load_window_icon() -> Option<window::Icon> {
-    const ICON_PNG: &[u8] =
-        include_bytes!("../../../core/assets/bytehive_icon_128x128.png");
-    let img = image::load_from_memory(ICON_PNG)
-        .ok()?
-        .into_rgba8();
+    const ICON_PNG: &[u8] = include_bytes!("../../../core/assets/bytehive_icon_128x128.png");
+    let img = image::load_from_memory(ICON_PNG).ok()?.into_rgba8();
     let (w, h) = img.dimensions();
     window::icon::from_rgba(img.into_raw(), w, h).ok()
 }
-
-// ─── State ────────────────────────────────────────────────────────────────────
 
 struct SetupState {
     step: SetupStep,
     folder_input: String,
     server_input: String,
     token_input: String,
-    // ── Step 3: Configure ────────────────────────────────────────────────────
+    // Step 3: Configure
     /// Raw TOML text being edited by the user.
     config_editor: text_editor::Content,
     /// Validated config produced when the user clicks Next on the Configure step.
@@ -115,8 +102,6 @@ struct FileSyncGui {
     window_id: Option<window::Id>,
 }
 
-// ─── Messages ─────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone)]
 pub enum Message {
     // Setup
@@ -157,8 +142,6 @@ pub enum Message {
     Quit,
 }
 
-// ─── Application logic ───────────────────────────────────────────────────────
-
 impl FileSyncGui {
     fn init(tray: Arc<Mutex<TrayHandle>>) -> (Self, Task<Message>) {
         let screen = match GuiConfig::load() {
@@ -193,7 +176,7 @@ impl FileSyncGui {
 
     fn update(&mut self, msg: Message) -> Task<Message> {
         match msg {
-            // ── Setup messages ────────────────────────────────────────────────
+            // Setup messages
             Message::FolderInput(v) => {
                 if let Screen::Setup(s) = &mut self.screen {
                     s.folder_input = v;
@@ -338,7 +321,7 @@ impl FileSyncGui {
                 Task::none()
             }
 
-            // ── Dashboard messages ────────────────────────────────────────────
+            // Dashboard messages
             Message::Tick => {
                 if let Ok(handle) = self.tray.lock() {
                     while let Ok(ev) = handle.events.try_recv() {
@@ -394,7 +377,7 @@ impl FileSyncGui {
                 Task::none()
             }
 
-            // ── Conflict messages ─────────────────────────────────────────────
+            // Conflict messages
             Message::OpenConflictFolder(id) => {
                 if let Screen::Dashboard(d) = &self.screen {
                     if let Some(conflict) = d.snapshot.conflicts.iter().find(|c| c.id == id) {
@@ -442,8 +425,8 @@ impl FileSyncGui {
                 Task::none()
             }
 
-            // ── Window management ─────────────────────────────────────────────
-            // ── File tree messages ────────────────────────────────────────────
+            // Window management
+            // File tree messages
             Message::ToggleNodeExpanded(id) => {
                 if let Screen::Dashboard(d) = &mut self.screen {
                     toggle_expanded(&mut d.file_tree, id);
@@ -458,7 +441,7 @@ impl FileSyncGui {
                 Task::none()
             }
 
-            // ── Side panel tab ────────────────────────────────────────────────
+            // Side panel tab
             Message::SelectTab(tab) => {
                 if let Screen::Dashboard(d) = &mut self.screen {
                     d.active_tab = tab;
@@ -515,7 +498,6 @@ impl FileSyncGui {
     }
 }
 
-// ─── Setup views ──────────────────────────────────────────────────────────────
 
 fn view_setup(s: &SetupState) -> Element<'_, Message> {
     let step_num = match s.step {
@@ -808,7 +790,6 @@ fn view_setup_review(s: &SetupState) -> Element<'_, Message> {
     setup_card(inner.into())
 }
 
-// ─── Dashboard view ───────────────────────────────────────────────────────────
 
 fn view_dashboard(d: &DashboardState) -> Element<'_, Message> {
     let snap = &d.snapshot;
@@ -862,7 +843,6 @@ fn main_content(d: &DashboardState) -> Element<'_, Message> {
     .into()
 }
 
-// ─── Tree mutation helpers ────────────────────────────────────────────────────
 
 fn toggle_expanded(nodes: &mut Vec<FileNode>, id: usize) {
     for node in nodes.iter_mut() {
@@ -985,7 +965,6 @@ fn refresh_file_tree(old_tree: &[FileNode], root: &std::path::Path) -> Vec<FileN
     new_tree
 }
 
-// ─── Config template ─────────────────────────────────────────────────────────
 
 /// Escapes a bare string value for embedding inside a TOML double-quoted string.
 fn toml_escape(s: &str) -> String {
@@ -1025,7 +1004,6 @@ exclude_regex = []
     )
 }
 
-// ─── Setup helpers ────────────────────────────────────────────────────────────
 
 fn setup_card(content: Element<Message>) -> Element<Message> {
     container(content)

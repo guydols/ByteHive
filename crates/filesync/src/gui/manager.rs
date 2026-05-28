@@ -73,6 +73,8 @@ fn session_loop(
     let node_id = format!("gui-{:x}", timestamp_id());
     let engine = Arc::new(SyncEngine::new(cfg.sync_root.clone(), node_id, exclusions));
 
+    // Show local stats immediately so the Stats panel isn't stuck at zero
+    // while waiting for a connection.
     match engine.scan() {
         Ok(_) => {
             refresh_manifest_stats(&engine, &state);

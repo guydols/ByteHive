@@ -139,12 +139,6 @@ fn io_loop(
     recv_tx: Sender<io::Result<Message>>,
     send_rx: Receiver<Option<Frame>>,
 ) {
-    // By the time this runs the TLS handshake has already been completed
-    // in from_tls(), so complete_prior_io() inside write/flush will never
-    // see is_handshaking() == true and will never try to read from the
-    // socket as part of a write.  WouldBlock can therefore only come from
-    // the deliberate short read-poll timeout, which FrameReader::poll
-    // already handles correctly.
     debug!(
         "tls-io: thread started (send_depth={SEND_QUEUE_DEPTH} recv_depth={RECV_CHANNEL_DEPTH})"
     );
@@ -193,14 +187,6 @@ fn io_loop(
 pub struct Connection {
     recv_rx: Mutex<Receiver<io::Result<Message>>>,
     send_tx: Sender<Option<Frame>>,
-    /// DER-encoded end-entity certificate presented by the remote peer during
-    /// the TLS handshake.
-    ///
-    /// * Server connection: the client's certificate (mutual TLS).
-    /// * Client connection: the server's certificate.
-    ///
-    /// `None` if the peer did not present a certificate (should not happen
-    /// in normal operation since both sides use stable identity certs).
     pub peer_cert: Option<Vec<u8>>,
 }
 
@@ -226,34 +212,6 @@ impl Connection {
 
     fn from_tls(mut tls: TlsStream) -> io::Result<Self> {
         debug!("tls: completing TLS handshake (blocking)");
-        // The TLS handshake MUST be completed here, in blocking mode, before
-        // the short read-poll timeout is applied.
-        //
-        // Root cause of the connection bug
-        // ---------------------------------
-        // rustls's Stream::write() calls complete_prior_io() first.  If the
-        // handshake is still in progress (is_handshaking() == true),
-        // complete_prior_io() calls ConnectionCommon::complete_io(), which
-        // tries to read the peer's next handshake record.  With the 5 ms poll
-        // timeout already set, that read returns EAGAIN (WouldBlock / os error
-        // 11) after 5 ms if the peer hasn't replied yet.  complete_io()
-        // propagates that error immediately (no retry), so write_all() — and
-        // therefore every send — fails with "Resource temporarily unavailable"
-        // before any application data is exchanged.  The peer then sees an
-        // unexpected EOF as the connection drops.
-        //
-        // The fix
-        // -------
-        // flush() on a freshly created StreamOwned drives complete_io() with
-        // until_handshaked = true.  With a blocking socket (the OS default for
-        // a newly connected/accepted TcpStream) that loop runs until
-        // is_handshaking() == false, i.e. until the full handshake is done.
-        // Only then do we install the short poll timeout that io_loop needs to
-        // interleave reads and writes without dedicated threads.  After this
-        // point complete_prior_io() in write/flush will never enter the
-        // is_handshaking() branch, so WouldBlock can only arise from the
-        // deliberate poll timeout on reads — and FrameReader::poll handles
-        // that correctly already.
         tls.flush()?;
         debug!(
             "tls: TLS handshake complete, setting read poll timeout to {} ms",
@@ -263,9 +221,6 @@ impl Connection {
         tls.tcp()
             .set_read_timeout(Some(Duration::from_millis(READ_POLL_MS)))?;
 
-        // Extract the peer's end-entity certificate now, while we still have
-        // direct access to the TLS connection object (before it moves into the
-        // io_loop thread).
         let peer_cert: Option<Vec<u8>> = match &tls {
             TlsStream::Server(s) => s
                 .conn

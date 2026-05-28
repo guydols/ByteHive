@@ -1,5 +1,3 @@
-//! Status panel: sync status indicator, progress bar, pause/resume and open folder buttons.
-
 use iced::{
     widget::{button, column, container, row, text, Space},
     Alignment, Background, Border, Color, Element, Length,
@@ -97,7 +95,6 @@ pub fn view(snap: &SyncSnapshot, is_paused: bool) -> Element<'_, Message> {
         .into()
 }
 
-/// Small dot indicating the current status category.
 fn status_indicator_dot(status: &ConnectionStatus) -> Element<'static, Message> {
     let color = match status {
         ConnectionStatus::Idle => theme::GREEN,
@@ -126,7 +123,6 @@ fn status_indicator_dot(status: &ConnectionStatus) -> Element<'static, Message> 
         .into()
 }
 
-/// A custom progress bar rendered as two layered containers.
 fn progress_bar(fraction: f32) -> Element<'static, Message> {
     let fraction = fraction.clamp(0.0, 1.0);
 
@@ -206,7 +202,6 @@ mod tests {
     use super::fmt_bytes;
     use crate::gui::state::{ConnectionStatus, SyncSnapshot};
 
-    // ─── fmt_bytes ────────────────────────────────────────────────────────────
 
     #[test]
     fn fmt_bytes_zero() {
@@ -248,7 +243,6 @@ mod tests {
         assert_eq!(fmt_bytes(2_147_483_648), "2.00 GiB");
     }
 
-    // ─── view smoke tests ─────────────────────────────────────────────────────
 
     #[test]
     fn view_disconnected_not_paused_does_not_panic() {

@@ -34,7 +34,6 @@ pub enum FinishResult {
     MissingChunks(Vec<u32>),
 }
 
-/// Information about a conflict that was resolved by creating a conflict copy.
 #[derive(Debug, Clone)]
 pub struct ConflictInfo {
     /// Original file path (incoming file applied here).
@@ -43,7 +42,6 @@ pub struct ConflictInfo {
     pub conflict_copy_path: PathBuf,
 }
 
-/// Result of applying a bundle.
 #[derive(Debug, Default)]
 pub struct ApplyResult {
     /// Number of entries actually written (files + dirs).
@@ -60,11 +58,14 @@ struct LargeFileAssembly {
     expected_hash: [u8; 32],
     dst: PathBuf,
     file_size: u64,
+    /// Original modification timestamp (ms since Unix epoch) from the sender.
+    /// Restored onto the destination file after the transfer is committed so
+    /// that the receiver's filesystem mtime matches the sender's.
+    modified_ms: u64,
 
     final_hash_pending: Option<[u8; 32]>,
 }
 
-/// Optional configuration overrides for a [`SyncEngine`] instance.
 #[derive(Debug, Default, Clone)]
 pub struct SyncEngineConfig {
     /// Automatically purge trash entries older than this many days.
@@ -91,10 +92,6 @@ pub struct SyncEngine {
     full_scan_interval_secs: u64,
 }
 
-/// Returns the path that a conflict copy of `rel_path` should use.
-///
-/// Format: `{dir}/{stem} (conflict {unix_secs} {node_id}).{ext}`
-/// If the file has no extension the extension suffix is omitted.
 pub fn conflict_copy_name(rel_path: &Path, node_id: &str, unix_secs: u64) -> PathBuf {
     let stem = rel_path
         .file_stem()
@@ -165,7 +162,21 @@ impl SyncEngine {
         );
         let full_scan_interval_secs = config
             .full_scan_interval_secs
+            .filter(|&v| v > 0)
             .unwrap_or(FULL_SCAN_INTERVAL_SECS);
+        log::info!(
+            "SyncEngine: full_scan_interval_secs = {}s ({})",
+            full_scan_interval_secs,
+            if config
+                .full_scan_interval_secs
+                .map(|v| v > 0)
+                .unwrap_or(false)
+            {
+                "from config"
+            } else {
+                "default"
+            }
+        );
         let trash_manager = TrashManager::new(root.clone(), config.trash_expiry_days);
         Self {
             manifest: RwLock::new(Manifest {
@@ -231,37 +242,30 @@ impl SyncEngine {
         age_ms >= FILE_STABILITY_MS
     }
 
-    /// Returns the configured full-rescan interval in seconds.
     pub fn full_scan_interval_secs(&self) -> u64 {
         self.full_scan_interval_secs
     }
 
-    /// Returns a reference to the shared trash manager.
     pub fn trash_manager(&self) -> &Arc<TrashManager> {
         &self.trash_manager
     }
 
-    /// List all entries currently in the trash.
     pub fn list_trash(&self) -> Vec<bytehive_core::TrashEntry> {
         self.trash_manager.list_trash()
     }
 
-    /// Restore a trashed entry by its ID back to its original location.
     pub fn restore_trash_entry(&self, id: &str) -> Result<(), String> {
         self.trash_manager.restore_entry(id)
     }
 
-    /// Permanently delete a single trash entry by its ID.
     pub fn purge_trash_entry(&self, id: &str) -> Result<(), String> {
         self.trash_manager.purge_entry(id)
     }
 
-    /// Purge all entries that exceed the configured expiry age.
     pub fn purge_expired_trash(&self) -> usize {
         self.trash_manager.purge_expired()
     }
 
-    /// Empty the entire trash bin. Returns the number of entries removed.
     pub fn empty_trash(&self) -> usize {
         self.trash_manager.empty()
     }
@@ -347,12 +351,19 @@ impl SyncEngine {
         if on_disk_hash == manifest_hash {
             return None; // local never changed — no conflict
         }
+        if &on_disk_hash == incoming_hash {
+            return None;
+        }
         Some(manifest_hash)
     }
 
     pub fn apply_bundle(&self, bundle: &FileBundle) -> std::io::Result<ApplyResult> {
         let mut written = Vec::new();
         let mut result = ApplyResult::default();
+        // Collect (absolute_path, modified_ms) for directories so we can stamp
+        // them *after* all their contents have been written.  Writing files into
+        // a directory updates the directory's mtime, so we must restore it last.
+        let mut dir_mtimes: Vec<(PathBuf, u64)> = Vec::new();
 
         for fd in &bundle.files {
             if !safe_relative(&fd.metadata.rel_path) {
@@ -396,17 +407,28 @@ impl SyncEngine {
                 }
             }
 
-            // --- Apply the incoming file ---
+            // --- Apply the incoming entry ---
             self.suppressed.write().insert(fd.metadata.rel_path.clone());
             written.push(fd.metadata.rel_path.clone());
 
             if fd.metadata.is_dir {
                 fs::create_dir_all(&full)?;
+                // Defer mtime restoration until after all files in this bundle
+                // have been written, otherwise child-file writes will clobber it.
+                dir_mtimes.push((full.clone(), fd.metadata.modified_ms));
             } else {
                 if let Some(parent) = full.parent() {
                     fs::create_dir_all(parent)?;
                 }
                 fs::write(&full, &fd.content)?;
+                // Restore the sender's modification timestamp on the file.
+                let mtime = filetime::FileTime::from_unix_time(
+                    (fd.metadata.modified_ms / 1000) as i64,
+                    ((fd.metadata.modified_ms % 1000) * 1_000_000) as u32,
+                );
+                if let Err(e) = filetime::set_file_mtime(&full, mtime) {
+                    warn!("failed to set mtime on {:?}: {e}", full);
+                }
             }
 
             self.manifest
@@ -414,6 +436,20 @@ impl SyncEngine {
                 .files
                 .insert(fd.metadata.rel_path.clone(), fd.metadata.clone());
             result.written += 1;
+        }
+
+        // Restore directory mtimes deepest-first so that stamping a child
+        // directory does not update its parent's mtime before we stamp the
+        // parent too.
+        dir_mtimes.sort_by(|a, b| b.0.components().count().cmp(&a.0.components().count()));
+        for (path, modified_ms) in dir_mtimes {
+            let mtime = filetime::FileTime::from_unix_time(
+                (modified_ms / 1000) as i64,
+                ((modified_ms % 1000) * 1_000_000) as u32,
+            );
+            if let Err(e) = filetime::set_file_mtime(&path, mtime) {
+                warn!("failed to set mtime on dir {:?}: {e}", path);
+            }
         }
 
         self.schedule_unsuppress(written);
@@ -472,6 +508,7 @@ impl SyncEngine {
                 expected_hash: metadata.hash,
                 dst,
                 file_size: metadata.size,
+                modified_ms: metadata.modified_ms,
                 final_hash_pending: None,
             },
         );
@@ -580,7 +617,7 @@ impl SyncEngine {
             if let Some(manifest_hash) = manifest_hash {
                 if final_hash != manifest_hash {
                     if let Some(on_disk_hash) = hash_file(&asm.dst) {
-                        if on_disk_hash != manifest_hash {
+                        if on_disk_hash != manifest_hash && on_disk_hash != final_hash {
                             let unix_secs = SystemTime::now()
                                 .duration_since(SystemTime::UNIX_EPOCH)
                                 .unwrap_or_default()
@@ -594,7 +631,7 @@ impl SyncEngine {
                                 Ok(_) => {
                                     log::info!(
                                         "conflict: large file {:?} diverged; \
-                                         local copy saved as {:?}",
+                                        local copy saved as {:?}",
                                         path,
                                         conflict_rel
                                     );
@@ -625,19 +662,22 @@ impl SyncEngine {
         fs::rename(&asm.tmp_path, &asm.dst)?;
         cleanup_transfer_dirs(&self.root, &asm.tmp_path);
 
-        let meta = fs::metadata(&asm.dst)?;
-        let modified_ms = meta
-            .modified()
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        // Restore the sender's original modification timestamp.  The rename
+        // above (and the OS itself) would otherwise stamp the file with the
+        // current time.
+        let mtime = filetime::FileTime::from_unix_time(
+            (asm.modified_ms / 1000) as i64,
+            ((asm.modified_ms % 1000) * 1_000_000) as u32,
+        );
+        if let Err(e) = filetime::set_file_mtime(&asm.dst, mtime) {
+            warn!("failed to set mtime on large file {:?}: {e}", asm.dst);
+        }
 
         let file_meta = FileMetadata {
             rel_path: path.clone(),
-            size: meta.len(),
+            size: asm.file_size,
             hash: final_hash,
-            modified_ms,
+            modified_ms: asm.modified_ms,
             is_dir: false,
         };
         self.manifest.write().files.insert(path.clone(), file_meta);

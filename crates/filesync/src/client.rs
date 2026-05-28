@@ -29,13 +29,9 @@ pub struct Client {
     server_addr: String,
     bus: Option<Arc<MessageBus>>,
     stopped: Arc<AtomicBool>,
-    /// Directory where the client's stable identity cert and `known_servers.toml`
-    /// are stored.  Populated from the framework config dir at construction.
     identity_dir: PathBuf,
     tls_config: Arc<rustls::ClientConfig>,
     gui_state: Option<SharedState>,
-    /// Set to `true` when the server responds with `ApprovalPending`.  The run
-    /// loop uses a longer, fixed back-off while this flag is set.
     awaiting_approval: Arc<AtomicBool>,
 }
 
@@ -127,16 +123,11 @@ impl Client {
         self.stopped.store(true, Ordering::SeqCst);
     }
 
-    /// Whether the last connection attempt ended with an `ApprovalPending`
-    /// response from the server.  The GUI can poll this to show status.
     pub fn is_awaiting_approval(&self) -> bool {
         self.awaiting_approval.load(Ordering::SeqCst)
     }
 
     pub fn run(&self) {
-        // Default back-off for normal errors.  When the server replies with
-        // ApprovalPending we use a much longer fixed interval so we don't
-        // hammer it while waiting for an admin to act.
         const APPROVAL_POLL_SECS: u64 = 30;
         let mut backoff = Duration::from_secs(1);
 
@@ -240,11 +231,6 @@ impl Client {
         );
         debug!("filesync session: TLS 1.3 handshake complete");
 
-        // ── TOFU server fingerprint check ────────────────────────────────────
-        // Verify the server's certificate fingerprint against our local store.
-        // On first connection we record it (Trust On First Use).  On subsequent
-        // connections we require it to match — a mismatch means the server cert
-        // has changed unexpectedly (possible MITM or unannounced rotation).
         {
             let known_servers_path = self.identity_dir.join("known_servers.toml");
             let mut ks = KnownServers::load_or_create(&known_servers_path);
@@ -257,7 +243,6 @@ impl Client {
                     let server_fp = cert_fingerprint(der);
                     match ks.get_fingerprint(&self.server_addr) {
                         None => {
-                            // First time we connect to this server — pin its cert (TOFU).
                             info!(
                                 "filesync: trusting new server {} — pinning fingerprint {}… \
                                  (delete {:?} to re-trust after cert rotation)",
@@ -274,7 +259,6 @@ impl Client {
                             );
                         }
                         Some(stored_fp) => {
-                            // Fingerprint mismatch — abort immediately.
                             let msg = format!(
                                 "filesync: SERVER FINGERPRINT MISMATCH for {}! \
                                  Stored: {}…  Got: {}…  \
@@ -325,6 +309,15 @@ impl Client {
                 }
                 // Approved — clear the awaiting flag.
                 self.awaiting_approval.store(false, Ordering::SeqCst);
+                if let Some(ref gs) = self.gui_state {
+                    let mut s = gs.write();
+                    s.status = ConnectionStatus::InitialSync;
+                    s.bytes_received = 0;
+                    s.bytes_sent = 0;
+                    s.files_received = 0;
+                    s.files_sent = 0;
+                    s.transfer_total = 0;
+                }
                 info!("filesync: server node_id={node_id}");
                 debug!(
                     "filesync session: protocol version agreed: {protocol_version} with server {node_id}"
@@ -486,13 +479,7 @@ impl Client {
         );
 
         if let Some(ref gs) = self.gui_state {
-            let mut s = gs.write();
-            s.status = ConnectionStatus::InitialSync;
-            s.bytes_received = 0;
-            s.bytes_sent = 0;
-            s.files_received = 0;
-            s.files_sent = 0;
-            s.transfer_total = transfer_total;
+            gs.write().transfer_total = transfer_total;
         }
 
         let sync_start = Instant::now();

@@ -54,20 +54,12 @@ pub enum Message {
     Hello {
         node_id: String,
         protocol_version: u32,
-        /// Kept for wire compatibility; no longer used for authentication.
-        /// Identity is established via the mutual-TLS certificate fingerprint.
+        // wire compat only, no longer used for auth
         credential: Option<String>,
     },
-    /// Sent by the server when the connecting client's certificate fingerprint
-    /// is not yet in the allowed list.  The client should display a
-    /// "waiting for approval" status and retry with back-off.
     ApprovalPending {
-        /// The client's own certificate fingerprint (echoed back so the
-        /// admin and the client can cross-check them).
         fingerprint: String,
     },
-    /// Sent by the server when the connecting client has been explicitly
-    /// rejected by an administrator.
     Rejected {
         reason: String,
     },
@@ -102,13 +94,8 @@ pub enum Message {
         to: PathBuf,
     },
 
-    /// Sent by either side when a preemptive disk-space check fails after
-    /// receiving the remote manifest.  The receiver should abort the sync
-    /// and surface the error to the user / operator.
     InsufficientDiskSpace {
-        /// Free bytes on the sender's filesystem at the time of the check.
         available_bytes: u64,
-        /// Bytes that would have been needed to complete the sync.
         required_bytes: u64,
     },
 }

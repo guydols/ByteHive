@@ -12,9 +12,6 @@ use std::time::{Duration, Instant};
 /// and is adequate for a benchmark tool.
 const CLOCK_TICKS_PER_SEC: f64 = 100.0;
 
-// ─── /proc readers ──────────────────────────────────────────────────────────
-
-/// Reads cumulative (utime, stime) ticks for a process from `/proc/<pid>/stat`.
 fn read_process_cpu_ticks(pid: u32) -> (u64, u64) {
     let path = format!("/proc/{}/stat", pid);
     let stat = fs::read_to_string(path).unwrap_or_default();
@@ -37,8 +34,6 @@ fn read_process_cpu_ticks(pid: u32) -> (u64, u64) {
     }
 }
 
-/// Reads memory and thread info from `/proc/<pid>/status`.
-///
 /// Returns (rss_bytes, vm_size_bytes, shared_bytes, private_bytes, thread_count).
 fn read_process_memory(pid: u32) -> (u64, u64, u64, u64, u32) {
     let path = format!("/proc/{}/status", pid);
@@ -82,8 +77,6 @@ fn read_process_memory(pid: u32) -> (u64, u64, u64, u64, u32) {
     )
 }
 
-/// Parses a `/proc/<pid>/status` line of the form `Key:  1234 kB` and returns
-/// the numeric value in kB.
 fn parse_status_kb(line: &str) -> u64 {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() >= 2 {
@@ -93,9 +86,7 @@ fn parse_status_kb(line: &str) -> u64 {
     }
 }
 
-/// Reads cumulative disk I/O from `/proc/<pid>/io`.
-///
-/// Returns (read_bytes, write_bytes) – the actual disk I/O counters.
+/// Returns (read_bytes, write_bytes).
 fn read_process_io(pid: u32) -> (u64, u64) {
     let path = format!("/proc/{}/io", pid);
     let io = fs::read_to_string(path).unwrap_or_default();
@@ -121,8 +112,6 @@ fn read_process_io(pid: u32) -> (u64, u64) {
     (read_bytes, write_bytes)
 }
 
-/// Reads cumulative RX and TX bytes for the loopback interface from
-/// `/proc/net/dev` (global, not per-process).
 fn read_net_loopback_bytes() -> (u64, u64) {
     let dev = fs::read_to_string("/proc/net/dev").unwrap_or_default();
     for line in dev.lines() {
@@ -144,13 +133,8 @@ fn read_net_loopback_bytes() -> (u64, u64) {
     (0, 0)
 }
 
-// ─── Per-thread sampling ────────────────────────────────────────────────────
-
-/// Per-thread tick state keyed by TID: (prev_utime, prev_stime).
 type ThreadTickMap = HashMap<u32, (u64, u64)>;
 
-/// Reads (utime, stime) from `/proc/<pid>/task/<tid>/stat`.
-///
 /// In the per-thread stat file the utime and stime fields are at the same
 /// positions as in the process stat file (fields 14 and 15, 1-indexed; after
 /// skipping comm they are at offsets 11 and 12 in the remainder).
@@ -171,7 +155,6 @@ fn read_thread_cpu_ticks(pid: u32, tid: u32) -> (u64, u64) {
     }
 }
 
-/// Reads the thread name from `/proc/<pid>/task/<tid>/comm`.
 fn read_thread_name(pid: u32, tid: u32) -> String {
     let path = format!("/proc/{}/task/{}/comm", pid, tid);
     fs::read_to_string(path)
@@ -180,7 +163,6 @@ fn read_thread_name(pid: u32, tid: u32) -> String {
         .to_string()
 }
 
-/// Enumerates all TIDs under `/proc/<pid>/task/`.
 fn list_tids(pid: u32) -> Vec<u32> {
     let path = format!("/proc/{}/task", pid);
     let entries = match fs::read_dir(&path) {
@@ -200,8 +182,6 @@ fn list_tids(pid: u32) -> Vec<u32> {
     tids
 }
 
-/// Samples all threads for a given PID and computes per-thread CPU deltas.
-///
 /// `prev_ticks` is mutated in-place to store the new tick values.  Threads
 /// that have disappeared are pruned from the map.
 fn sample_threads(pid: u32, prev_ticks: &mut ThreadTickMap, wall_delta: f64) -> Vec<ThreadSample> {
@@ -254,9 +234,6 @@ fn sample_threads(pid: u32, prev_ticks: &mut ThreadTickMap, wall_delta: f64) -> 
     samples
 }
 
-// ─── Per-process sampler state ──────────────────────────────────────────────
-
-/// Internal state for sampling a single process.
 struct ProcessState {
     pid: u32,
     prev_utime: u64,
@@ -277,12 +254,10 @@ impl ProcessState {
         }
     }
 
-    /// Takes a single sample and advances internal state.
     fn sample(&mut self, elapsed_secs: f64) -> ProcessSample {
         let now = Instant::now();
         let wall_delta = now.duration_since(self.prev_wall).as_secs_f64();
 
-        // ── CPU ──
         let (utime, stime) = read_process_cpu_ticks(self.pid);
         let du = utime.saturating_sub(self.prev_utime) as f64;
         let ds = stime.saturating_sub(self.prev_stime) as f64;
@@ -300,17 +275,13 @@ impl ProcessState {
         self.prev_stime = stime;
         self.prev_wall = now;
 
-        // ── Memory ──
         let (rss_bytes, vm_size_bytes, shared_bytes, private_bytes, thread_count) =
             read_process_memory(self.pid);
 
-        // ── Threads ──
         let threads = sample_threads(self.pid, &mut self.thread_ticks, wall_delta);
 
-        // ── Disk I/O ──
         let (io_read_bytes, io_write_bytes) = read_process_io(self.pid);
 
-        // ── Network (loopback, global) ──
         let (net_rx_bytes, net_tx_bytes) = read_net_loopback_bytes();
 
         ProcessSample {
@@ -332,8 +303,6 @@ impl ProcessState {
     }
 }
 
-// ─── Public API ─────────────────────────────────────────────────────────────
-
 pub struct ProcessMetricsCollector {
     interval: Duration,
 }
@@ -343,10 +312,6 @@ impl ProcessMetricsCollector {
         Self { interval }
     }
 
-    /// Starts a background thread that periodically samples both the server
-    /// and client processes identified by their PIDs.  Returns a
-    /// [`MetricsHandle`] that can be used to retrieve snapshots or stop
-    /// collection.
     pub fn start(
         self,
         server_pid: u32,
@@ -415,8 +380,7 @@ pub struct MetricsHandle {
 
 #[cfg(test)]
 impl MetricsHandle {
-    /// Constructs an empty `MetricsHandle` with no background thread.
-    /// Used only in tests to exercise `snapshot` and `stop` without a real PID.
+    // No background thread — used in tests to exercise snapshot/stop without a real PID.
     fn empty() -> Self {
         Self {
             server_samples: Arc::new(Mutex::new(Vec::new())),
@@ -428,8 +392,6 @@ impl MetricsHandle {
 }
 
 impl MetricsHandle {
-    /// Returns snapshots of all collected samples so far for
-    /// (server, client).
     pub fn snapshot(&self) -> (Vec<ProcessSample>, Vec<ProcessSample>) {
         let srv = self
             .server_samples
@@ -444,8 +406,6 @@ impl MetricsHandle {
         (srv, cli)
     }
 
-    /// Stops sampling and returns all collected samples for
-    /// (server, client).
     pub fn stop(mut self) -> (Vec<ProcessSample>, Vec<ProcessSample>) {
         self.stop_flag.store(true, Ordering::Relaxed);
         if let Some(h) = self.thread.take() {
@@ -469,8 +429,6 @@ impl MetricsHandle {
 mod tests {
     use super::*;
     use std::time::Duration;
-
-    // ── parse_status_kb ──────────────────────────────────────────────────────
 
     #[test]
     fn parse_status_kb_parses_standard_line() {
@@ -501,8 +459,6 @@ mod tests {
     fn parse_status_kb_parses_zero() {
         assert_eq!(parse_status_kb("VmRSS: 0 kB"), 0);
     }
-
-    // ── MetricsHandle ────────────────────────────────────────────────────────
 
     #[test]
     fn metrics_handle_snapshot_returns_empty_when_no_samples() {
@@ -558,8 +514,6 @@ mod tests {
         assert_eq!(srv[0].elapsed_secs, 1.0);
         assert_eq!(srv[0].cpu_percent, 5.0);
     }
-
-    // ── ProcessMetricsCollector ──────────────────────────────────────────────
 
     #[test]
     fn process_metrics_collector_new_stores_interval() {

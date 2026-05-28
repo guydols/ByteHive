@@ -2,37 +2,23 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-// ─── DHAT allocation site ────────────────────────────────────────────────────
-
-/// One "program point" from a DHAT JSON output file — a unique allocation
-/// call-stack and the aggregate metrics for all allocations made from it.
 #[derive(Clone, Debug)]
 pub struct DhatAllocSite {
-    /// Total bytes allocated from this site over the entire run.
     pub total_bytes: u64,
-    /// Total allocation calls (blocks) from this site over the entire run.
     pub total_blocks: u64,
     /// Maximum bytes live at any one time from this site (peak live bytes).
     pub peak_bytes: u64,
-    /// Maximum blocks live at any one time from this site.
     pub peak_blocks: u64,
-    /// Total bytes read from blocks allocated at this site.
     pub bytes_read: u64,
-    /// Total bytes written to blocks allocated at this site.
     pub bytes_written: u64,
-    /// Bytes that were allocated but never read or written ("evil" bytes).
+    /// Bytes allocated but never read or written.
     pub bytes_never_accessed: u64,
     /// Call-stack frames from innermost (allocation site) to outermost caller.
     pub frames: Vec<String>,
 }
 
-// ─── DHAT run summary ────────────────────────────────────────────────────────
-
-/// Summary parsed from a DHAT JSON output file produced by
-/// `valgrind --tool=dhat`.
 #[derive(Clone, Debug)]
 pub struct DhatSummary {
-    /// Path to the DHAT JSON file on disk.
     pub output_path: std::path::PathBuf,
     /// The profiled command string (from `cmd` in the JSON).
     pub command: Option<String>,
@@ -40,7 +26,6 @@ pub struct DhatSummary {
     pub pid: Option<u64>,
     /// Grand total bytes allocated across all sites over the entire run.
     pub total_bytes: u64,
-    /// Grand total allocation calls (blocks) across all sites.
     pub total_blocks: u64,
     /// Peak bytes for the single largest allocation site (largest `mb` value).
     pub max_site_peak_bytes: u64,
@@ -51,7 +36,6 @@ pub struct DhatSummary {
 }
 
 impl DhatSummary {
-    /// Construct an empty/error summary.
     pub fn error(path: &std::path::Path, msg: String) -> Self {
         Self {
             output_path: path.to_path_buf(),
@@ -66,41 +50,25 @@ impl DhatSummary {
     }
 }
 
-// ─── Per-thread CPU sample ──────────────────────────────────────────────────
-
-/// A single per-thread CPU sample captured from /proc/<pid>/task/<tid>/.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ThreadSample {
     /// Thread name (from /proc/<pid>/task/<tid>/comm).
     pub name: String,
     /// Total CPU usage percentage (user + system) since last sample.
     pub cpu_percent: f64,
-    /// User-mode CPU usage percentage since last sample.
     pub user_cpu_percent: f64,
-    /// Kernel-mode CPU usage percentage since last sample.
     pub sys_cpu_percent: f64,
 }
 
-// ─── Per-process metric sample ──────────────────────────────────────────────
-
-/// A single point-in-time sample of a process's resource usage,
-/// collected by reading /proc/<pid>/ for an external process.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProcessSample {
-    /// Seconds elapsed since benchmark start.
     pub elapsed_secs: f64,
 
-    // ── CPU ──────────────────────────────────────────────────────────────
-    /// Total CPU usage percentage (user + system) since last sample.
-    /// This is relative to a single core — values above 100% indicate
-    /// multi-core usage.
+    /// Total CPU — values above 100% indicate multi-core usage.
     pub cpu_percent: f64,
-    /// User-mode CPU percentage since last sample.
     pub user_cpu_percent: f64,
-    /// Kernel/system-mode CPU percentage since last sample.
     pub sys_cpu_percent: f64,
 
-    // ── Memory ───────────────────────────────────────────────────────────
     /// Resident Set Size in bytes (VmRSS from /proc/<pid>/status).
     pub rss_bytes: u64,
     /// Virtual memory size in bytes (VmSize from /proc/<pid>/status).
@@ -110,35 +78,25 @@ pub struct ProcessSample {
     /// Private (anonymous) memory in bytes (rss - shared).
     pub private_bytes: u64,
 
-    // ── Threads ──────────────────────────────────────────────────────────
-    /// Number of threads in the process (Threads from /proc/<pid>/status).
     pub thread_count: u32,
-    /// Per-thread CPU breakdown.
     pub threads: Vec<ThreadSample>,
 
-    // ── Disk I/O ─────────────────────────────────────────────────────────
     /// Cumulative bytes read from disk (read_bytes from /proc/<pid>/io).
     pub io_read_bytes: u64,
     /// Cumulative bytes written to disk (write_bytes from /proc/<pid>/io).
     pub io_write_bytes: u64,
 
-    // ── Network (loopback) ───────────────────────────────────────────────
-    /// Cumulative bytes received on the loopback interface.
+    /// Cumulative bytes on the loopback interface.
     pub net_rx_bytes: u64,
-    /// Cumulative bytes transmitted on the loopback interface.
     pub net_tx_bytes: u64,
 }
 
-// ─── Benchmark events ───────────────────────────────────────────────────────
-
-/// A timestamped event that occurred during the benchmark.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Event {
     pub elapsed_secs: f64,
     pub kind: EventKind,
 }
 
-/// The kind of benchmark event.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
@@ -169,9 +127,6 @@ pub enum EventKind {
     Info(String),
 }
 
-// ─── Workload statistics ────────────────────────────────────────────────────
-
-/// Statistics returned by a workload generator.
 #[derive(Clone, Debug, Default)]
 pub struct WorkloadStats {
     pub files_created: usize,
@@ -184,8 +139,6 @@ pub struct WorkloadStats {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-
-    // ── IntegrityResult::passed ───────────────────────────────────────────────
 
     #[test]
     fn integrity_result_passed_all_clean() {
@@ -255,8 +208,6 @@ mod tests {
         assert!(r.passed());
     }
 
-    // ── WorkloadStats ─────────────────────────────────────────────────────────
-
     #[test]
     fn workload_stats_default_is_all_zero() {
         let s = WorkloadStats::default();
@@ -281,9 +232,6 @@ mod tests {
     }
 }
 
-// ─── Integrity result ───────────────────────────────────────────────────────
-
-/// Result of an integrity check between server and client directories.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IntegrityResult {
     pub matched: usize,
@@ -298,9 +246,6 @@ impl IntegrityResult {
     }
 }
 
-// ─── Log capture ────────────────────────────────────────────────────────────
-
-/// A single log line captured from a server or client subprocess.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LogLine {
     /// Seconds since benchmark start when this line was received.
@@ -309,6 +254,5 @@ pub struct LogLine {
     pub source: String,
     /// Parsed log level: "ERROR", "WARN", "INFO", "DEBUG", "TRACE", or "INFO" for unrecognised prefixes.
     pub level: String,
-    /// The full original log line text.
     pub message: String,
 }

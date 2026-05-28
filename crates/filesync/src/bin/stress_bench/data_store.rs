@@ -1,10 +1,3 @@
-//! Crash-safe NDJSON data store for the stress benchmark.
-//!
-//! Every record written by the orchestrator, log reader threads, and metrics
-//! sampler is appended to a single `data.ndjson` file in the run directory.
-//! Because each line is a self-contained JSON object, the file stays readable
-//! after a crash — the report generator skips any incomplete trailing line.
-
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
@@ -14,42 +7,45 @@ use serde::{Deserialize, Serialize};
 
 use super::types::{Event, IntegrityResult, LogLine, ProcessSample};
 
-// ─── On-disk record ──────────────────────────────────────────────────────────
-
-/// One NDJSON line written to `data.ndjson`.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DataRecord {
-    /// Written once at the very start.
-    Meta { run_id: String, command: String },
-    /// A benchmark event (phase start/end, file ops, integrity check, …).
-    Event { event: Event },
-    /// Integrity comparison result for a named phase.
+    Meta {
+        run_id: String,
+        command: String,
+    },
+    Event {
+        event: Event,
+    },
     Integrity {
         phase: String,
         result: IntegrityResult,
     },
-    /// One server metrics sample.
-    ServerSample { sample: ProcessSample },
-    /// One client metrics sample.
-    ClientSample { sample: ProcessSample },
+    ServerSample {
+        sample: ProcessSample,
+    },
+    ClientSample {
+        sample: ProcessSample,
+    },
     /// One server log line (from stderr **or** stdout of the server subprocess).
-    ServerLog { line: LogLine },
+    ServerLog {
+        line: LogLine,
+    },
     /// One client log line (from stderr **or** stdout of the client subprocess).
-    ClientLog { line: LogLine },
+    ClientLog {
+        line: LogLine,
+    },
     /// Written once on a clean shutdown; signals that the run finished normally.
-    Complete { total_duration_secs: f64 },
+    Complete {
+        total_duration_secs: f64,
+    },
 }
 
-// ─── Writer ──────────────────────────────────────────────────────────────────
-
-/// Append-only NDJSON data store, safe to share across threads via `Arc`.
 pub struct DataStore {
     file: Mutex<File>,
 }
 
 impl DataStore {
-    /// Create (or truncate) the data store file at `path`.
     pub fn create(path: &Path) -> io::Result<Arc<Self>> {
         let file = OpenOptions::new()
             .create(true)
@@ -61,8 +57,6 @@ impl DataStore {
         }))
     }
 
-    /// Append `record` as a single NDJSON line and flush immediately.
-    ///
     /// Errors are silently swallowed — the benchmark must not abort because it
     /// cannot write to the data store.
     pub fn append(&self, record: &DataRecord) {
@@ -76,9 +70,6 @@ impl DataStore {
     }
 }
 
-// ─── Reader / loader ─────────────────────────────────────────────────────────
-
-/// All data recovered from a `data.ndjson` file.
 pub struct LoadedData {
     /// Total benchmark duration.  Estimated from the last timestamp when the
     /// `Complete` record is absent (i.e. the run crashed).
@@ -93,10 +84,6 @@ pub struct LoadedData {
     pub completed: bool,
 }
 
-/// Load a data store file and reconstruct all benchmark data.
-///
-/// Incomplete / malformed lines — e.g. from a crash mid-write — are silently
-/// skipped, so the load always succeeds for any prefix of a valid file.
 pub fn load(path: &Path) -> io::Result<LoadedData> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);

@@ -1,41 +1,23 @@
-//! Shared trash-bin management used by both the filesync server and the
-//! filebrowser.  Both apps write to the same `.bh_filesync/trash/` directory
-//! under the sync root.
-
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-/// Path of the trash directory relative to the sync root.
 pub const TRASH_DIR: &str = ".bh_filesync/trash";
-/// Filename for the JSON metadata index inside the trash directory.
 pub const TRASH_INDEX_FILE: &str = "index.json";
 
-/// Metadata for a single item that has been moved to the trash.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrashEntry {
-    /// Unique identifier for this deletion event.
     pub id: String,
-    /// Original path relative to the sync root.
     pub original_path: PathBuf,
-    /// Path relative to the trash directory: `{id}/{original_path}`.
     pub trash_rel_path: PathBuf,
-    /// Unix millisecond timestamp of deletion.
     pub deleted_at_ms: u64,
-    /// File size in bytes (0 for directories).
     pub size: u64,
-    /// True when this entry is a directory.
     pub is_dir: bool,
-    /// Label of the component or user that performed the deletion.
     pub deleted_by: String,
 }
 
-/// Thread-safe manager for the `.bh_filesync/trash` directory.
-///
-/// All mutations are protected by an internal `Mutex` and use an atomic
-/// rename-on-write strategy for the index file to prevent partial writes.
 pub struct TrashManager {
     root: PathBuf,
     lock: Mutex<()>,
@@ -87,10 +69,6 @@ impl TrashManager {
         }
     }
 
-    /// Move `full_path` (at relative path `rel` inside the root) into the
-    /// trash, preserving the original folder structure.
-    ///
-    /// Falls back to a hard delete when the move fails.
     pub fn move_to_trash(&self, full_path: &Path, rel: &Path, deleted_by: &str) {
         if !full_path.exists() {
             return;
@@ -161,13 +139,11 @@ impl TrashManager {
         self.save_index(&index);
     }
 
-    /// List all entries currently in the trash.
     pub fn list_trash(&self) -> Vec<TrashEntry> {
         let _guard = self.lock.lock();
         self.load_index()
     }
 
-    /// Move the entry identified by `id` back to its original location.
     pub fn restore_entry(&self, id: &str) -> Result<(), String> {
         let _guard = self.lock.lock();
         let mut index = self.load_index();
@@ -214,7 +190,6 @@ impl TrashManager {
         Ok(())
     }
 
-    /// Permanently delete the trash entry identified by `id`.
     pub fn purge_entry(&self, id: &str) -> Result<(), String> {
         let _guard = self.lock.lock();
         let mut index = self.load_index();
@@ -236,8 +211,6 @@ impl TrashManager {
         Ok(())
     }
 
-    /// Remove all entries older than `expiry_days`. Returns the count removed.
-    /// Does nothing when `expiry_days` is `None` or `0`.
     pub fn purge_expired(&self) -> usize {
         let expiry_days = match self.expiry_days {
             Some(d) if d > 0 => d,
@@ -278,7 +251,6 @@ impl TrashManager {
         count
     }
 
-    /// Permanently delete **all** items in the trash. Returns count removed.
     pub fn empty(&self) -> usize {
         let _guard = self.lock.lock();
         let mut index = self.load_index();
@@ -298,10 +270,6 @@ impl TrashManager {
     }
 }
 
-// ── Private helpers ──────────────────────────────────────────────────────────
-
-/// Generate a unique ID for a trash entry using nanosecond time + an atomic
-/// counter so two calls within the same nanosecond produce distinct IDs.
 fn trash_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);

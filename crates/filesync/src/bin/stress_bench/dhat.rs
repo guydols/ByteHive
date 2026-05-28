@@ -6,10 +6,6 @@ use serde_json::Value;
 
 use super::types::{DhatAllocSite, DhatSummary};
 
-// ─── Output-file discovery ───────────────────────────────────────────────────
-
-/// Polls for the DHAT output file at exactly `path`.
-/// (`valgrind --tool=dhat --dhat-out-file=<path>` writes to the exact path given.)
 pub fn wait_for_output(path: &Path, timeout: Duration) -> Option<PathBuf> {
     let start = Instant::now();
     loop {
@@ -27,10 +23,6 @@ pub fn wait_for_output(path: &Path, timeout: Duration) -> Option<PathBuf> {
     }
 }
 
-// ─── DHAT JSON parser ────────────────────────────────────────────────────────
-
-/// Parses a DHAT JSON output file and returns a `DhatSummary`.
-///
 /// DHAT JSON v2 format key fields:
 /// - `cmd`   — the profiled command string
 /// - `pid`   — profiled PID
@@ -70,7 +62,6 @@ fn parse_json(path: &Path, data: &str) -> DhatSummary {
     let command = v["cmd"].as_str().map(|s| s.to_string());
     let pid = v["pid"].as_u64();
 
-    // Frame table — maps index → human-readable frame string.
     let ftbl: Vec<String> = v["ftbl"]
         .as_array()
         .map(|arr| {
@@ -103,7 +94,6 @@ fn parse_json(path: &Path, data: &str) -> DhatSummary {
         grand_total_bytes += tb;
         grand_total_blocks += tbk;
 
-        // Resolve call-stack frames.
         let frames: Vec<String> = pp["fs"]
             .as_array()
             .map(|arr| {
@@ -150,15 +140,11 @@ fn parse_json(path: &Path, data: &str) -> DhatSummary {
     }
 }
 
-// ─── Tests ───────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
     use tempfile::TempDir;
-
-    // ── DhatSummary::error ───────────────────────────────────────────────────
 
     #[test]
     fn dhat_summary_error_constructor_sets_all_fields() {
@@ -173,8 +159,6 @@ mod tests {
         assert!(s.pid.is_none());
         assert_eq!(s.output_path, p);
     }
-
-    // ── parse_json ───────────────────────────────────────────────────────────
 
     #[test]
     fn parse_json_valid_minimal() {
@@ -292,8 +276,6 @@ mod tests {
         assert!(s.command.is_none());
         assert!(s.pid.is_none());
     }
-
-    // ── wait_for_output ──────────────────────────────────────────────────────
 
     #[test]
     fn wait_for_output_returns_none_when_file_missing() {
