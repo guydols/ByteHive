@@ -8,9 +8,10 @@ pub const BUNDLE_MAX_FILES: usize = 500;
 pub const LARGE_FILE_THRESHOLD: u64 = 8 * 1024 * 1024;
 pub const FILE_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 pub const DEBOUNCE_MS: u64 = 200;
 pub const FILE_STABILITY_MS: u64 = 500;
+pub const FILE_CHANGE_COALESCE_MS: u64 = 100;
 pub const SUPPRESSION_SECS: u64 = 2;
 pub const SEND_QUEUE_DEPTH: usize = 512;
 pub const CLIENT_BROADCAST_DEPTH: usize = 512;
@@ -28,6 +29,7 @@ pub struct FileMetadata {
     pub size: u64,
     pub hash: [u8; 32],
     pub modified_ms: u64,
+    pub change_sequence: u64,
     pub is_dir: bool,
 }
 
@@ -65,6 +67,10 @@ pub enum Message {
     },
     ManifestExchange(Manifest),
     Bundle(FileBundle),
+    ChangeAcknowledgment {
+        bundle_id: u64,
+        sequence_numbers: Vec<u64>,
+    },
     Delete {
         paths: Vec<PathBuf>,
     },

@@ -789,6 +789,31 @@ fn recv_loop(engine: Arc<SyncEngine>, conn: Arc<Connection>, bus: Option<Arc<Mes
                 if let Err(e) = common::handle_recv_bundle(&engine, &b, "server", &bus, prefix) {
                     error!("{prefix}: apply_bundle: {e}");
                 }
+
+                // Send acknowledgment for this bundle
+                let sequence_numbers: Vec<u64> = b
+                    .files
+                    .iter()
+                    .map(|fd| fd.metadata.change_sequence)
+                    .filter(|&seq| seq > 0)
+                    .collect();
+
+                if !sequence_numbers.is_empty() {
+                    if let Err(e) = conn.send(&Message::ChangeAcknowledgment {
+                        bundle_id: b.bundle_id,
+                        sequence_numbers: sequence_numbers.clone(),
+                    }) {
+                        warn!(
+                            "{prefix}: failed to send acknowledgment for bundle {}: {e}",
+                            b.bundle_id
+                        );
+                    } else {
+                        debug!(
+                            "{prefix}: sent acknowledgment for bundle {} (sequences: {:?})",
+                            b.bundle_id, sequence_numbers
+                        );
+                    }
+                }
             }
             Ok(Message::LargeFileStart {
                 ref metadata,
@@ -846,6 +871,9 @@ fn recv_loop(engine: Arc<SyncEngine>, conn: Arc<Connection>, bus: Option<Arc<Mes
                     }
                     Ok(LargeFileEndOutcome::Committed) => {
                         debug!("{prefix}: LargeFileEnd committed {path:?}");
+
+                        // Note: For large files, we don't have the metadata here to get the sequence number
+                        // The acknowledgment would need to be handled differently for large files
                     }
                     Err(e) => error!("{prefix}: large_file_end: {e}"),
                 }
@@ -887,6 +915,16 @@ fn recv_loop(engine: Arc<SyncEngine>, conn: Arc<Connection>, bus: Option<Arc<Mes
                      {available_bytes} B available, {required_bytes} B required; disconnecting"
                 );
                 return;
+            }
+            Ok(Message::ChangeAcknowledgment {
+                bundle_id,
+                sequence_numbers,
+            }) => {
+                debug!(
+                    "{prefix}: ChangeAcknowledgment bundle_id={} sequences={:?}",
+                    bundle_id, sequence_numbers
+                );
+                // Handle acknowledgment - could be used to track which changes were received
             }
             Ok(other) => {
                 warn!("{prefix}: unexpected message in live sync phase — possible protocol issue");

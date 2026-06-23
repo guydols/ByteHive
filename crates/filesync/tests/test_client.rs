@@ -13,6 +13,7 @@ fn make_manifest(entries: &[(&str, u64, bool)]) -> Manifest {
         files.insert(
             p.clone(),
             FileMetadata {
+                change_sequence: 0,
                 rel_path: p,
                 size: *size,
                 hash: [0u8; 32],

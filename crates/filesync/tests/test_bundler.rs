@@ -19,7 +19,7 @@ fn tmp_dir(suffix: &str) -> std::path::PathBuf {
 
 fn collect_messages(root: &std::path::Path, paths: &[PathBuf]) -> Vec<Message> {
     let (tx, rx) = bounded(256);
-    stream_messages(root, paths, &tx);
+    stream_messages(root, paths, &tx, None);
     drop(tx);
     rx.iter().collect()
 }

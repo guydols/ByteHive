@@ -24,6 +24,7 @@ fn bundle_msg(filename: &str, content: &[u8]) -> Message {
                 size: content.len() as u64,
                 hash,
                 modified_ms: 1_000_000,
+                change_sequence: 0,
                 is_dir: false,
             },
             content: content.to_vec(),
@@ -114,6 +115,7 @@ fn roundtrip_manifest_exchange() {
             size: 42,
             hash,
             modified_ms: 9999,
+            change_sequence: 0,
             is_dir: false,
         },
     );
@@ -144,6 +146,7 @@ fn roundtrip_large_file_start() {
         size: 32 * 1024 * 1024,
         hash,
         modified_ms: 12345,
+        change_sequence: 0,
         is_dir: false,
     };
     let msg = Message::LargeFileStart {

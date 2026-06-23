@@ -74,6 +74,7 @@ pub fn build_manifest(root: &Path, node_id: &str, exclusions: &Exclusions) -> io
                         size: 0,
                         hash: [0u8; 32],
                         modified_ms,
+                        change_sequence: 0,
                         is_dir: true,
                     },
                 ));
@@ -88,6 +89,7 @@ pub fn build_manifest(root: &Path, node_id: &str, exclusions: &Exclusions) -> io
                     size,
                     hash,
                     modified_ms,
+                    change_sequence: 0,
                     is_dir: false,
                 },
             ))

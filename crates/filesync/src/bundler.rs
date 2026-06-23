@@ -1,9 +1,11 @@
 use crate::protocol::*;
+use crate::sync_engine::SyncEngine;
 use crossbeam_channel::Sender;
 use log::{debug, warn};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -20,7 +22,12 @@ fn modified_ms(meta: &std::fs::Metadata) -> u64 {
         .as_millis() as u64
 }
 
-pub fn stream_messages(root: &Path, rel_paths: &[PathBuf], tx: &Sender<Message>) {
+pub fn stream_messages(
+    root: &Path,
+    rel_paths: &[PathBuf],
+    tx: &Sender<Message>,
+    engine: Option<Arc<SyncEngine>>,
+) {
     debug!(
         "bundler: stream_messages starting — {} path(s) from {:?}",
         rel_paths.len(),
@@ -47,6 +54,10 @@ pub fn stream_messages(root: &Path, rel_paths: &[PathBuf], tx: &Sender<Message>)
                     size: 0,
                     hash: [0u8; 32],
                     modified_ms: modified_ms(&meta),
+                    change_sequence: engine
+                        .as_ref()
+                        .map(|e| e.record_file_change(rel))
+                        .unwrap_or(0),
                     is_dir: true,
                 },
                 content: Vec::new(),
@@ -63,7 +74,7 @@ pub fn stream_messages(root: &Path, rel_paths: &[PathBuf], tx: &Sender<Message>)
             );
             flush_bundle(&mut cur, &mut cur_bytes, tx);
 
-            if let Err(e) = stream_large_file(root, rel, &meta, tx) {
+            if let Err(e) = stream_large_file(root, rel, &meta, tx, engine.clone()) {
                 warn!("large-file stream({rel:?}): {e}");
             }
             continue;
@@ -91,6 +102,10 @@ pub fn stream_messages(root: &Path, rel_paths: &[PathBuf], tx: &Sender<Message>)
                 size: size as u64,
                 hash,
                 modified_ms: modified_ms(&meta),
+                change_sequence: engine
+                    .as_ref()
+                    .map(|e| e.record_file_change(rel))
+                    .unwrap_or(0),
                 is_dir: false,
             },
             content,
@@ -125,6 +140,7 @@ fn stream_large_file(
     rel: &PathBuf,
     meta: &std::fs::Metadata,
     tx: &Sender<Message>,
+    engine: Option<Arc<SyncEngine>>,
 ) -> std::io::Result<()> {
     let full = root.join(rel);
     let file_size = meta.len();
@@ -163,6 +179,10 @@ fn stream_large_file(
             size: file_size,
             hash: final_hash,
             modified_ms: mms,
+            change_sequence: engine
+                .as_ref()
+                .map(|e| e.record_file_change(rel))
+                .unwrap_or(0),
             is_dir: false,
         },
         total_chunks,
