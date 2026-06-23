@@ -55,6 +55,7 @@ fn file_bundle(rel: &str, content: &[u8]) -> FileBundle {
     FileBundle {
         files: vec![FileData {
             metadata: FileMetadata {
+                change_sequence: 0,
                 rel_path: PathBuf::from(rel),
                 size: content.len() as u64,
                 hash,
@@ -93,6 +94,7 @@ fn large_file_with_prior(
     let incoming_hash: [u8; 32] = blake3::hash(incoming_content).into();
     let rel_path = PathBuf::from(rel);
     let meta = FileMetadata {
+        change_sequence: 0,
         rel_path: rel_path.clone(),
         size: incoming_content.len() as u64,
         hash: incoming_hash,
@@ -291,6 +293,7 @@ fn no_conflict_for_directory_entries_in_bundle() {
     let dir_bundle = FileBundle {
         files: vec![FileData {
             metadata: FileMetadata {
+                change_sequence: 0,
                 rel_path: PathBuf::from("mydir"),
                 size: 0,
                 hash: [0u8; 32],
@@ -528,6 +531,7 @@ fn only_conflicted_files_get_copies_in_multi_file_bundle() {
         files: vec![
             FileData {
                 metadata: FileMetadata {
+                change_sequence: 0,
                     rel_path: PathBuf::from("will_conflict.txt"),
                     size: 5,
                     hash: blake3::hash(b"base1").into(),
@@ -538,6 +542,7 @@ fn only_conflicted_files_get_copies_in_multi_file_bundle() {
             },
             FileData {
                 metadata: FileMetadata {
+                change_sequence: 0,
                     rel_path: PathBuf::from("no_conflict.txt"),
                     size: 5,
                     hash: blake3::hash(b"base2").into(),
@@ -560,6 +565,7 @@ fn only_conflicted_files_get_copies_in_multi_file_bundle() {
         files: vec![
             FileData {
                 metadata: FileMetadata {
+                change_sequence: 0,
                     rel_path: PathBuf::from("will_conflict.txt"),
                     size: 13,
                     hash: blake3::hash(b"remote update1").into(),
@@ -570,6 +576,7 @@ fn only_conflicted_files_get_copies_in_multi_file_bundle() {
             },
             FileData {
                 metadata: FileMetadata {
+                change_sequence: 0,
                     rel_path: PathBuf::from("no_conflict.txt"),
                     size: 13,
                     hash: blake3::hash(b"remote update2").into(),
@@ -611,6 +618,7 @@ fn unsafe_path_still_rejected_even_with_conflict_logic_active() {
     let bad_bundle = FileBundle {
         files: vec![FileData {
             metadata: FileMetadata {
+                change_sequence: 0,
                 rel_path: PathBuf::from("../escape.txt"),
                 size: 4,
                 hash: blake3::hash(b"evil").into(),
@@ -739,6 +747,7 @@ fn large_file_no_conflict_for_brand_new_file() {
     let hash: [u8; 32] = blake3::hash(content).into();
     let rel = PathBuf::from("new_large.bin");
     let meta = FileMetadata {
+        change_sequence: 0,
         rel_path: rel.clone(),
         size: content.len() as u64,
         hash,
@@ -792,6 +801,7 @@ fn large_file_no_conflict_when_incoming_equals_manifest() {
     let incoming_hash: [u8; 32] = blake3::hash(content).into();
     let rel = PathBuf::from("stable.bin");
     let meta = FileMetadata {
+        change_sequence: 0,
         rel_path: rel.clone(),
         size: content.len() as u64,
         hash: incoming_hash,
@@ -1021,6 +1031,7 @@ fn regression_large_file_happy_path_yields_committed() {
     let hash: [u8; 32] = blake3::hash(content).into();
     let rel = PathBuf::from("lf.bin");
     let meta = FileMetadata {
+        change_sequence: 0,
         rel_path: rel.clone(),
         size: content.len() as u64,
         hash,
@@ -1049,6 +1060,7 @@ fn regression_large_file_hash_mismatch_still_errors() {
     let wrong_hash = [0xFFu8; 32];
     let rel = PathBuf::from("corrupt.bin");
     let meta = FileMetadata {
+        change_sequence: 0,
         rel_path: rel.clone(),
         size: content.len() as u64,
         hash: wrong_hash,
@@ -1071,6 +1083,7 @@ fn regression_apply_bundle_multiple_files_written_correctly() {
         files: vec![
             FileData {
                 metadata: FileMetadata {
+                change_sequence: 0,
                     rel_path: PathBuf::from("one.txt"),
                     size: 3,
                     hash: blake3::hash(b"aaa").into(),
@@ -1081,6 +1094,7 @@ fn regression_apply_bundle_multiple_files_written_correctly() {
             },
             FileData {
                 metadata: FileMetadata {
+                change_sequence: 0,
                     rel_path: PathBuf::from("two.txt"),
                     size: 3,
                     hash: blake3::hash(b"bbb").into(),
