@@ -12,7 +12,7 @@ use bytehive_core::MessageBus;
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 use log::{debug, error, info, warn};
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -33,9 +33,35 @@ pub struct Server {
     known_clients: Arc<Mutex<KnownClients>>,
     stopped: Arc<AtomicBool>,
     peers: Arc<RwLock<HashMap<String, Peer>>>,
-
     active_conns: Arc<RwLock<Vec<Arc<Connection>>>>,
     tls_config: Arc<rustls::ServerConfig>,
+
+    // For tracking sent bundles and sending acknowledgments
+    sent_bundles: Arc<RwLock<HashMap<u64, BundleTracking>>>,
+}
+
+/// Tracks information about sent bundles for acknowledgment purposes
+#[derive(Debug, Clone)]
+struct BundleTracking {
+    bundle_id: u64,
+    sequence_numbers: Vec<u64>,
+    sent_time: Instant,
+    acknowledged_by: HashSet<String>, // client IDs that have acknowledged
+}
+
+impl BundleTracking {
+    fn new(bundle_id: u64, sequence_numbers: Vec<u64>) -> Self {
+        Self {
+            bundle_id,
+            sequence_numbers,
+            sent_time: Instant::now(),
+            acknowledged_by: HashSet::new(),
+        }
+    }
+
+    fn record_acknowledgment(&mut self, client_id: &str) {
+        self.acknowledged_by.insert(client_id.to_string());
+    }
 }
 
 struct ConnGuard {
@@ -68,6 +94,7 @@ impl Server {
             peers: Arc::new(RwLock::new(HashMap::new())),
             active_conns: Arc::new(RwLock::new(Vec::new())),
             tls_config,
+            sent_bundles: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -107,9 +134,12 @@ impl Server {
         let peers = self.peers.clone();
         let bus = self.bus.clone();
         let stopped = self.stopped.clone();
+        let sent_bundles = self.sent_bundles.clone();
         thread::Builder::new()
             .name("srv-watcher-broadcast".into())
-            .spawn(move || local_change_broadcaster(eng, peers, fs_rx, bus, stopped))?;
+            .spawn(move || {
+                local_change_broadcaster(eng, peers, fs_rx, bus, stopped, sent_bundles)
+            })?;
 
         info!("filesync server listening on {} (TLS 1.3)", self.bind_addr);
         debug!("filesync server: accept loop started");
@@ -130,6 +160,7 @@ impl Server {
                     let active_conns = self.active_conns.clone();
                     let known_clients = self.known_clients.clone();
                     let tls = self.tls_config.clone();
+                    let sent_bundles = self.sent_bundles.clone();
                     thread::Builder::new()
                         .name(format!("srv-client-{addr}"))
                         .spawn(move || {
@@ -142,6 +173,7 @@ impl Server {
                                 bus,
                                 known_clients,
                                 tls,
+                                sent_bundles,
                             ) {
                                 error!("filesync: client {addr} session error: {e}");
                             }
@@ -172,6 +204,7 @@ fn handle_client(
     bus: Option<Arc<MessageBus>>,
     known_clients: Arc<Mutex<KnownClients>>,
     tls_config: Arc<rustls::ServerConfig>,
+    sent_bundles: Arc<RwLock<HashMap<u64, BundleTracking>>>, // Add this parameter
 ) -> io::Result<()> {
     let conn = Arc::new(Connection::new_server(stream, tls_config)?);
     debug!("filesync: TLS handshake complete with new client");
@@ -654,7 +687,7 @@ fn handle_client(
     let recv_handle = thread::Builder::new()
         .name(format!("srv-recv-{client_id}"))
         .spawn(move || {
-            client_recv_loop(cid, eng_r, conn_r, peers_r, bus_r);
+            client_recv_loop(cid, eng_r, conn_r, peers_r, bus_r, sent_bundles);
             let _ = done_tx.send(());
         })?;
 
@@ -680,6 +713,7 @@ fn client_recv_loop(
     conn: Arc<Connection>,
     peers: Arc<RwLock<HashMap<String, Peer>>>,
     bus: Option<Arc<MessageBus>>,
+    sent_bundles: Arc<RwLock<HashMap<u64, BundleTracking>>>, // Add this parameter
 ) {
     debug!("filesync: recv loop started for {client_id}");
     loop {
@@ -796,6 +830,32 @@ fn client_recv_loop(
                     Err(e) => error!("filesync: apply_rename from {client_id}: {e}"),
                 }
             }
+            Ok(Message::ChangeAcknowledgment {
+                bundle_id,
+                sequence_numbers,
+            }) => {
+                debug!(
+                    "filesync: recv ChangeAcknowledgment from {client_id}: bundle_id={} sequences={:?}",
+                    bundle_id, sequence_numbers
+                );
+
+                // Record the acknowledgment
+                let mut sent_bundles_lock = sent_bundles.write();
+                if let Some(bundle_tracking) = sent_bundles_lock.get_mut(&bundle_id) {
+                    bundle_tracking.record_acknowledgment(&client_id);
+                    debug!(
+                        "filesync: bundle {} acknowledged by {} (total: {})",
+                        bundle_id,
+                        client_id,
+                        bundle_tracking.acknowledged_by.len()
+                    );
+                } else {
+                    debug!(
+                        "filesync: received acknowledgment for unknown bundle {} from {}",
+                        bundle_id, client_id
+                    );
+                }
+            }
             Ok(Message::RequestChunks {
                 ref path,
                 ref chunk_indices,
@@ -896,6 +956,7 @@ fn local_change_broadcaster(
     fs_rx: Receiver<FsEvent>,
     bus: Option<Arc<MessageBus>>,
     stopped: Arc<AtomicBool>,
+    sent_bundles: Arc<RwLock<HashMap<u64, BundleTracking>>>, // Add this parameter
 ) {
     let mut pending = PendingChanges::new();
     debug!("filesync server: local change broadcaster started");
@@ -915,7 +976,7 @@ fn local_change_broadcaster(
 
         if pending.should_flush() {
             // debug!("filesync server: flushing local changes");
-            flush_local_changes(&engine, &peers, &bus, &mut pending);
+            flush_local_changes(&engine, &peers, &bus, &mut pending, &sent_bundles);
         }
     }
 }
@@ -925,6 +986,7 @@ fn flush_local_changes(
     peers: &Arc<RwLock<HashMap<String, Peer>>>,
     bus: &Option<Arc<MessageBus>>,
     pending: &mut PendingChanges,
+    sent_bundles: &Arc<RwLock<HashMap<u64, BundleTracking>>>, // Add this parameter
 ) {
     let rn = pending.renames.len();
     if rn > 0 {
@@ -952,7 +1014,7 @@ fn flush_local_changes(
             "filesync server: broadcasting {} ready path(s)",
             ready_paths.len()
         );
-        broadcast_paths(engine, peers, bus, ready_paths);
+        broadcast_paths(engine, peers, bus, ready_paths, sent_bundles);
     }
 
     let stable_paths = pending.take_stable_changes(engine);
@@ -961,7 +1023,7 @@ fn flush_local_changes(
             "filesync server: broadcasting {} stable-change path(s)",
             stable_paths.len()
         );
-        broadcast_paths(engine, peers, bus, stable_paths);
+        broadcast_paths(engine, peers, bus, stable_paths, sent_bundles);
     }
 
     if !pending.deletes.is_empty() {
@@ -997,6 +1059,7 @@ fn broadcast_paths(
     peers: &Arc<RwLock<HashMap<String, Peer>>>,
     bus: &Option<Arc<MessageBus>>,
     paths: Vec<PathBuf>,
+    sent_bundles: &Arc<RwLock<HashMap<u64, BundleTracking>>>, // Add this parameter
 ) {
     const BROADCAST_PIPELINE_DEPTH: usize = 128;
     debug!(
@@ -1008,9 +1071,17 @@ fn broadcast_paths(
     let (msg_tx, msg_rx) = bounded::<Message>(BROADCAST_PIPELINE_DEPTH);
     let root = engine.root().to_path_buf();
     let paths_for_thread = paths.clone();
+    let engine_for_thread = engine.clone();
     std::thread::Builder::new()
         .name("broadcast-reader".into())
-        .spawn(move || bundler::stream_messages(&root, &paths_for_thread, &msg_tx))
+        .spawn(move || {
+            bundler::stream_messages(
+                &root,
+                &paths_for_thread,
+                &msg_tx,
+                Some(engine_for_thread.clone()),
+            )
+        })
         .expect("spawn broadcast-reader");
 
     let mut total_files = 0usize;
@@ -1034,6 +1105,22 @@ fn broadcast_paths(
                             }),
                         );
                     }
+                }
+
+                // Track this bundle for acknowledgment purposes
+                let sequence_numbers: Vec<u64> = bundle
+                    .files
+                    .iter()
+                    .map(|fd| fd.metadata.change_sequence)
+                    .filter(|&seq| seq > 0)
+                    .collect();
+
+                if !sequence_numbers.is_empty() {
+                    let mut sent_bundles_lock = sent_bundles.write();
+                    sent_bundles_lock.insert(
+                        bundle.bundle_id,
+                        BundleTracking::new(bundle.bundle_id, sequence_numbers),
+                    );
                 }
             }
 

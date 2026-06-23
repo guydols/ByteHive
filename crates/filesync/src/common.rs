@@ -160,7 +160,9 @@ impl PendingChanges {
         let mut stable = Vec::new();
         for path in paths {
             if engine.is_file_stable(&path) {
-                stable.push(path);
+                stable.push(path.clone());
+                // Clear change history for this file since we're processing it
+                engine.clear_change_history(&path);
             } else {
                 self.changes.insert(path);
             }
