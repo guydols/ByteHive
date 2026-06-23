@@ -13,9 +13,43 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 const PIPELINE_DEPTH: usize = 128;
+
+/// Tracks recent changes to a file for coalescing rapid modifications
+#[derive(Debug, Clone)]
+struct FileChangeHistory {
+    last_change_time: Instant,
+    change_count: u32,
+    last_sequence_number: u64,
+}
+
+impl FileChangeHistory {
+    fn new(sequence_number: u64) -> Self {
+        Self {
+            last_change_time: Instant::now(),
+            change_count: 1,
+            last_sequence_number: sequence_number,
+        }
+    }
+
+    fn record_change(&mut self, sequence_number: u64) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_change_time).as_millis() as u64;
+
+        self.last_change_time = now;
+        self.change_count += 1;
+        self.last_sequence_number = sequence_number;
+
+        // Return true if this change is part of a rapid sequence
+        elapsed < FILE_CHANGE_COALESCE_MS
+    }
+
+    fn should_coalesce(&self) -> bool {
+        self.change_count > 1
+    }
+}
 
 pub fn safe_relative(p: &Path) -> bool {
     p.components().all(|c| matches!(c, Component::Normal(_)))
@@ -90,6 +124,10 @@ pub struct SyncEngine {
     exclusions: Arc<Exclusions>,
     trash_manager: Arc<TrashManager>,
     full_scan_interval_secs: u64,
+
+    // For tracking rapid changes and coalescing
+    change_sequences: RwLock<HashMap<PathBuf, FileChangeHistory>>,
+    last_sequence_number: RwLock<u64>,
 }
 
 pub fn conflict_copy_name(rel_path: &Path, node_id: &str, unix_secs: u64) -> PathBuf {
@@ -191,6 +229,8 @@ impl SyncEngine {
             exclusions,
             trash_manager,
             full_scan_interval_secs,
+            change_sequences: RwLock::new(HashMap::new()),
+            last_sequence_number: RwLock::new(0),
         }
     }
 
@@ -239,11 +279,70 @@ impl SyncEngine {
             .as_millis() as u64;
 
         let age_ms = now_ms.saturating_sub(modified_ms);
-        age_ms >= FILE_STABILITY_MS
+
+        // Improved stability detection: consider file stable if:
+        // 1. It hasn't been modified for FILE_STABILITY_MS, OR
+        // 2. It's been modified recently but we've seen multiple rapid changes (coalescing)
+        if age_ms >= FILE_STABILITY_MS {
+            return true;
+        }
+
+        // Check if this file has recent rapid changes that should be coalesced
+        self.has_recent_rapid_changes(rel, modified_ms)
     }
 
     pub fn full_scan_interval_secs(&self) -> u64 {
         self.full_scan_interval_secs
+    }
+
+    pub fn has_recent_rapid_changes(&self, rel: &Path, _current_modified_ms: u64) -> bool {
+        let history = self.change_sequences.read();
+        if let Some(file_history) = history.get(rel) {
+            // If we have recent rapid changes, consider the file stable for coalescing
+            file_history.should_coalesce()
+        } else {
+            false
+        }
+    }
+
+    pub fn record_file_change(&self, rel: &Path) -> u64 {
+        let mut seq_lock = self.last_sequence_number.write();
+        *seq_lock += 1;
+        let sequence_number = *seq_lock;
+
+        let mut histories = self.change_sequences.write();
+        let entry = histories
+            .entry(rel.to_path_buf())
+            .or_insert_with(|| FileChangeHistory::new(sequence_number));
+
+        entry.record_change(sequence_number);
+        sequence_number
+    }
+
+    pub fn get_current_sequence_number(&self) -> u64 {
+        *self.last_sequence_number.read()
+    }
+
+    pub fn clear_change_history(&self, rel: &Path) {
+        let mut histories = self.change_sequences.write();
+        histories.remove(rel);
+    }
+
+    /// Create a new SyncEngine with the same configuration but fresh state
+    pub fn clone_with_fresh_state(&self) -> Self {
+        Self {
+            root: self.root.clone(),
+            node_id: self.node_id.clone(),
+            manifest: RwLock::new(self.manifest.read().clone()),
+            suppressed: self.suppressed.clone(),
+            suppressed_deletes: self.suppressed_deletes.clone(),
+            in_progress: RwLock::new(HashMap::new()),
+            exclusions: self.exclusions.clone(),
+            trash_manager: self.trash_manager.clone(),
+            full_scan_interval_secs: self.full_scan_interval_secs,
+            change_sequences: RwLock::new(HashMap::new()),
+            last_sequence_number: RwLock::new(0),
+        }
     }
 
     pub fn trash_manager(&self) -> &Arc<TrashManager> {
@@ -297,7 +396,7 @@ impl SyncEngine {
                 thread::Builder::new()
                     .name("file-reader".into())
                     .spawn(move || {
-                        bundler::stream_messages(&root, &slice, &tx);
+                        bundler::stream_messages(&root, &slice, &tx, None);
                     })
                     .expect("spawn file-reader")
             })
@@ -319,7 +418,8 @@ impl SyncEngine {
         let (tx, rx) = bounded::<Message>(PIPELINE_DEPTH);
         let root = self.root.clone();
         let paths = paths.to_vec();
-        thread::spawn(move || bundler::stream_messages(&root, &paths, &tx));
+        let engine = self.clone_with_fresh_state();
+        thread::spawn(move || bundler::stream_messages(&root, &paths, &tx, Some(Arc::new(engine))));
         rx.into_iter()
             .filter_map(|m| {
                 if let Message::Bundle(b) = m {
@@ -678,6 +778,7 @@ impl SyncEngine {
             size: asm.file_size,
             hash: final_hash,
             modified_ms: asm.modified_ms,
+            change_sequence: 0,
             is_dir: false,
         };
         self.manifest.write().files.insert(path.clone(), file_meta);

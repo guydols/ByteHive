@@ -32,6 +32,7 @@ fn file_bundle(rel: &str, content: &[u8]) -> FileBundle {
     FileBundle {
         files: vec![FileData {
             metadata: FileMetadata {
+                change_sequence: 0,
                 rel_path: PathBuf::from(rel),
                 size: content.len() as u64,
                 hash,
@@ -48,6 +49,7 @@ fn dir_bundle(rel: &str) -> FileBundle {
     FileBundle {
         files: vec![FileData {
             metadata: FileMetadata {
+                change_sequence: 0,
                 rel_path: PathBuf::from(rel),
                 size: 0,
                 hash: [0u8; 32],
@@ -136,6 +138,7 @@ fn apply_bundle_rejects_path_traversal() {
     let evil_bundle = FileBundle {
         files: vec![FileData {
             metadata: FileMetadata {
+                change_sequence: 0,
                 rel_path: PathBuf::from("../escaped.txt"),
                 size: 4,
                 hash: [0u8; 32],
@@ -159,6 +162,7 @@ fn apply_bundle_rejects_absolute_path() {
     let evil_bundle = FileBundle {
         files: vec![FileData {
             metadata: FileMetadata {
+                change_sequence: 0,
                 rel_path: PathBuf::from("/tmp/evil.txt"),
                 size: 4,
                 hash: [0u8; 32],
@@ -194,6 +198,7 @@ fn apply_bundle_handles_multiple_files_in_one_bundle() {
         files: vec![
             FileData {
                 metadata: FileMetadata {
+                change_sequence: 0,
                     rel_path: PathBuf::from("a.txt"),
                     size: 1,
                     hash: blake3::hash(b"a").into(),
@@ -204,6 +209,7 @@ fn apply_bundle_handles_multiple_files_in_one_bundle() {
             },
             FileData {
                 metadata: FileMetadata {
+                change_sequence: 0,
                     rel_path: PathBuf::from("b.txt"),
                     size: 1,
                     hash: blake3::hash(b"b").into(),
@@ -303,6 +309,7 @@ fn large_file_flow_happy_path() {
     let hash: [u8; 32] = blake3::hash(content).into();
     let rel = PathBuf::from("large.bin");
     let meta = FileMetadata {
+        change_sequence: 0,
         rel_path: rel.clone(),
         size: content.len() as u64,
         hash,
@@ -329,6 +336,7 @@ fn large_file_finish_rejects_hash_mismatch() {
     let wrong_hash = [0xFFu8; 32];
     let rel = PathBuf::from("bad.bin");
     let meta = FileMetadata {
+        change_sequence: 0,
         rel_path: rel.clone(),
         size: content.len() as u64,
         hash: wrong_hash,
@@ -351,6 +359,7 @@ fn large_file_rejects_unsafe_path() {
     let dir = tmp_dir("lf_unsafe");
     let engine = make_engine(dir.clone());
     let meta = FileMetadata {
+        change_sequence: 0,
         rel_path: PathBuf::from("../outside.bin"),
         size: 0,
         hash: [0u8; 32],
@@ -513,6 +522,7 @@ fn large_file_finish_detects_missing_chunks() {
     let hash: [u8; 32] = blake3::hash(&all_content).into();
     let rel = PathBuf::from("partial.bin");
     let meta = FileMetadata {
+        change_sequence: 0,
         rel_path: rel.clone(),
         size: all_content.len() as u64,
         hash,
@@ -621,6 +631,7 @@ fn begin_large_file_rejects_path_traversal() {
     let dir = tmp_dir("lf_unsafe_path");
     let engine = make_engine(dir.clone());
     let meta = FileMetadata {
+        change_sequence: 0,
         rel_path: PathBuf::from("../escape.bin"),
         size: 100,
         hash: [0u8; 32],
@@ -666,6 +677,7 @@ fn clear_in_progress_removes_assembly() {
     let engine = make_engine(dir.clone());
     // Begin a large file assembly
     let meta = FileMetadata {
+        change_sequence: 0,
         rel_path: PathBuf::from("bigfile.bin"),
         size: 1024,
         hash: [0u8; 32],
