@@ -29,6 +29,7 @@ fn make_manifest(entries: &[(&str, u64, [u8; 32], bool, u64)], node: &str) -> Ma
         files.insert(
             p.clone(),
             FileMetadata {
+                change_sequence: 0,
                 rel_path: p,
                 size: *size,
                 hash: *hash,
