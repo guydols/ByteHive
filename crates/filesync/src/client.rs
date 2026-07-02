@@ -1,11 +1,11 @@
 use crate::cert_fingerprint;
 use crate::common::{self, LargeFileEndOutcome, PendingChanges};
 use crate::gui::state::ConnectionStatus;
-use crate::gui::state::SharedState;
+use crate::gui::state::{ConflictKind, SharedState};
 use crate::known_hosts::KnownServers;
 use crate::manifest;
 use crate::protocol::*;
-use crate::sync_engine::SyncEngine;
+use crate::sync_engine::{ConflictInfo, SyncEngine};
 use crate::timestamp_id;
 use crate::transport::Connection;
 use crate::watcher::{self, FsEvent};
@@ -16,11 +16,11 @@ use log::{debug, error, info, warn};
 
 use std::io;
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 pub use crate::common::count_manifest;
 
@@ -499,7 +499,9 @@ impl Client {
                         b.bundle_id, n_files, n_dirs, bundle_bytes,
                         bytes_received + bundle_bytes
                     );
-                    let n = self.engine.apply_bundle(&b)?.written;
+                    let apply_result = self.engine.apply_bundle(&b)?;
+                    let n = apply_result.written;
+                    push_gui_conflicts(&self.gui_state, &self.engine, &apply_result.conflicts);
                     for fd in &b.files {
                         if fd.metadata.is_dir {
                             dirs_received += 1;
@@ -592,6 +594,7 @@ impl Client {
                                  (conflict copy: {:?})",
                                 ci.conflict_copy_path
                             );
+                            push_gui_conflicts(&self.gui_state, &self.engine, &[ci]);
                         }
                         crate::sync_engine::FinishResult::MissingChunks(indices) => {
                             warn!(
@@ -748,11 +751,12 @@ impl Client {
         let eng_r = self.engine.clone();
         let conn_r = conn.clone();
         let bus_r = self.bus.clone();
+        let gui_state_r = self.gui_state.clone();
         debug!("filesync session: spawning recv-loop thread");
         let recv_handle = thread::Builder::new()
             .name("recv-srv".into())
             .spawn(move || {
-                recv_loop(eng_r, conn_r, bus_r);
+                recv_loop(eng_r, conn_r, bus_r, gui_state_r);
                 let _ = shut_tx.send(());
             })?;
 
@@ -763,6 +767,7 @@ impl Client {
             fs_rx,
             shut_rx,
             self.bus.clone(),
+            self.gui_state.clone(),
         );
 
         debug!("filesync session: send-loop returned, shutting down connection");
@@ -773,7 +778,12 @@ impl Client {
     }
 }
 
-fn recv_loop(engine: Arc<SyncEngine>, conn: Arc<Connection>, bus: Option<Arc<MessageBus>>) {
+fn recv_loop(
+    engine: Arc<SyncEngine>,
+    conn: Arc<Connection>,
+    bus: Option<Arc<MessageBus>>,
+    gui_state: Option<SharedState>,
+) {
     let prefix = "filesync recv";
     debug!("{prefix}: loop started, waiting for incremental messages from server");
     loop {
@@ -786,8 +796,17 @@ fn recv_loop(engine: Arc<SyncEngine>, conn: Arc<Connection>, bus: Option<Arc<Mes
                     "{prefix}: Bundle id={} files={} dirs={} size={} B",
                     b.bundle_id, n_files, n_dirs, bundle_bytes
                 );
-                if let Err(e) = common::handle_recv_bundle(&engine, &b, "server", &bus, prefix) {
-                    error!("{prefix}: apply_bundle: {e}");
+                match common::handle_recv_bundle(&engine, &b, "server", &bus, prefix) {
+                    Ok(applied) => {
+                        if let Some(ref gs) = gui_state {
+                            let mut s = gs.write();
+                            s.begin_sync_activity();
+                            s.files_received += applied.files_count as u64;
+                            s.bytes_received += applied.bytes;
+                        }
+                        push_gui_conflicts(&gui_state, &engine, &applied.conflicts);
+                    }
+                    Err(e) => error!("{prefix}: apply_bundle: {e}"),
                 }
 
                 // Send acknowledgment for this bundle
@@ -832,6 +851,9 @@ fn recv_loop(engine: Arc<SyncEngine>, conn: Arc<Connection>, bus: Option<Arc<Mes
                 ) {
                     error!("{prefix}: large_file_start: {e}");
                 }
+                if let Some(ref gs) = gui_state {
+                    gs.write().begin_sync_activity();
+                }
             }
             Ok(Message::LargeFileChunk {
                 ref path,
@@ -852,6 +874,11 @@ fn recv_loop(engine: Arc<SyncEngine>, conn: Arc<Connection>, bus: Option<Arc<Mes
                 ) {
                     error!("{prefix}: large_file_chunk: {e}");
                 }
+                if let Some(ref gs) = gui_state {
+                    let mut s = gs.write();
+                    s.begin_sync_activity();
+                    s.bytes_received += data.len() as u64;
+                }
             }
             Ok(Message::LargeFileEnd {
                 ref path,
@@ -871,9 +898,23 @@ fn recv_loop(engine: Arc<SyncEngine>, conn: Arc<Connection>, bus: Option<Arc<Mes
                     }
                     Ok(LargeFileEndOutcome::Committed) => {
                         debug!("{prefix}: LargeFileEnd committed {path:?}");
+                        if let Some(ref gs) = gui_state {
+                            let mut s = gs.write();
+                            s.begin_sync_activity();
+                            s.files_received += 1;
+                        }
 
                         // Note: For large files, we don't have the metadata here to get the sequence number
                         // The acknowledgment would need to be handled differently for large files
+                    }
+                    Ok(LargeFileEndOutcome::CommittedWithConflict(ci)) => {
+                        debug!("{prefix}: LargeFileEnd committed with conflict {path:?}");
+                        if let Some(ref gs) = gui_state {
+                            let mut s = gs.write();
+                            s.begin_sync_activity();
+                            s.files_received += 1;
+                        }
+                        push_gui_conflicts(&gui_state, &engine, &[ci]);
                     }
                     Err(e) => error!("{prefix}: large_file_end: {e}"),
                 }
@@ -884,6 +925,9 @@ fn recv_loop(engine: Arc<SyncEngine>, conn: Arc<Connection>, bus: Option<Arc<Mes
                 {
                     error!("{prefix}: apply_deletes: {e}");
                 }
+                if let Some(ref gs) = gui_state {
+                    gs.write().begin_sync_activity();
+                }
             }
             Ok(Message::Rename { from, to }) => {
                 debug!("{prefix}: Rename {from:?} → {to:?}");
@@ -891,6 +935,9 @@ fn recv_loop(engine: Arc<SyncEngine>, conn: Arc<Connection>, bus: Option<Arc<Mes
                     common::handle_recv_rename(&engine, &from, &to, "server", &bus, prefix)
                 {
                     error!("{prefix}: apply_rename {from:?} → {to:?}: {e}");
+                }
+                if let Some(ref gs) = gui_state {
+                    gs.write().begin_sync_activity();
                 }
             }
             Err(e) => {
@@ -940,6 +987,7 @@ fn send_loop(
     fs_rx: Receiver<FsEvent>,
     shutdown: Receiver<()>,
     bus: Option<Arc<MessageBus>>,
+    gui_state: Option<SharedState>,
 ) {
     debug!("filesync send: loop started");
     let mut pending = PendingChanges::new();
@@ -1000,7 +1048,7 @@ fn send_loop(
                 pending.renames.len()
             );
             flush_count += 1;
-            if let Err(e) = flush_to_server(&engine, &conn, &mut pending, &bus) {
+            if let Err(e) = flush_to_server(&engine, &conn, &mut pending, &bus, &gui_state) {
                 error!("filesync send: flush #{flush_count} error: {e}");
                 debug!(
                     "filesync send: flush error kind={:?}, breaking out of send-loop",
@@ -1020,6 +1068,7 @@ fn flush_to_server(
     conn: &Arc<Connection>,
     pending: &mut PendingChanges,
     bus: &Option<Arc<MessageBus>>,
+    gui_state: &Option<SharedState>,
 ) -> io::Result<()> {
     let renames = pending.take_renames();
     if !renames.is_empty() {
@@ -1031,6 +1080,9 @@ fn flush_to_server(
             from: from.clone(),
             to: to.clone(),
         })?;
+        if let Some(ref gs) = gui_state {
+            gs.write().begin_sync_activity();
+        }
         if let Some(ref bus) = bus {
             bus.publish(
                 "filesync",
@@ -1048,7 +1100,7 @@ fn flush_to_server(
     let ready = pending.take_ready();
     if !ready.is_empty() {
         debug!("filesync send: flushing {} ready path(s)", ready.len());
-        send_paths_to_server(engine, conn, bus, ready)?;
+        send_paths_to_server(engine, conn, bus, gui_state, ready)?;
     }
 
     let stable = pending.take_stable_changes(engine);
@@ -1057,7 +1109,7 @@ fn flush_to_server(
             "filesync send: flushing {} stable-change path(s)",
             stable.len()
         );
-        send_paths_to_server(engine, conn, bus, stable)?;
+        send_paths_to_server(engine, conn, bus, gui_state, stable)?;
     }
 
     let (paths, delete_count) = pending.take_deletes(engine.root());
@@ -1068,6 +1120,9 @@ fn flush_to_server(
             delete_count
         );
         conn.send(&Message::Delete { paths })?;
+        if let Some(ref gs) = gui_state {
+            gs.write().begin_sync_activity();
+        }
 
         if let Some(ref bus) = bus {
             bus.publish(
@@ -1085,10 +1140,51 @@ fn flush_to_server(
     Ok(())
 }
 
+fn push_gui_conflicts(
+    gui_state: &Option<SharedState>,
+    engine: &SyncEngine,
+    conflicts: &[ConflictInfo],
+) {
+    if conflicts.is_empty() {
+        return;
+    }
+    let Some(gs) = gui_state else { return };
+
+    let root = engine.root();
+    let mut s = gs.write();
+    for ci in conflicts {
+        let filename = ci
+            .original_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ci.original_path.to_string_lossy().into_owned());
+        let folder_path = root
+            .join(&ci.original_path)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| root.to_string_lossy().into_owned());
+        let remote_modified = format_modified(&root.join(&ci.original_path));
+        let local_modified = format_modified(&root.join(&ci.conflict_copy_path));
+
+        s.push_conflict(
+            filename,
+            folder_path,
+            local_modified,
+            remote_modified,
+            ConflictKind::BothModified,
+        );
+        s.log_event(format!(
+            "Conflict detected: {:?} (local copy saved as {:?})",
+            ci.original_path, ci.conflict_copy_path
+        ));
+    }
+}
+
 fn send_paths_to_server(
     engine: &Arc<SyncEngine>,
     conn: &Arc<Connection>,
     bus: &Option<Arc<MessageBus>>,
+    gui_state: &Option<SharedState>,
     paths: Vec<PathBuf>,
 ) -> io::Result<()> {
     let manifest = engine.get_manifest();
@@ -1108,11 +1204,20 @@ fn send_paths_to_server(
         files_count,
         bytes_sent
     );
+    if let Some(ref gs) = gui_state {
+        gs.write().begin_sync_activity();
+    }
     engine.send_paths(&paths, conn)?;
     debug!(
         "filesync send: send_paths complete — {} file(s) {} B",
         files_count, bytes_sent
     );
+    if let Some(ref gs) = gui_state {
+        let mut s = gs.write();
+        s.begin_sync_activity();
+        s.files_sent += files_count as u64;
+        s.bytes_sent += bytes_sent;
+    }
 
     if files_count > 0 {
         if let Some(ref bus) = bus {
@@ -1129,4 +1234,146 @@ fn send_paths_to_server(
         }
     }
     Ok(())
+}
+
+fn format_modified(path: &Path) -> String {
+    match std::fs::metadata(path).and_then(|m| m.modified()) {
+        Ok(t) => format_unix_secs(
+            t.duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        ),
+        Err(_) => "unknown".to_string(),
+    }
+}
+
+fn format_unix_secs(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let hour = rem / 3600;
+    let minute = (rem % 3600) / 60;
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!("{y:04}-{m:02}-{d:02} {hour:02}:{minute:02}")
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::format_unix_secs;
+
+    #[test]
+    fn epoch_formats_correctly() {
+        assert_eq!(format_unix_secs(0), "1970-01-01 00:00");
+    }
+
+    #[test]
+    fn known_date_formats_correctly() {
+        assert_eq!(format_unix_secs(1_717_236_000), "2024-06-01 10:00");
+    }
+}
+
+#[cfg(test)]
+mod push_gui_conflicts_tests {
+    use super::push_gui_conflicts;
+    use crate::exclusions::{ExclusionConfig, Exclusions};
+    use crate::gui::state::new_shared_state;
+    use crate::protocol::{FileBundle, FileData, FileMetadata};
+    use crate::sync_engine::SyncEngine;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn tmp_dir(label: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "filesync_push_gui_conflicts_{label}_{:x}",
+            crate::timestamp_id()
+        ));
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn make_engine(root: PathBuf) -> SyncEngine {
+        let ex = Arc::new(Exclusions::compile(&ExclusionConfig::default()));
+        SyncEngine::new(root, "test-node".to_string(), ex)
+    }
+
+    fn file_bundle(rel: &str, content: &[u8]) -> FileBundle {
+        let hash: [u8; 32] = blake3::hash(content).into();
+        FileBundle {
+            files: vec![FileData {
+                metadata: FileMetadata {
+                    change_sequence: 0,
+                    rel_path: PathBuf::from(rel),
+                    size: content.len() as u64,
+                    hash,
+                    modified_ms: 1_000,
+                    is_dir: false,
+                },
+                content: content.to_vec(),
+            }],
+            bundle_id: 1,
+        }
+    }
+
+    /// Reproduces the exact root cause of the "GUI can't show conflicts" bug:
+    /// a `ConflictInfo` produced by `apply_bundle` must end up visible in
+    /// `SyncSnapshot.conflicts` once routed through `push_gui_conflicts`.
+    #[test]
+    fn conflict_from_apply_bundle_is_visible_in_gui_snapshot() {
+        let dir = tmp_dir("visible");
+        let engine = make_engine(dir.clone());
+
+        // Establish the ancestor state, then simulate an offline local edit
+        // (bypassing apply_bundle, exactly like a real filesystem edit while
+        // disconnected), then apply a genuinely different incoming version.
+        engine
+            .apply_bundle(&file_bundle("shared.txt", b"version A"))
+            .unwrap();
+        fs::write(dir.join("shared.txt"), b"version B (local)").unwrap();
+        let result = engine
+            .apply_bundle(&file_bundle("shared.txt", b"version C (remote)"))
+            .unwrap();
+        assert_eq!(result.conflicts.len(), 1, "expected exactly one conflict");
+
+        let gui_state = new_shared_state();
+        push_gui_conflicts(&Some(gui_state.clone()), &engine, &result.conflicts);
+
+        let snap = gui_state.read().clone();
+        assert_eq!(snap.conflicts.len(), 1);
+        assert_eq!(snap.conflicts[0].filename, "shared.txt");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn no_gui_state_does_not_panic() {
+        let dir = tmp_dir("no_gui");
+        let engine = make_engine(dir.clone());
+        engine.apply_bundle(&file_bundle("f.txt", b"A")).unwrap();
+        fs::write(dir.join("f.txt"), b"B").unwrap();
+        let result = engine.apply_bundle(&file_bundle("f.txt", b"C")).unwrap();
+        // Must be a no-op, not a panic, when gui_state is None.
+        push_gui_conflicts(&None, &engine, &result.conflicts);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn empty_conflicts_does_not_touch_gui_state() {
+        let dir = tmp_dir("empty");
+        let engine = make_engine(dir.clone());
+        let gui_state = new_shared_state();
+        push_gui_conflicts(&Some(gui_state.clone()), &engine, &[]);
+        assert!(gui_state.read().conflicts.is_empty());
+        fs::remove_dir_all(&dir).ok();
+    }
 }
