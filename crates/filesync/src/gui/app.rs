@@ -88,6 +88,7 @@ struct DashboardState {
     log_expanded: bool,
     file_tree: Vec<FileNode>,
     active_tab: SideTab,
+    had_conflicts: bool,
     last_tree_refresh: Instant,
 }
 
@@ -159,6 +160,7 @@ impl FileSyncGui {
                     log_expanded: false,
                     file_tree,
                     active_tab: SideTab::Stats,
+                    had_conflicts: false,
                     last_tree_refresh: Instant::now(),
                 })
             }
@@ -315,6 +317,7 @@ impl FileSyncGui {
                         log_expanded: false,
                         file_tree,
                         active_tab: SideTab::Stats,
+                        had_conflicts: false,
                         last_tree_refresh: Instant::now(),
                     });
                 }
@@ -333,14 +336,15 @@ impl FileSyncGui {
                 }
 
                 if let Screen::Dashboard(d) = &mut self.screen {
+                    d.state
+                        .write()
+                        .end_sync_activity_if_quiet(std::time::Duration::from_millis(1500));
                     d.snapshot = d.state.read().clone();
-                    // Auto-switch to Conflicts tab when conflicts appear.
-                    if !d.snapshot.conflicts.is_empty() && d.active_tab == SideTab::Stats {
+                    let now_has_conflicts = !d.snapshot.conflicts.is_empty();
+                    if now_has_conflicts && !d.had_conflicts {
                         d.active_tab = SideTab::Conflicts;
-                    } else if d.snapshot.conflicts.is_empty() && d.active_tab == SideTab::Conflicts
-                    {
-                        d.active_tab = SideTab::Stats;
                     }
+                    d.had_conflicts = now_has_conflicts;
                     // Periodically refresh the file tree from disk.
                     if d.last_tree_refresh.elapsed() >= std::time::Duration::from_secs(5) {
                         d.file_tree = refresh_file_tree(&d.file_tree, &d.config.sync_root);
@@ -497,7 +501,6 @@ impl FileSyncGui {
         }
     }
 }
-
 
 fn view_setup(s: &SetupState) -> Element<'_, Message> {
     let step_num = match s.step {
@@ -790,7 +793,6 @@ fn view_setup_review(s: &SetupState) -> Element<'_, Message> {
     setup_card(inner.into())
 }
 
-
 fn view_dashboard(d: &DashboardState) -> Element<'_, Message> {
     let snap = &d.snapshot;
     let is_paused = d.manager.is_paused();
@@ -842,7 +844,6 @@ fn main_content(d: &DashboardState) -> Element<'_, Message> {
     .height(Length::Fill)
     .into()
 }
-
 
 fn toggle_expanded(nodes: &mut Vec<FileNode>, id: usize) {
     for node in nodes.iter_mut() {
@@ -965,7 +966,6 @@ fn refresh_file_tree(old_tree: &[FileNode], root: &std::path::Path) -> Vec<FileN
     new_tree
 }
 
-
 /// Escapes a bare string value for embedding inside a TOML double-quoted string.
 fn toml_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
@@ -1003,7 +1003,6 @@ exclude_regex = []
         token = toml_escape(token),
     )
 }
-
 
 fn setup_card(content: Element<Message>) -> Element<Message> {
     container(content)

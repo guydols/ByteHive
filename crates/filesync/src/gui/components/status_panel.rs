@@ -10,19 +10,31 @@ use crate::gui::theme;
 pub fn view(snap: &SyncSnapshot, is_paused: bool) -> Element<'_, Message> {
     let status_label = text(snap.status.label()).size(13).style(theme::secondary);
 
-    let right_detail: Element<Message> = if matches!(snap.status, ConnectionStatus::InitialSync) {
+    let is_transferring = matches!(
+        snap.status,
+        ConnectionStatus::InitialSync | ConnectionStatus::Syncing
+    );
+
+    let right_detail: Element<Message> = if is_transferring {
         let transferred = snap.bytes_sent + snap.bytes_received;
+        let files = snap.files_sent + snap.files_received;
         if snap.transfer_total > 0 {
             let pct = (transferred as f32 / snap.transfer_total as f32 * 100.0) as u32;
-            text(format!("{} ({pct}%)", fmt_bytes(transferred)))
-                .size(12)
-                .style(theme::muted)
-                .into()
+            text(format!(
+                "{files} file(s) \u{b7} {} ({pct}%)",
+                fmt_bytes(transferred)
+            ))
+            .size(12)
+            .style(theme::muted)
+            .into()
         } else {
-            text(format!("{} transferred", fmt_bytes(transferred)))
-                .size(12)
-                .style(theme::muted)
-                .into()
+            text(format!(
+                "{files} file(s) \u{b7} {} transferred",
+                fmt_bytes(transferred)
+            ))
+            .size(12)
+            .style(theme::muted)
+            .into()
         }
     } else {
         Space::new().width(0).into()
@@ -68,7 +80,7 @@ pub fn view(snap: &SyncSnapshot, is_paused: bool) -> Element<'_, Message> {
     ]
     .align_y(Alignment::Center);
 
-    let progress: Element<Message> = if matches!(snap.status, ConnectionStatus::InitialSync) {
+    let progress: Element<Message> = if is_transferring {
         let transferred = snap.bytes_sent + snap.bytes_received;
         let fraction = if snap.transfer_total > 0 {
             (transferred as f32 / snap.transfer_total as f32).clamp(0.0, 1.0)
@@ -99,6 +111,7 @@ fn status_indicator_dot(status: &ConnectionStatus) -> Element<'static, Message> 
     let color = match status {
         ConnectionStatus::Idle => theme::GREEN,
         ConnectionStatus::InitialSync => theme::AMBER,
+        ConnectionStatus::Syncing => theme::AMBER,
         ConnectionStatus::Connecting => theme::AMBER,
         ConnectionStatus::Paused => theme::YELLOW,
         ConnectionStatus::AwaitingApproval => theme::YELLOW,
@@ -202,7 +215,6 @@ mod tests {
     use super::fmt_bytes;
     use crate::gui::state::{ConnectionStatus, SyncSnapshot};
 
-
     #[test]
     fn fmt_bytes_zero() {
         assert_eq!(fmt_bytes(0), "0 B");
@@ -243,7 +255,6 @@ mod tests {
         assert_eq!(fmt_bytes(2_147_483_648), "2.00 GiB");
     }
 
-
     #[test]
     fn view_disconnected_not_paused_does_not_panic() {
         let _ = super::view(&SyncSnapshot::default(), false);
@@ -261,6 +272,16 @@ mod tests {
         let mut snap = SyncSnapshot::default();
         snap.status = ConnectionStatus::InitialSync;
         snap.transfer_total = 0;
+        let _ = super::view(&snap, false);
+    }
+
+    #[test]
+    fn view_syncing_no_total_does_not_panic() {
+        let mut snap = SyncSnapshot::default();
+        snap.status = ConnectionStatus::Syncing;
+        snap.transfer_total = 0;
+        snap.files_received = 3;
+        snap.bytes_received = 4096;
         let _ = super::view(&snap, false);
     }
 

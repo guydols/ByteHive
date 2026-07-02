@@ -794,7 +794,8 @@ fn client_recv_loop(
                 match common::handle_recv_large_file_end(
                     &engine, path, final_hash, &client_id, &bus, "filesync",
                 ) {
-                    Ok(LargeFileEndOutcome::Committed) => {
+                    Ok(LargeFileEndOutcome::Committed)
+                    | Ok(LargeFileEndOutcome::CommittedWithConflict(_)) => {
                         broadcast_to_others(
                             &peers,
                             &client_id,

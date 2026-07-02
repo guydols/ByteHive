@@ -7,6 +7,10 @@ pub enum ConnectionStatus {
     Disconnected,
     Connecting,
     InitialSync,
+    /// Actively exchanging an incremental (post-initial-sync) batch of
+    /// changes with the peer — files being sent/received in the background
+    /// while the connection is otherwise idle.
+    Syncing,
     Idle,
     Paused,
     /// The server has received the connection but an administrator has not yet
@@ -22,6 +26,7 @@ impl ConnectionStatus {
             Self::Disconnected => "Disconnected",
             Self::Connecting => "Connecting…",
             Self::InitialSync => "Initial sync…",
+            Self::Syncing => "Syncing…",
             Self::Idle => "Connected",
             Self::Paused => "Paused",
             Self::AwaitingApproval => "Awaiting approval…",
@@ -33,6 +38,7 @@ impl ConnectionStatus {
         match self {
             Self::Idle => [34, 197, 94, 255],
             Self::InitialSync => [59, 130, 246, 255],
+            Self::Syncing => [14, 165, 233, 255],
             Self::Connecting => [245, 158, 11, 255],
             Self::Paused => [168, 85, 247, 255],
             Self::AwaitingApproval => [251, 191, 36, 255],
@@ -191,6 +197,11 @@ pub struct SyncSnapshot {
 
     pub transfer_total: u64,
 
+    /// Timestamp of the most recent incremental (live) sync activity —
+    /// used to detect when a live-sync batch has gone quiet so the UI can
+    /// drop back from `Syncing` to `Idle`.
+    pub last_activity: Option<Instant>,
+
     pub conflicts: Vec<Conflict>,
 
     pub last_connected: Option<Instant>,
@@ -209,6 +220,7 @@ impl Default for SyncSnapshot {
             files_received: 0,
             bytes_received: 0,
             transfer_total: 0,
+            last_activity: None,
             conflicts: Vec::new(),
             last_connected: None,
             log: EventLog::new(),
@@ -220,6 +232,65 @@ impl SyncSnapshot {
     pub fn log_event(&mut self, msg: impl Into<String>) {
         self.log.push(msg);
     }
+
+    /// Marks the start (or continuation) of a live incremental-sync batch.
+    /// Transitions the status to `Syncing` and, if this is the start of a
+    /// new batch (status was previously `Idle`), resets the transfer
+    /// counters so the UI reflects only this batch's progress.
+    pub fn begin_sync_activity(&mut self) {
+        if self.status == ConnectionStatus::Idle {
+            self.files_sent = 0;
+            self.bytes_sent = 0;
+            self.files_received = 0;
+            self.bytes_received = 0;
+            self.transfer_total = 0;
+            self.status = ConnectionStatus::Syncing;
+        }
+        self.last_activity = Some(Instant::now());
+    }
+
+    /// Called periodically (e.g. on a UI tick) to drop back from `Syncing`
+    /// to `Idle` once no live-sync activity has been observed for
+    /// `idle_after`.
+    pub fn end_sync_activity_if_quiet(&mut self, idle_after: std::time::Duration) {
+        if self.status == ConnectionStatus::Syncing {
+            let quiet = self
+                .last_activity
+                .map(|t| t.elapsed() >= idle_after)
+                .unwrap_or(true);
+            if quiet {
+                self.status = ConnectionStatus::Idle;
+                self.last_connected = Some(Instant::now());
+            }
+        }
+    }
+
+    /// Adds a new conflict entry with a freshly-allocated, unique id.
+    pub fn push_conflict(
+        &mut self,
+        filename: String,
+        folder_path: String,
+        local_modified: String,
+        remote_modified: String,
+        kind: ConflictKind,
+    ) {
+        self.conflicts.push(Conflict {
+            id: next_conflict_id(),
+            filename,
+            folder_path,
+            local_modified,
+            remote_modified,
+            kind,
+        });
+    }
+}
+
+static NEXT_CONFLICT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+/// Allocates a fresh, process-unique conflict id (used so conflicts raised
+/// from different code paths never collide).
+pub fn next_conflict_id() -> usize {
+    NEXT_CONFLICT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 pub type SharedState = Arc<RwLock<SyncSnapshot>>;
@@ -288,6 +359,7 @@ mod tests {
         assert_eq!(ConnectionStatus::Disconnected.label(), "Disconnected");
         assert_eq!(ConnectionStatus::Connecting.label(), "Connecting…");
         assert_eq!(ConnectionStatus::InitialSync.label(), "Initial sync…");
+        assert_eq!(ConnectionStatus::Syncing.label(), "Syncing…");
         assert_eq!(ConnectionStatus::Idle.label(), "Connected");
         assert_eq!(ConnectionStatus::Paused.label(), "Paused");
         assert_eq!(
@@ -305,6 +377,7 @@ mod tests {
         let statuses = [
             ConnectionStatus::Idle,
             ConnectionStatus::InitialSync,
+            ConnectionStatus::Syncing,
             ConnectionStatus::Connecting,
             ConnectionStatus::Paused,
             ConnectionStatus::AwaitingApproval,
@@ -327,6 +400,7 @@ mod tests {
         let statuses = [
             ConnectionStatus::Idle,
             ConnectionStatus::InitialSync,
+            ConnectionStatus::Syncing,
             ConnectionStatus::Connecting,
             ConnectionStatus::Paused,
             ConnectionStatus::AwaitingApproval,
@@ -385,6 +459,7 @@ mod tests {
         assert_eq!(snap.bytes_received, 0);
         assert_eq!(snap.transfer_total, 0);
         assert!(snap.last_connected.is_none());
+        assert!(snap.last_activity.is_none());
         assert!(snap.log.entries().is_empty());
     }
 
@@ -395,6 +470,68 @@ mod tests {
         snap.log_event("sync complete");
         assert_eq!(snap.log.entries().len(), 2);
         assert_eq!(snap.log.entries()[0], "connected");
+    }
+
+    #[test]
+    fn begin_sync_activity_transitions_from_idle_and_resets_counters() {
+        let mut snap = SyncSnapshot::default();
+        snap.status = ConnectionStatus::Idle;
+        snap.bytes_sent = 500;
+        snap.files_received = 3;
+        snap.begin_sync_activity();
+        assert_eq!(snap.status, ConnectionStatus::Syncing);
+        assert_eq!(snap.bytes_sent, 0);
+        assert_eq!(snap.files_received, 0);
+        assert!(snap.last_activity.is_some());
+    }
+
+    #[test]
+    fn begin_sync_activity_does_not_reset_counters_mid_batch() {
+        let mut snap = SyncSnapshot::default();
+        snap.status = ConnectionStatus::Syncing;
+        snap.bytes_received = 42;
+        snap.begin_sync_activity();
+        assert_eq!(snap.status, ConnectionStatus::Syncing);
+        assert_eq!(snap.bytes_received, 42);
+    }
+
+    #[test]
+    fn end_sync_activity_if_quiet_returns_to_idle_after_timeout() {
+        let mut snap = SyncSnapshot::default();
+        snap.status = ConnectionStatus::Syncing;
+        snap.last_activity = Some(Instant::now() - std::time::Duration::from_secs(10));
+        snap.end_sync_activity_if_quiet(std::time::Duration::from_millis(100));
+        assert_eq!(snap.status, ConnectionStatus::Idle);
+    }
+
+    #[test]
+    fn end_sync_activity_if_quiet_stays_syncing_when_recent() {
+        let mut snap = SyncSnapshot::default();
+        snap.status = ConnectionStatus::Syncing;
+        snap.last_activity = Some(Instant::now());
+        snap.end_sync_activity_if_quiet(std::time::Duration::from_secs(5));
+        assert_eq!(snap.status, ConnectionStatus::Syncing);
+    }
+
+    #[test]
+    fn push_conflict_assigns_unique_ids() {
+        let mut snap = SyncSnapshot::default();
+        snap.push_conflict(
+            "a.txt".into(),
+            "/sync".into(),
+            "t1".into(),
+            "t2".into(),
+            ConflictKind::BothModified,
+        );
+        snap.push_conflict(
+            "b.txt".into(),
+            "/sync".into(),
+            "t1".into(),
+            "t2".into(),
+            ConflictKind::BothModified,
+        );
+        assert_eq!(snap.conflicts.len(), 2);
+        assert_ne!(snap.conflicts[0].id, snap.conflicts[1].id);
     }
 
     #[test]
