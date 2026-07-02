@@ -237,6 +237,7 @@ pub enum ChunkOutcome {
 
 pub enum LargeFileEndOutcome {
     Committed,
+    CommittedWithConflict(ConflictInfo),
     MissingChunks(Vec<u32>),
 }
 
@@ -408,7 +409,7 @@ pub fn handle_recv_large_file_end(
                     }),
                 );
             }
-            Ok(LargeFileEndOutcome::Committed)
+            Ok(LargeFileEndOutcome::CommittedWithConflict(ci))
         }
         FinishResult::MissingChunks(indices) => {
             warn!(
