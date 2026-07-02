@@ -62,6 +62,7 @@ fn connection_badge(status: &ConnectionStatus) -> Element<'_, Message> {
         match status {
             ConnectionStatus::Idle => (theme::GREEN, theme::green_text),
             ConnectionStatus::InitialSync => (theme::AMBER, theme::amber_text),
+            ConnectionStatus::Syncing => (theme::AMBER, theme::amber_text),
             ConnectionStatus::Connecting => (theme::YELLOW, theme::yellow_text),
             ConnectionStatus::AwaitingApproval => (theme::YELLOW, theme::yellow_text),
             ConnectionStatus::Paused => (theme::YELLOW, theme::yellow_text),
@@ -109,6 +110,11 @@ mod tests {
     #[test]
     fn view_initial_sync_does_not_panic() {
         let _ = super::view(&ConnectionStatus::InitialSync);
+    }
+
+    #[test]
+    fn view_syncing_does_not_panic() {
+        let _ = super::view(&ConnectionStatus::Syncing);
     }
 
     #[test]
