@@ -13,6 +13,7 @@ use crate::watcher::{self, FsEvent};
 use bytehive_core::MessageBus;
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, TryRecvError};
 use log::{debug, error, info, warn};
+use parking_lot::Mutex;
 
 use std::io;
 use std::net::TcpStream;
@@ -33,6 +34,23 @@ pub struct Client {
     tls_config: Arc<rustls::ClientConfig>,
     gui_state: Option<SharedState>,
     awaiting_approval: Arc<AtomicBool>,
+    /// The connection currently in use by an in-flight `session()` call, if
+    /// any. This lets `shutdown()` force-close a live connection (e.g. after
+    /// the system resumes from suspend) instead of only preventing *future*
+    /// connection attempts.
+    active_conn: Arc<Mutex<Option<Arc<Connection>>>>,
+}
+
+/// RAII guard that clears the client's `active_conn` slot when a `session()`
+/// call finishes, regardless of which return path is taken.
+struct ActiveConnGuard<'a> {
+    slot: &'a Mutex<Option<Arc<Connection>>>,
+}
+
+impl<'a> Drop for ActiveConnGuard<'a> {
+    fn drop(&mut self) {
+        self.slot.lock().take();
+    }
 }
 
 impl Client {
@@ -57,6 +75,7 @@ impl Client {
             tls_config,
             gui_state: None,
             awaiting_approval: Arc::new(AtomicBool::new(false)),
+            active_conn: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -82,6 +101,7 @@ impl Client {
             tls_config,
             gui_state: None,
             awaiting_approval: Arc::new(AtomicBool::new(false)),
+            active_conn: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -111,6 +131,7 @@ impl Client {
             tls_config,
             gui_state,
             awaiting_approval: Arc::new(AtomicBool::new(false)),
+            active_conn: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -121,6 +142,14 @@ impl Client {
     pub fn shutdown(&self) {
         debug!("filesync client: shutdown requested");
         self.stopped.store(true, Ordering::SeqCst);
+        // Force-close any connection that a blocked `session()` call is
+        // currently using. This unblocks the recv/send loops the same way a
+        // normal network drop would, so the caller's reconnect logic kicks in
+        // immediately instead of waiting on a possibly-stale socket.
+        if let Some(conn) = self.active_conn.lock().clone() {
+            debug!("filesync client: forcing active connection closed");
+            conn.shutdown();
+        }
     }
 
     pub fn is_awaiting_approval(&self) -> bool {
@@ -193,6 +222,11 @@ impl Client {
     }
 
     pub fn session(&self) -> io::Result<()> {
+        if self.stopped.load(Ordering::SeqCst) {
+            debug!("filesync session: shutdown already requested, not connecting");
+            return Ok(());
+        }
+
         self.engine.clear_in_progress();
         debug!("filesync session: cleared any in-progress large-file state");
 
@@ -230,6 +264,14 @@ impl Client {
             })?,
         );
         debug!("filesync session: TLS 1.3 handshake complete");
+
+        // Make this connection reachable from `shutdown()` for the rest of the
+        // session so a forced shutdown (e.g. suspend/resume) can close it even
+        // while we're blocked in the receive/send loops below.
+        *self.active_conn.lock() = Some(conn.clone());
+        let _active_conn_guard = ActiveConnGuard {
+            slot: &self.active_conn,
+        };
 
         {
             let known_servers_path = self.identity_dir.join("known_servers.toml");
