@@ -5,6 +5,7 @@ use crate::gui::state::{ConnectionStatus, SharedState};
 use crate::suspend_detector::SuspendDetector;
 use crate::sync_engine::SyncEngine;
 use crate::timestamp_id;
+use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -85,7 +86,49 @@ fn session_loop(
         }
     }
 
-    let mut suspend_detector = SuspendDetector::new();
+    // Tracks whichever `Client` is currently connecting/connected, so the
+    // suspend-monitor thread below can force it to disconnect. `None` while
+    // we're idling between sessions (paused, or waiting to reconnect).
+    let active_client: Arc<Mutex<Option<Arc<Client>>>> = Arc::new(Mutex::new(None));
+    // Set by the suspend-monitor thread whenever it detects a resume, so the
+    // reconnect-backoff loop below can skip its wait and retry immediately.
+    let resume_pending = Arc::new(AtomicBool::new(false));
+
+    // Runs for the lifetime of this sync session (independent of connect/
+    // reconnect cycles) so that suspend/resume is detected promptly even
+    // while a session is actively connected — not just between attempts.
+    // On resume it force-closes whatever connection is active, which makes
+    // the main loop below reconnect and rescan exactly like the startup
+    // sequence.
+    {
+        let state = state.clone();
+        let stopped = stopped.clone();
+        let active_client = active_client.clone();
+        let resume_pending = resume_pending.clone();
+        thread::Builder::new()
+            .name("suspend-monitor".into())
+            .spawn(move || {
+                let mut suspend_detector = SuspendDetector::new();
+                loop {
+                    if stopped.load(Ordering::SeqCst) {
+                        break;
+                    }
+
+                    if suspend_detector.check_for_resume() {
+                        state
+                            .write()
+                            .log_event("System resumed from suspend — reconnecting.");
+                        resume_pending.store(true, Ordering::SeqCst);
+                        if let Some(client) = active_client.lock().clone() {
+                            client.shutdown();
+                        }
+                    }
+
+                    thread::sleep(Duration::from_millis(1000));
+                }
+            })
+            .expect("spawn suspend-monitor");
+    }
 
     loop {
         if stopped.load(Ordering::SeqCst) {
@@ -94,9 +137,10 @@ fn session_loop(
 
         if paused.load(Ordering::SeqCst) {
             thread::sleep(Duration::from_millis(250));
-            let _ = suspend_detector.check_for_resume();
             continue;
         }
+
+        resume_pending.store(false, Ordering::SeqCst);
 
         {
             let mut s = state.write();
@@ -106,12 +150,14 @@ fn session_loop(
 
         let identity_dir: PathBuf = GuiConfig::config_dir().join("filesync");
 
-        let client = Client::new_standalone(
+        let client = Arc::new(Client::new_standalone(
             engine.clone(),
             cfg.server_addr.clone(),
             identity_dir,
             Some(state.clone()),
-        );
+        ));
+
+        *active_client.lock() = Some(client.clone());
 
         match client.session() {
             Ok(()) => {
@@ -127,6 +173,8 @@ fn session_loop(
             }
         }
 
+        *active_client.lock() = None;
+
         refresh_manifest_stats(&engine, &state);
 
         if stopped.load(Ordering::SeqCst) {
@@ -136,20 +184,26 @@ fn session_loop(
             continue;
         }
 
+        if resume_pending.swap(false, Ordering::SeqCst) {
+            // The suspend-monitor already forced this disconnect; reconnect
+            // right away instead of waiting out the usual backoff.
+            continue;
+        }
+
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             if stopped.load(Ordering::SeqCst) || paused.load(Ordering::SeqCst) {
                 break;
             }
 
-            if suspend_detector.check_for_resume() {
+            if resume_pending.swap(false, Ordering::SeqCst) {
                 state
                     .write()
                     .log_event("System resumed from suspend — reconnecting immediately.");
                 break;
             }
 
-            thread::sleep(Duration::from_millis(1000));
+            thread::sleep(Duration::from_millis(200));
         }
     }
 
