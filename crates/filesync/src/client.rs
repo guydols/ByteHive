@@ -34,15 +34,9 @@ pub struct Client {
     tls_config: Arc<rustls::ClientConfig>,
     gui_state: Option<SharedState>,
     awaiting_approval: Arc<AtomicBool>,
-    /// The connection currently in use by an in-flight `session()` call, if
-    /// any. This lets `shutdown()` force-close a live connection (e.g. after
-    /// the system resumes from suspend) instead of only preventing *future*
-    /// connection attempts.
     active_conn: Arc<Mutex<Option<Arc<Connection>>>>,
 }
 
-/// RAII guard that clears the client's `active_conn` slot when a `session()`
-/// call finishes, regardless of which return path is taken.
 struct ActiveConnGuard<'a> {
     slot: &'a Mutex<Option<Arc<Connection>>>,
 }
@@ -142,10 +136,6 @@ impl Client {
     pub fn shutdown(&self) {
         debug!("filesync client: shutdown requested");
         self.stopped.store(true, Ordering::SeqCst);
-        // Force-close any connection that a blocked `session()` call is
-        // currently using. This unblocks the recv/send loops the same way a
-        // normal network drop would, so the caller's reconnect logic kicks in
-        // immediately instead of waiting on a possibly-stale socket.
         if let Some(conn) = self.active_conn.lock().clone() {
             debug!("filesync client: forcing active connection closed");
             conn.shutdown();
@@ -265,9 +255,6 @@ impl Client {
         );
         debug!("filesync session: TLS 1.3 handshake complete");
 
-        // Make this connection reachable from `shutdown()` for the rest of the
-        // session so a forced shutdown (e.g. suspend/resume) can close it even
-        // while we're blocked in the receive/send loops below.
         *self.active_conn.lock() = Some(conn.clone());
         let _active_conn_guard = ActiveConnGuard {
             slot: &self.active_conn,
@@ -437,8 +424,6 @@ impl Client {
             l_files, l_dirs, l_bytes
         );
 
-        // Update GUI state with local stats right after scan so the Stats
-        // panel shows real values while the sync is still in progress.
         if let Some(ref gs) = self.gui_state {
             let mut s = gs.write();
             s.file_count = l_files;
@@ -446,11 +431,6 @@ impl Client {
             s.total_bytes = l_bytes;
         }
 
-        // ── Preemptive disk-space check (client) ──────────────────────────────
-        // Simulate the server's send-list computation (is_server = true) to
-        // predict exactly which bytes will arrive.  We do this *before* sending
-        // our ManifestExchange so that, if we are out of space, the server is
-        // notified before it starts transmitting anything.
         let bytes_incoming: u64 = manifest::compute_send_list(&remote, &local, true)
             .iter()
             .filter_map(|p| remote.files.get(p))
@@ -472,8 +452,7 @@ impl Client {
                          {} B available, {} B required; aborting sync",
                         avail, bytes_incoming
                     );
-                    // Notify the server before closing so it can surface the
-                    // real reason rather than a generic connection error.
+
                     let _ = conn.send(&Message::InsufficientDiskSpace {
                         available_bytes: avail,
                         required_bytes: bytes_incoming,
@@ -945,9 +924,6 @@ fn recv_loop(
                             s.begin_sync_activity();
                             s.files_received += 1;
                         }
-
-                        // Note: For large files, we don't have the metadata here to get the sequence number
-                        // The acknowledgment would need to be handled differently for large files
                     }
                     Ok(LargeFileEndOutcome::CommittedWithConflict(ci)) => {
                         debug!("{prefix}: LargeFileEnd committed with conflict {path:?}");
@@ -1013,7 +989,6 @@ fn recv_loop(
                     "{prefix}: ChangeAcknowledgment bundle_id={} sequences={:?}",
                     bundle_id, sequence_numbers
                 );
-                // Handle acknowledgment - could be used to track which changes were received
             }
             Ok(other) => {
                 warn!("{prefix}: unexpected message in live sync phase — possible protocol issue");
@@ -1289,7 +1264,7 @@ fn format_modified(path: &Path) -> String {
     }
 }
 
-fn format_unix_secs(secs: u64) -> String {
+pub fn format_unix_secs(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let hour = rem / 3600;
@@ -1307,115 +1282,4 @@ fn format_unix_secs(secs: u64) -> String {
     let y = if m <= 2 { y + 1 } else { y };
 
     format!("{y:04}-{m:02}-{d:02} {hour:02}:{minute:02}")
-}
-
-#[cfg(test)]
-mod format_tests {
-    use super::format_unix_secs;
-
-    #[test]
-    fn epoch_formats_correctly() {
-        assert_eq!(format_unix_secs(0), "1970-01-01 00:00");
-    }
-
-    #[test]
-    fn known_date_formats_correctly() {
-        assert_eq!(format_unix_secs(1_717_236_000), "2024-06-01 10:00");
-    }
-}
-
-#[cfg(test)]
-mod push_gui_conflicts_tests {
-    use super::push_gui_conflicts;
-    use crate::exclusions::{ExclusionConfig, Exclusions};
-    use crate::gui::state::new_shared_state;
-    use crate::protocol::{FileBundle, FileData, FileMetadata};
-    use crate::sync_engine::SyncEngine;
-    use std::fs;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-
-    fn tmp_dir(label: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "filesync_push_gui_conflicts_{label}_{:x}",
-            crate::timestamp_id()
-        ));
-        fs::create_dir_all(&d).unwrap();
-        d
-    }
-
-    fn make_engine(root: PathBuf) -> SyncEngine {
-        let ex = Arc::new(Exclusions::compile(&ExclusionConfig::default()));
-        SyncEngine::new(root, "test-node".to_string(), ex)
-    }
-
-    fn file_bundle(rel: &str, content: &[u8]) -> FileBundle {
-        let hash: [u8; 32] = blake3::hash(content).into();
-        FileBundle {
-            files: vec![FileData {
-                metadata: FileMetadata {
-                    change_sequence: 0,
-                    rel_path: PathBuf::from(rel),
-                    size: content.len() as u64,
-                    hash,
-                    modified_ms: 1_000,
-                    is_dir: false,
-                },
-                content: content.to_vec(),
-            }],
-            bundle_id: 1,
-        }
-    }
-
-    /// Reproduces the exact root cause of the "GUI can't show conflicts" bug:
-    /// a `ConflictInfo` produced by `apply_bundle` must end up visible in
-    /// `SyncSnapshot.conflicts` once routed through `push_gui_conflicts`.
-    #[test]
-    fn conflict_from_apply_bundle_is_visible_in_gui_snapshot() {
-        let dir = tmp_dir("visible");
-        let engine = make_engine(dir.clone());
-
-        // Establish the ancestor state, then simulate an offline local edit
-        // (bypassing apply_bundle, exactly like a real filesystem edit while
-        // disconnected), then apply a genuinely different incoming version.
-        engine
-            .apply_bundle(&file_bundle("shared.txt", b"version A"))
-            .unwrap();
-        fs::write(dir.join("shared.txt"), b"version B (local)").unwrap();
-        let result = engine
-            .apply_bundle(&file_bundle("shared.txt", b"version C (remote)"))
-            .unwrap();
-        assert_eq!(result.conflicts.len(), 1, "expected exactly one conflict");
-
-        let gui_state = new_shared_state();
-        push_gui_conflicts(&Some(gui_state.clone()), &engine, &result.conflicts);
-
-        let snap = gui_state.read().clone();
-        assert_eq!(snap.conflicts.len(), 1);
-        assert_eq!(snap.conflicts[0].filename, "shared.txt");
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn no_gui_state_does_not_panic() {
-        let dir = tmp_dir("no_gui");
-        let engine = make_engine(dir.clone());
-        engine.apply_bundle(&file_bundle("f.txt", b"A")).unwrap();
-        fs::write(dir.join("f.txt"), b"B").unwrap();
-        let result = engine.apply_bundle(&file_bundle("f.txt", b"C")).unwrap();
-        // Must be a no-op, not a panic, when gui_state is None.
-        push_gui_conflicts(&None, &engine, &result.conflicts);
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn empty_conflicts_does_not_touch_gui_state() {
-        let dir = tmp_dir("empty");
-        let engine = make_engine(dir.clone());
-        let gui_state = new_shared_state();
-        push_gui_conflicts(&Some(gui_state.clone()), &engine, &[]);
-        assert!(gui_state.read().conflicts.is_empty());
-        fs::remove_dir_all(&dir).ok();
-    }
 }

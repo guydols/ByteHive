@@ -225,7 +225,6 @@ impl KnownClients {
 }
 
 fn splice_known_clients(original: &str, clients: &[KnownClient]) -> String {
-    // Build the replacement section text up front.
     let new_section = if clients.is_empty() {
         String::new()
     } else {
@@ -235,7 +234,6 @@ fn splice_known_clients(original: &str, clients: &[KnownClient]) -> String {
             Ok(s) => s,
             Err(e) => {
                 log::error!("filesync: failed to serialize known_clients: {e}");
-                // Return original unchanged rather than corrupting the file.
                 return original.to_string();
             }
         }
@@ -245,9 +243,6 @@ fn splice_known_clients(original: &str, clients: &[KnownClient]) -> String {
     let mut after: Vec<&str> = Vec::new();
     let mut found_first = false;
     let mut in_section = false;
-
-    // Blank / comment lines that trail an auth block are "pending": we keep
-    // them only if the next non-blank line belongs to a non-auth section.
     let mut pending: Vec<&str> = Vec::new();
 
     for line in original.lines() {
@@ -262,8 +257,6 @@ fn splice_known_clients(original: &str, clients: &[KnownClient]) -> String {
             let inner = &trimmed[2..trimmed.len() - 2];
             let name = inner.trim().to_ascii_lowercase();
             if name == "filesync_known_clients" {
-                // Entering our managed section — discard any trailing
-                // whitespace that followed the previous entry.
                 pending.clear();
                 in_section = true;
                 found_first = true;
@@ -286,8 +279,6 @@ fn splice_known_clients(original: &str, clients: &[KnownClient]) -> String {
         }
 
         if in_section {
-            // Inside a managed block: buffer blank/comment lines; drop value
-            // lines (they belong to the old entry we're replacing).
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 pending.push(line);
             } else {
@@ -428,280 +419,5 @@ impl KnownServers {
                 log::error!("filesync: failed to serialize known_servers: {e}");
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    /// Return a unique path in the system temp dir for each test invocation.
-    fn tmp_path(name: &str) -> std::path::PathBuf {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("bh_kh_unit_{n}_{name}"))
-    }
-
-    // ── splice_known_clients unit tests ──────────────────────────────────────
-
-    #[test]
-    fn splice_into_empty_string_produces_section() {
-        let out = splice_known_clients(
-            "",
-            &[KnownClient {
-                node_id: "n1".into(),
-                fingerprint: "fp1".into(),
-                label: String::new(),
-                status: ClientStatus::Pending,
-                addr: "1.2.3.4:1".into(),
-                first_seen_ms: 1,
-                last_seen_ms: 1,
-            }],
-        );
-        assert!(out.contains("[[filesync_known_clients]]"));
-        assert!(out.contains("fp1"));
-    }
-
-    #[test]
-    fn splice_empty_clients_removes_section() {
-        let original = "[framework]\nname = \"test\"\n\n[[filesync_known_clients]]\nfingerprint = \"fp1\"\nnode_id = \"n1\"\nstatus = \"pending\"\nfirst_seen_ms = 1\nlast_seen_ms = 1\n";
-        let out = splice_known_clients(original, &[]);
-        assert!(!out.contains("filesync_known_clients"));
-        assert!(out.contains("[framework]"));
-    }
-
-    #[test]
-    fn splice_preserves_surrounding_config() {
-        let original = "[framework]\nname = \"test\"\n\n[[filesync_known_clients]]\nfingerprint = \"old\"\nnode_id = \"n\"\nstatus = \"pending\"\nfirst_seen_ms = 1\nlast_seen_ms = 1\n\n[apps.filesync]\nroot = \"/data\"\n";
-        let replacement = vec![KnownClient {
-            node_id: "n".into(),
-            fingerprint: "new".into(),
-            label: String::new(),
-            status: ClientStatus::Allowed,
-            addr: String::new(),
-            first_seen_ms: 1,
-            last_seen_ms: 2,
-        }];
-        let out = splice_known_clients(original, &replacement);
-        assert!(out.contains("[framework]"));
-        assert!(out.contains("[apps.filesync]"));
-        assert!(out.contains("new"));
-        assert!(!out.contains("\"old\""));
-    }
-
-    #[test]
-    fn splice_roundtrip_multiple_entries() {
-        let clients = vec![
-            KnownClient {
-                node_id: "a".into(),
-                fingerprint: "fp-a".into(),
-                label: String::new(),
-                status: ClientStatus::Allowed,
-                addr: "1.1.1.1:1".into(),
-                first_seen_ms: 10,
-                last_seen_ms: 20,
-            },
-            KnownClient {
-                node_id: "b".into(),
-                fingerprint: "fp-b".into(),
-                label: "my label".into(),
-                status: ClientStatus::Rejected,
-                addr: "2.2.2.2:2".into(),
-                first_seen_ms: 30,
-                last_seen_ms: 40,
-            },
-        ];
-        let spliced = splice_known_clients("", &clients);
-        let parsed: KnownClientsRaw = toml::from_str(&spliced).expect("valid toml");
-        assert_eq!(parsed.filesync_known_clients.len(), 2);
-        assert_eq!(parsed.filesync_known_clients[0].fingerprint, "fp-a");
-        assert_eq!(parsed.filesync_known_clients[1].fingerprint, "fp-b");
-        assert_eq!(parsed.filesync_known_clients[1].label, "my label");
-    }
-
-    // ── KnownClients integration tests ───────────────────────────────────────
-
-    #[test]
-    fn new_client_upsert_returns_true() {
-        let p = tmp_path("kc1.toml");
-        let mut kc = KnownClients::load_from_config(&p);
-        assert!(kc.upsert_pending("node-1", "fp-aaa", "127.0.0.1:1234"));
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn repeat_upsert_returns_false() {
-        let p = tmp_path("kc2.toml");
-        let mut kc = KnownClients::load_from_config(&p);
-        kc.upsert_pending("node-1", "fp-bbb", "127.0.0.1:1");
-        assert!(!kc.upsert_pending("node-1", "fp-bbb", "127.0.0.1:2"));
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn new_client_has_pending_status() {
-        let p = tmp_path("kc3.toml");
-        let mut kc = KnownClients::load_from_config(&p);
-        kc.upsert_pending("node-1", "fp-ccc", "127.0.0.1:1");
-        assert_eq!(kc.status("fp-ccc"), Some(ClientStatus::Pending));
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn approve_changes_status_to_allowed() {
-        let p = tmp_path("kc4.toml");
-        let mut kc = KnownClients::load_from_config(&p);
-        kc.upsert_pending("node-1", "fp-ddd", "127.0.0.1:1");
-        assert!(kc.set_status("fp-ddd", ClientStatus::Allowed));
-        assert_eq!(kc.status("fp-ddd"), Some(ClientStatus::Allowed));
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn set_status_unknown_fingerprint_returns_false() {
-        let p = tmp_path("kc5.toml");
-        let mut kc = KnownClients::load_from_config(&p);
-        assert!(!kc.set_status("no-such-fp", ClientStatus::Allowed));
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn remove_deletes_entry() {
-        let p = tmp_path("kc6.toml");
-        let mut kc = KnownClients::load_from_config(&p);
-        kc.upsert_pending("node-1", "fp-eee", "127.0.0.1:1");
-        assert!(kc.remove("fp-eee"));
-        assert_eq!(kc.status("fp-eee"), None);
-        assert!(!kc.remove("fp-eee")); // second remove returns false
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn pending_count_is_accurate() {
-        let p = tmp_path("kc7.toml");
-        let mut kc = KnownClients::load_from_config(&p);
-        kc.upsert_pending("n1", "fp-f1", "");
-        kc.upsert_pending("n2", "fp-f2", "");
-        kc.upsert_pending("n3", "fp-f3", "");
-        assert_eq!(kc.pending_count(), 3);
-        kc.set_status("fp-f1", ClientStatus::Allowed);
-        assert_eq!(kc.pending_count(), 2);
-        kc.set_status("fp-f2", ClientStatus::Rejected);
-        assert_eq!(kc.pending_count(), 1);
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn persists_and_reloads() {
-        let p = tmp_path("kc8.toml");
-        {
-            let mut kc = KnownClients::load_from_config(&p);
-            kc.upsert_pending("node-1", "fp-ppp", "10.0.0.1:7878");
-            kc.set_status("fp-ppp", ClientStatus::Allowed);
-        }
-        // reload from disk
-        let kc2 = KnownClients::load_from_config(&p);
-        assert_eq!(kc2.status("fp-ppp"), Some(ClientStatus::Allowed));
-        assert_eq!(kc2.list()[0].addr, "10.0.0.1:7878");
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn load_nonexistent_file_gives_empty_store() {
-        let p = tmp_path("kc9_nonexistent.toml");
-        let kc = KnownClients::load_from_config(&p);
-        assert_eq!(kc.list().len(), 0);
-    }
-
-    #[test]
-    fn persists_alongside_existing_config_content() {
-        let p = tmp_path("kc10.toml");
-        // Seed the "config file" with some pre-existing content.
-        std::fs::write(
-            &p,
-            "[framework]\nname = \"test\"\n\n[apps.filesync]\nroot = \"/tmp\"\n",
-        )
-        .unwrap();
-
-        let mut kc = KnownClients::load_from_config(&p);
-        kc.upsert_pending("node-x", "fp-xyz", "9.9.9.9:1");
-
-        // Reload and verify the client was saved.
-        let kc2 = KnownClients::load_from_config(&p);
-        assert_eq!(kc2.status("fp-xyz"), Some(ClientStatus::Pending));
-
-        // The rest of the config must still be intact.
-        let raw = std::fs::read_to_string(&p).unwrap();
-        assert!(raw.contains("[framework]"));
-        assert!(raw.contains("[apps.filesync]"));
-        assert!(raw.contains("[[filesync_known_clients]]"));
-
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn remove_last_entry_strips_section_from_config() {
-        let p = tmp_path("kc11.toml");
-        std::fs::write(&p, "[framework]\nname = \"test\"\n").unwrap();
-
-        let mut kc = KnownClients::load_from_config(&p);
-        kc.upsert_pending("n", "fp-del", "");
-        kc.remove("fp-del");
-
-        let raw = std::fs::read_to_string(&p).unwrap();
-        assert!(!raw.contains("filesync_known_clients"));
-        assert!(raw.contains("[framework]"));
-
-        let _ = std::fs::remove_file(&p);
-    }
-
-    // ── KnownServers tests (unchanged) ────────────────────────────────────────
-
-    #[test]
-    fn first_pin_is_tofu() {
-        let p = tmp_path("ks1.toml");
-        let mut ks = KnownServers::load_or_create(&p);
-        assert!(ks.get_fingerprint("server:7878").is_none());
-        ks.pin("server:7878", "abcdef");
-        assert_eq!(ks.get_fingerprint("server:7878"), Some("abcdef"));
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn re_pin_updates_fingerprint() {
-        let p = tmp_path("ks2.toml");
-        let mut ks = KnownServers::load_or_create(&p);
-        ks.pin("server:7878", "old-fp");
-        ks.pin("server:7878", "new-fp");
-        assert_eq!(ks.get_fingerprint("server:7878"), Some("new-fp"));
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn remove_server_clears_pin() {
-        let p = tmp_path("ks3.toml");
-        let mut ks = KnownServers::load_or_create(&p);
-        ks.pin("srv:1", "fp-x");
-        assert!(ks.remove("srv:1"));
-        assert!(ks.get_fingerprint("srv:1").is_none());
-        assert!(!ks.remove("srv:1"));
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn server_persists_and_reloads() {
-        let p = tmp_path("ks4.toml");
-        {
-            let mut ks = KnownServers::load_or_create(&p);
-            ks.pin("192.168.1.10:7878", "server-fingerprint-hex");
-        }
-        let ks2 = KnownServers::load_or_create(&p);
-        assert_eq!(
-            ks2.get_fingerprint("192.168.1.10:7878"),
-            Some("server-fingerprint-hex")
-        );
-        let _ = std::fs::remove_file(&p);
     }
 }

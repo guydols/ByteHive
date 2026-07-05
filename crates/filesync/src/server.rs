@@ -35,18 +35,15 @@ pub struct Server {
     peers: Arc<RwLock<HashMap<String, Peer>>>,
     active_conns: Arc<RwLock<Vec<Arc<Connection>>>>,
     tls_config: Arc<rustls::ServerConfig>,
-
-    // For tracking sent bundles and sending acknowledgments
     sent_bundles: Arc<RwLock<HashMap<u64, BundleTracking>>>,
 }
 
-/// Tracks information about sent bundles for acknowledgment purposes
 #[derive(Debug, Clone)]
 struct BundleTracking {
     bundle_id: u64,
     sequence_numbers: Vec<u64>,
     sent_time: Instant,
-    acknowledged_by: HashSet<String>, // client IDs that have acknowledged
+    acknowledged_by: HashSet<String>,
 }
 
 impl BundleTracking {
@@ -209,15 +206,9 @@ fn handle_client(
     let conn = Arc::new(Connection::new_server(stream, tls_config)?);
     debug!("filesync: TLS handshake complete with new client");
 
-    // ── Known-host check ────────────────────────────────────────────────────
-    // The client's certificate was exchanged and key-ownership was proven
-    // during the mutual-TLS handshake.  We now derive its fingerprint and
-    // look it up in the known_clients table.
     let client_fp = match &conn.peer_cert {
         Some(der) => cert_fingerprint(der),
         None => {
-            // Should never happen with client_auth_mandatory = true, but
-            // guard defensively.
             warn!("filesync: client at {addr} did not present a certificate — rejecting");
             let _ = conn.send(&Message::Rejected {
                 reason: "no client certificate presented".into(),
@@ -253,7 +244,6 @@ fn handle_client(
             }
             debug!("filesync: received Hello from {node_id} proto={protocol_version}");
 
-            // ── Authorization check ──────────────────────────────────────
             let status = {
                 let mut kc = known_clients.lock();
                 let is_new = kc.upsert_pending(&node_id, &client_fp, &addr);
@@ -331,10 +321,6 @@ fn handle_client(
     })?;
     debug!("filesync: sent Hello response to {client_id}");
 
-    // Use the cached manifest from the initial (or most recent periodic) scan
-    // when available, rather than blocking on a full re-walk + BLAKE3 hash of
-    // every file.  A fresh scan of a large tree (tens of thousands of dirs)
-    // can take minutes and starves the client waiting for ManifestExchange.
     let cached = engine.get_manifest();
     let local = if cached.files.is_empty() {
         debug!("filesync: no cached manifest yet, running full scan for {client_id}");
@@ -388,10 +374,6 @@ fn handle_client(
         r_files, r_dirs
     );
 
-    // ── Preemptive disk-space check (server) ──────────────────────────────
-    // Simulate the client's send-list computation (is_server = false) to
-    // predict the bytes the client will upload.  Abort before sending
-    // anything if the server filesystem cannot accommodate them.
     let bytes_from_client: u64 = manifest::compute_send_list(&remote, &local, false)
         .iter()
         .filter_map(|p| remote.files.get(p))
@@ -1108,7 +1090,6 @@ fn broadcast_paths(
                     }
                 }
 
-                // Track this bundle for acknowledgment purposes
                 let sequence_numbers: Vec<u64> = bundle
                     .files
                     .iter()

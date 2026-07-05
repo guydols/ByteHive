@@ -21,7 +21,7 @@ pub const BH_DIR: &str = ".bh_filesync";
 pub const TMP_DIR: &str = ".bh_filesync/transfers";
 pub const TRASH_DIR: &str = ".bh_filesync/trash";
 pub const TRASH_INDEX_FILE: &str = "index.json";
-pub const FULL_SCAN_INTERVAL_SECS: u64 = 900; // 15 minutes
+pub const FULL_SCAN_INTERVAL_SECS: u64 = 3600; // 1 hour
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMetadata {

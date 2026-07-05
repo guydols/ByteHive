@@ -1,9 +1,15 @@
 use std::collections::HashMap;
+use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use bytehive_filesync::{
-    client::count_manifest,
-    protocol::{FileMetadata, Manifest},
+    client::{count_manifest, format_unix_secs},
+    exclusions::{ExclusionConfig, Exclusions},
+    gui::state::new_shared_state,
+    protocol::{FileBundle, FileData, FileMetadata, Manifest},
+    sync_engine::SyncEngine,
+    timestamp_id,
 };
 
 fn make_manifest(entries: &[(&str, u64, bool)]) -> Manifest {
@@ -127,4 +133,14 @@ fn count_many_files_and_dirs() {
     assert_eq!(f, 5);
     assert_eq!(d, 5);
     assert_eq!(b, 500);
+}
+
+#[test]
+fn epoch_formats_correctly() {
+    assert_eq!(format_unix_secs(0), "1970-01-01 00:00");
+}
+
+#[test]
+fn known_date_formats_correctly() {
+    assert_eq!(format_unix_secs(1_717_236_000), "2024-06-01 10:00");
 }

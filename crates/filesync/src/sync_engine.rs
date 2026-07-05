@@ -17,7 +17,6 @@ use std::time::{Duration, Instant, SystemTime};
 
 const PIPELINE_DEPTH: usize = 128;
 
-/// Tracks recent changes to a file for coalescing rapid modifications
 #[derive(Debug, Clone)]
 struct FileChangeHistory {
     last_change_time: Instant,
@@ -42,7 +41,6 @@ impl FileChangeHistory {
         self.change_count += 1;
         self.last_sequence_number = sequence_number;
 
-        // Return true if this change is part of a rapid sequence
         elapsed < FILE_CHANGE_COALESCE_MS
     }
 
@@ -70,17 +68,13 @@ pub enum FinishResult {
 
 #[derive(Debug, Clone)]
 pub struct ConflictInfo {
-    /// Original file path (incoming file applied here).
     pub original_path: PathBuf,
-    /// Path where the diverged local copy was saved.
     pub conflict_copy_path: PathBuf,
 }
 
 #[derive(Debug, Default)]
 pub struct ApplyResult {
-    /// Number of entries actually written (files + dirs).
     pub written: usize,
-    /// Conflict copies created during this apply.
     pub conflicts: Vec<ConflictInfo>,
 }
 
@@ -92,9 +86,6 @@ struct LargeFileAssembly {
     expected_hash: [u8; 32],
     dst: PathBuf,
     file_size: u64,
-    /// Original modification timestamp (ms since Unix epoch) from the sender.
-    /// Restored onto the destination file after the transfer is committed so
-    /// that the receiver's filesystem mtime matches the sender's.
     modified_ms: u64,
 
     final_hash_pending: Option<[u8; 32]>,
@@ -102,11 +93,7 @@ struct LargeFileAssembly {
 
 #[derive(Debug, Default, Clone)]
 pub struct SyncEngineConfig {
-    /// Automatically purge trash entries older than this many days.
-    /// `None` or `0` disables automatic purging.
     pub trash_expiry_days: Option<u64>,
-    /// Override for the periodic full-rescan interval in seconds.
-    /// Defaults to `FULL_SCAN_INTERVAL_SECS` (900) when `None`.
     pub full_scan_interval_secs: Option<u64>,
 }
 
@@ -114,18 +101,12 @@ pub struct SyncEngine {
     root: PathBuf,
     node_id: String,
     manifest: RwLock<Manifest>,
-
     suppressed: Arc<RwLock<HashSet<PathBuf>>>,
-
     suppressed_deletes: Arc<RwLock<HashSet<PathBuf>>>,
-
     in_progress: RwLock<HashMap<PathBuf, LargeFileAssembly>>,
-
     exclusions: Arc<Exclusions>,
     trash_manager: Arc<TrashManager>,
     full_scan_interval_secs: u64,
-
-    // For tracking rapid changes and coalescing
     change_sequences: RwLock<HashMap<PathBuf, FileChangeHistory>>,
     last_sequence_number: RwLock<u64>,
 }
@@ -146,8 +127,6 @@ pub fn conflict_copy_name(rel_path: &Path, node_id: &str, unix_secs: u64) -> Pat
     }
 }
 
-/// Compute the BLAKE3 hash of a file on disk.  Returns `None` if the file
-/// cannot be read (e.g. does not exist yet).
 fn hash_file(path: &Path) -> Option<[u8; 32]> {
     use std::io::Read;
     let file = fs::File::open(path).ok()?;
@@ -164,10 +143,6 @@ fn hash_file(path: &Path) -> Option<[u8; 32]> {
     Some(hasher.finalize().into())
 }
 
-/// Remove empty intermediate directories left behind inside the transfers
-/// folder after a large-file tmp file has been consumed or deleted.
-/// Walks upward from `tmp_path`'s parent, removing directories that are
-/// empty, stopping when it reaches the transfers root or a non-empty dir.
 fn cleanup_transfer_dirs(root: &Path, tmp_path: &Path) {
     let transfers_dir = root.join(crate::protocol::TMP_DIR);
     let mut current = tmp_path.parent();
@@ -176,7 +151,6 @@ fn cleanup_transfer_dirs(root: &Path, tmp_path: &Path) {
             break;
         }
         if fs::remove_dir(dir).is_err() {
-            // Non-empty or permission error — stop climbing
             break;
         }
         current = dir.parent();
@@ -280,14 +254,9 @@ impl SyncEngine {
 
         let age_ms = now_ms.saturating_sub(modified_ms);
 
-        // Improved stability detection: consider file stable if:
-        // 1. It hasn't been modified for FILE_STABILITY_MS, OR
-        // 2. It's been modified recently but we've seen multiple rapid changes (coalescing)
         if age_ms >= FILE_STABILITY_MS {
             return true;
         }
-
-        // Check if this file has recent rapid changes that should be coalesced
         self.has_recent_rapid_changes(rel, modified_ms)
     }
 
@@ -298,7 +267,6 @@ impl SyncEngine {
     pub fn has_recent_rapid_changes(&self, rel: &Path, _current_modified_ms: u64) -> bool {
         let history = self.change_sequences.read();
         if let Some(file_history) = history.get(rel) {
-            // If we have recent rapid changes, consider the file stable for coalescing
             file_history.should_coalesce()
         } else {
             false
@@ -328,7 +296,6 @@ impl SyncEngine {
         histories.remove(rel);
     }
 
-    /// Create a new SyncEngine with the same configuration but fresh state
     pub fn clone_with_fresh_state(&self) -> Self {
         Self {
             root: self.root.clone(),
@@ -431,25 +398,19 @@ impl SyncEngine {
             .collect()
     }
 
-    /// Returns `Some(manifest_hash)` when both the on-disk file and the incoming
-    /// file have diverged from the recorded manifest hash (i.e. a genuine
-    /// two-sided conflict).  Returns `None` when there is no conflict.
     fn detect_conflict(
         &self,
         rel_path: &Path,
         full_path: &Path,
         incoming_hash: &[u8; 32],
     ) -> Option<[u8; 32]> {
-        // Must be a known file (present in our manifest)
         let manifest_hash = self.manifest.read().files.get(rel_path).map(|m| m.hash)?;
-        // The incoming file must differ from the last-synced state
         if incoming_hash == &manifest_hash {
             return None;
         }
-        // The on-disk file must also differ from the last-synced state
         let on_disk_hash = hash_file(full_path)?;
         if on_disk_hash == manifest_hash {
-            return None; // local never changed — no conflict
+            return None;
         }
         if &on_disk_hash == incoming_hash {
             return None;
@@ -460,9 +421,6 @@ impl SyncEngine {
     pub fn apply_bundle(&self, bundle: &FileBundle) -> std::io::Result<ApplyResult> {
         let mut written = Vec::new();
         let mut result = ApplyResult::default();
-        // Collect (absolute_path, modified_ms) for directories so we can stamp
-        // them *after* all their contents have been written.  Writing files into
-        // a directory updates the directory's mtime, so we must restore it last.
         let mut dir_mtimes: Vec<(PathBuf, u64)> = Vec::new();
 
         for fd in &bundle.files {
@@ -473,7 +431,6 @@ impl SyncEngine {
 
             let full = self.root.join(&fd.metadata.rel_path);
 
-            // --- Conflict detection (files only) ---
             if !fd.metadata.is_dir {
                 if let Some(_ancestor_hash) =
                     self.detect_conflict(&fd.metadata.rel_path, &full, &fd.metadata.hash)
@@ -507,21 +464,17 @@ impl SyncEngine {
                 }
             }
 
-            // --- Apply the incoming entry ---
             self.suppressed.write().insert(fd.metadata.rel_path.clone());
             written.push(fd.metadata.rel_path.clone());
 
             if fd.metadata.is_dir {
                 fs::create_dir_all(&full)?;
-                // Defer mtime restoration until after all files in this bundle
-                // have been written, otherwise child-file writes will clobber it.
                 dir_mtimes.push((full.clone(), fd.metadata.modified_ms));
             } else {
                 if let Some(parent) = full.parent() {
                     fs::create_dir_all(parent)?;
                 }
                 fs::write(&full, &fd.content)?;
-                // Restore the sender's modification timestamp on the file.
                 let mtime = filetime::FileTime::from_unix_time(
                     (fd.metadata.modified_ms / 1000) as i64,
                     ((fd.metadata.modified_ms % 1000) * 1_000_000) as u32,
@@ -538,9 +491,6 @@ impl SyncEngine {
             result.written += 1;
         }
 
-        // Restore directory mtimes deepest-first so that stamping a child
-        // directory does not update its parent's mtime before we stamp the
-        // parent too.
         dir_mtimes.sort_by(|a, b| b.0.components().count().cmp(&a.0.components().count()));
         for (path, modified_ms) in dir_mtimes {
             let mtime = filetime::FileTime::from_unix_time(
@@ -711,7 +661,6 @@ impl SyncEngine {
             }
         }
 
-        // --- Conflict detection ---
         let conflict = {
             let manifest_hash = self.manifest.read().files.get(path).map(|m| m.hash);
             if let Some(manifest_hash) = manifest_hash {
@@ -762,9 +711,6 @@ impl SyncEngine {
         fs::rename(&asm.tmp_path, &asm.dst)?;
         cleanup_transfer_dirs(&self.root, &asm.tmp_path);
 
-        // Restore the sender's original modification timestamp.  The rename
-        // above (and the OS itself) would otherwise stamp the file with the
-        // current time.
         let mtime = filetime::FileTime::from_unix_time(
             (asm.modified_ms / 1000) as i64,
             ((asm.modified_ms % 1000) * 1_000_000) as u32,

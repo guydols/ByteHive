@@ -13,8 +13,6 @@ mod tests {
         std::env::temp_dir().join(format!("bh_kh_test_{n}_{name}"))
     }
 
-    // ── KnownClients ─────────────────────────────────────────────────────────
-
     #[test]
     fn new_client_upsert_returns_true() {
         let p = tmp_path("kc1.toml");
@@ -54,6 +52,7 @@ mod tests {
     #[test]
     fn set_status_unknown_fingerprint_returns_false() {
         let p = tmp_path("kc5.toml");
+
         let mut kc = KnownClients::load_from_config(&p);
         assert!(!kc.set_status("no-such-fp", ClientStatus::Allowed));
         let _ = std::fs::remove_file(&p);
@@ -66,7 +65,7 @@ mod tests {
         kc.upsert_pending("node-1", "fp-eee", "127.0.0.1:1");
         assert!(kc.remove("fp-eee"));
         assert_eq!(kc.status("fp-eee"), None);
-        assert!(!kc.remove("fp-eee")); // second remove returns false
+        assert!(!kc.remove("fp-eee"));
         let _ = std::fs::remove_file(&p);
     }
 
@@ -106,8 +105,6 @@ mod tests {
         let kc = KnownClients::load_from_config(&p);
         assert_eq!(kc.list().len(), 0);
     }
-
-    // ── KnownServers ─────────────────────────────────────────────────────────
 
     #[test]
     fn first_pin_is_tofu() {
