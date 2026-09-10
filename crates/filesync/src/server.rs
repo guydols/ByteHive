@@ -2,6 +2,7 @@ use crate::bundler;
 use crate::cert_fingerprint;
 use crate::common::{self, LargeFileEndOutcome, PendingChanges};
 use crate::known_hosts::{ClientStatus, KnownClients};
+use crate::ledger::{DeletionLedger, Tombstone};
 use crate::manifest;
 use crate::protocol::*;
 use crate::sync_engine::SyncEngine;
@@ -374,6 +375,25 @@ fn handle_client(
         r_files, r_dirs
     );
 
+    // ---- Deletion-ledger exchange (symmetric order: server sends first,
+    // client replies — avoids both-wait deadlock) ----
+    conn.send(&Message::LedgerExchange {
+        entries: engine.ledger_entries(),
+    })?;
+    debug!("filesync: sent LedgerExchange to {client_id}");
+    let peer_ledger_entries = match conn.recv()? {
+        Message::LedgerExchange { entries } => entries,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "filesync: expected LedgerExchange",
+            ))
+        }
+    };
+    let merged = engine.merge_ledger(peer_ledger_entries);
+    debug!("filesync: merged {merged} tombstone(s) from {client_id}");
+    // NOTE: LedgerAck intentionally not sent — no side reads it.
+
     let bytes_from_client: u64 = manifest::compute_send_list(&remote, &local, false)
         .iter()
         .filter_map(|p| remote.files.get(p))
@@ -405,7 +425,32 @@ fn handle_client(
         );
     }
 
-    let to_client = manifest::compute_send_list(&local, &remote, true);
+    let raw_to_client = manifest::compute_send_list(&local, &remote, true);
+    let snap = local_ledger_snapshot(&engine);
+    let (to_client, recreated) =
+        manifest::filter_resurrected(raw_to_client.clone(), &local, Some(&snap));
+    // Tombstone wins over our stale copy: converge by deleting locally while
+    // preserving the original tombstone stamp (never re-stamp here).
+    {
+        let send_set: HashSet<&PathBuf> = to_client.iter().collect();
+        for path in raw_to_client.iter().filter(|p| !send_set.contains(p)) {
+            if let Some(tomb) = snap.get(path) {
+                debug!("filesync: tombstone wins for {path:?} — deleting local stale copy");
+                engine.apply_deletes(&[path.clone()], tomb.deleted_at_ms, &tomb.deleter_node)?;
+            }
+        }
+    }
+    // Refresh: veto step changed disk + manifest.
+    let local = engine.get_manifest();
+    // Tell the peer about deletes it missed while offline.
+    for (path, deleted_at_ms, deleter) in compute_deletes_to_push(&local, &remote, &snap) {
+        debug!("filesync: pushing missed delete {path:?} to {client_id}");
+        conn.send(&Message::Delete {
+            paths: vec![path],
+            deleted_at_ms,
+            deleter,
+        })?;
+    }
     let files_sent_to_client = to_client
         .iter()
         .filter(|p| local.files.get(*p).map(|m| !m.is_dir).unwrap_or(false))
@@ -430,6 +475,8 @@ fn handle_client(
         engine.send_paths(&to_client, &conn)?;
         debug!("filesync: send_paths to {client_id} complete");
     }
+    // Legitimate recreates were just uploaded — lift their stale tombstones.
+    engine.clear_tombstones(&recreated);
     conn.send(&Message::SyncComplete)?;
     debug!("filesync: sent SyncComplete to {client_id}, waiting for client's initial sync");
 
@@ -578,6 +625,38 @@ fn handle_client(
                         }
                     }
                     Err(e) => error!("filesync: initial sync large_file_end from {client_id}: {e}"),
+                }
+            }
+            Message::Delete {
+                paths,
+                deleted_at_ms,
+                deleter,
+            } => {
+                debug!(
+                    "filesync: initial recv Delete from {client_id}: {} path(s)",
+                    paths.len()
+                );
+                match common::handle_recv_delete_with_meta(
+                    &engine,
+                    &paths,
+                    deleted_at_ms,
+                    &deleter,
+                    &client_id,
+                    &bus,
+                    "filesync",
+                ) {
+                    Ok(_) => broadcast_to_others(
+                        &peers,
+                        &client_id,
+                        &Message::Delete {
+                            paths,
+                            deleted_at_ms,
+                            deleter,
+                        },
+                    ),
+                    Err(e) => {
+                        error!("filesync: initial sync apply_deletes from {client_id}: {e}")
+                    }
                 }
             }
             Message::SyncComplete => {
@@ -793,13 +872,33 @@ fn client_recv_loop(
                     Err(e) => error!("filesync: large_file_end from {client_id}: {e}"),
                 }
             }
-            Ok(Message::Delete { paths }) => {
+            Ok(Message::Delete {
+                paths,
+                deleted_at_ms,
+                deleter,
+            }) => {
                 debug!(
                     "filesync: recv Delete from {client_id}: {} path(s)",
                     paths.len()
                 );
-                match common::handle_recv_delete(&engine, &paths, &client_id, &bus, "filesync") {
-                    Ok(_) => broadcast_to_others(&peers, &client_id, &Message::Delete { paths }),
+                match common::handle_recv_delete_with_meta(
+                    &engine,
+                    &paths,
+                    deleted_at_ms,
+                    &deleter,
+                    &client_id,
+                    &bus,
+                    "filesync",
+                ) {
+                    Ok(_) => broadcast_to_others(
+                        &peers,
+                        &client_id,
+                        &Message::Delete {
+                            paths,
+                            deleted_at_ms,
+                            deleter,
+                        },
+                    ),
                     Err(e) => error!("filesync: apply_deletes from {client_id}: {e}"),
                 }
             }
@@ -1014,7 +1113,7 @@ fn flush_local_changes(
             "filesync server: broadcasting {} delete(s)",
             pending.deletes.len()
         );
-        let (paths, _) = pending.take_deletes(engine.root());
+        let (paths, _) = pending.take_deletes_with_engine(engine);
         if let Some(ref bus) = bus {
             bus.publish(
                 "filesync",
@@ -1031,7 +1130,15 @@ fn flush_local_changes(
                 }),
             );
         }
-        broadcast_to_others(peers, "", &Message::Delete { paths });
+        broadcast_to_others(
+            peers,
+            "",
+            &Message::Delete {
+                paths,
+                deleted_at_ms: crate::ledger::now_ms(),
+                deleter: engine.node_id().to_string(),
+            },
+        );
     }
 
     pending.reset_timer();
@@ -1145,8 +1252,56 @@ fn broadcast_paths(
     }
 }
 
-fn broadcast_to_others(peers: &Arc<RwLock<HashMap<String, Peer>>>, sender_id: &str, msg: &Message) {
-    let peers = peers.read();
+/// In-memory snapshot of the engine's deletion ledger for sync decisions
+/// (rebuilt from `ledger_entries`; avoids new sync_engine accessors).
+fn local_ledger_snapshot(engine: &SyncEngine) -> DeletionLedger {
+    let mut snap = DeletionLedger::new();
+    snap.merge_remote(
+        engine
+            .ledger_entries()
+            .into_iter()
+            .map(|d| {
+                let path = d.path.clone();
+                (
+                    path,
+                    Tombstone::new(
+                        d.path,
+                        d.deleted_at_ms,
+                        d.deleter_node,
+                        d.prev_hash,
+                        d.prev_mtime_ms,
+                    ),
+                )
+            })
+            .collect(),
+    );
+    snap
+}
+
+/// Paths the peer still lists but our merged ledger marks deleted (tombstone
+/// newer than the peer's copy): the peer missed the delete while offline.
+/// Returns `(path, deleted_at_ms, deleter)` so the original stamp survives.
+fn compute_deletes_to_push(
+    local: &Manifest,
+    remote: &Manifest,
+    ledger: &DeletionLedger,
+) -> Vec<(PathBuf, u64, String)> {
+    let mut out: Vec<(PathBuf, u64, String)> = Vec::new();
+    for (path, tomb) in ledger.iter() {
+        if local.files.contains_key(path) {
+            continue;
+        }
+        if let Some(peer_meta) = remote.files.get(path) {
+            if tomb.deleted_at_ms > peer_meta.modified_ms {
+                out.push((path.clone(), tomb.deleted_at_ms, tomb.deleter_node.clone()));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+fn broadcast_to_others(peers: &Arc<RwLock<HashMap<String, Peer>>>, sender_id: &str, msg: &Message) {    let peers = peers.read();
     if peers.is_empty() {
         return;
     }

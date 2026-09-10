@@ -3,6 +3,7 @@ use crate::common::{self, LargeFileEndOutcome, PendingChanges};
 use crate::gui::state::ConnectionStatus;
 use crate::gui::state::{ConflictKind, SharedState};
 use crate::known_hosts::KnownServers;
+use crate::ledger::{DeletionLedger, Tombstone};
 use crate::manifest;
 use crate::protocol::*;
 use crate::sync_engine::{ConflictInfo, SyncEngine};
@@ -16,6 +17,7 @@ use log::{debug, error, info, warn};
 use parking_lot::Mutex;
 
 use std::io;
+use std::collections::HashSet;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -472,6 +474,30 @@ impl Client {
         debug!("filesync session: sending local ManifestExchange");
         conn.send(&Message::ManifestExchange(local.clone()))?;
 
+        // ---- Deletion-ledger exchange (symmetric order: server sent first,
+        // we reply — avoids both-wait deadlock) ----
+        debug!("filesync session: waiting for server LedgerExchange");
+        let peer_ledger_entries = match conn.recv()? {
+            Message::LedgerExchange { entries } => entries,
+            other => {
+                error!("filesync session: expected LedgerExchange from server");
+                debug!(
+                    "filesync session: unexpected message instead of LedgerExchange: {other:?}"
+                );
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "filesync: expected LedgerExchange",
+                ));
+            }
+        };
+        let merged = self.engine.merge_ledger(peer_ledger_entries);
+        debug!("filesync session: merged {merged} tombstone(s) from server");
+        conn.send(&Message::LedgerExchange {
+            entries: self.engine.ledger_entries(),
+        })?;
+        debug!("filesync session: sent LedgerExchange to server");
+        // NOTE: LedgerAck intentionally not sent — no side reads it.
+
         let expected_rx: u64 = remote
             .files
             .iter()
@@ -632,6 +658,30 @@ impl Client {
                         }
                     }
                 }
+                Message::Delete {
+                    paths,
+                    deleted_at_ms,
+                    deleter,
+                } => {
+                    debug!(
+                        "filesync session: recv Delete {} path(s) during initial sync",
+                        paths.len()
+                    );
+                    if let Err(e) = common::handle_recv_delete_with_meta(
+                        &self.engine,
+                        &paths,
+                        deleted_at_ms,
+                        &deleter,
+                        "server",
+                        &self.bus,
+                        "filesync session",
+                    ) {
+                        error!("filesync session: apply_deletes during initial sync: {e}");
+                    }
+                    if let Some(ref gs) = self.gui_state {
+                        gs.write().begin_sync_activity();
+                    }
+                }
                 Message::SyncComplete => {
                     debug!(
                         "filesync session: received SyncComplete — files_received={} dirs_received={} bytes_received={} B elapsed={}ms",
@@ -665,7 +715,38 @@ impl Client {
             }
         }
 
-        let to_send = manifest::compute_send_list(&local, &remote, false);
+        let raw_to_send = manifest::compute_send_list(&local, &remote, false);
+        let snap = local_ledger_snapshot(&self.engine);
+        let (to_send, recreated) =
+            manifest::filter_resurrected(raw_to_send.clone(), &local, Some(&snap));
+        // Tombstone wins over our stale copy: converge by deleting locally
+        // while preserving the original tombstone stamp (never re-stamp).
+        {
+            let send_set: HashSet<&PathBuf> = to_send.iter().collect();
+            for path in raw_to_send.iter().filter(|p| !send_set.contains(p)) {
+                if let Some(tomb) = snap.get(path) {
+                    debug!(
+                        "filesync session: tombstone wins for {path:?} — deleting local stale copy"
+                    );
+                    self.engine.apply_deletes(
+                        &[path.clone()],
+                        tomb.deleted_at_ms,
+                        &tomb.deleter_node,
+                    )?;
+                }
+            }
+        }
+        // Refresh: veto step changed disk + manifest.
+        let local = self.engine.get_manifest();
+        // Tell the server about deletes it missed while we were offline.
+        for (path, deleted_at_ms, deleter) in compute_deletes_to_push(&local, &remote, &snap) {
+            debug!("filesync session: pushing missed delete {path:?} to server");
+            conn.send(&Message::Delete {
+                paths: vec![path],
+                deleted_at_ms,
+                deleter,
+            })?;
+        }
         let files_sent = to_send
             .iter()
             .filter(|p| local.files.get(*p).map(|m| !m.is_dir).unwrap_or(false))
@@ -688,6 +769,8 @@ impl Client {
             self.engine.send_paths(&to_send, &conn)?;
             debug!("filesync session: send_paths complete");
         }
+        // Legitimate recreates were just uploaded — lift their tombstones.
+        self.engine.clear_tombstones(&recreated);
 
         debug!("filesync session: sending SyncComplete to server");
         conn.send(&Message::SyncComplete)?;
@@ -937,10 +1020,21 @@ fn recv_loop(
                     Err(e) => error!("{prefix}: large_file_end: {e}"),
                 }
             }
-            Ok(Message::Delete { paths }) => {
+            Ok(Message::Delete {
+                paths,
+                deleted_at_ms,
+                deleter,
+            }) => {
                 debug!("{prefix}: Delete {} path(s)", paths.len());
-                if let Err(e) = common::handle_recv_delete(&engine, &paths, "server", &bus, prefix)
-                {
+                if let Err(e) = common::handle_recv_delete_with_meta(
+                    &engine,
+                    &paths,
+                    deleted_at_ms,
+                    &deleter,
+                    "server",
+                    &bus,
+                    prefix,
+                ) {
                     error!("{prefix}: apply_deletes: {e}");
                 }
                 if let Some(ref gs) = gui_state {
@@ -1080,6 +1174,55 @@ fn send_loop(
     debug!("filesync send: loop exited after {} flush(es)", flush_count);
 }
 
+/// In-memory snapshot of the engine's deletion ledger for sync decisions
+/// (rebuilt from `ledger_entries`; avoids new sync_engine accessors).
+fn local_ledger_snapshot(engine: &SyncEngine) -> DeletionLedger {
+    let mut snap = DeletionLedger::new();
+    snap.merge_remote(
+        engine
+            .ledger_entries()
+            .into_iter()
+            .map(|d| {
+                let path = d.path.clone();
+                (
+                    path,
+                    Tombstone::new(
+                        d.path,
+                        d.deleted_at_ms,
+                        d.deleter_node,
+                        d.prev_hash,
+                        d.prev_mtime_ms,
+                    ),
+                )
+            })
+            .collect(),
+    );
+    snap
+}
+
+/// Paths the peer still lists but our merged ledger marks deleted (tombstone
+/// newer than the peer's copy): the peer missed the delete while offline.
+/// Returns `(path, deleted_at_ms, deleter)` so the original stamp survives.
+fn compute_deletes_to_push(
+    local: &Manifest,
+    remote: &Manifest,
+    ledger: &DeletionLedger,
+) -> Vec<(PathBuf, u64, String)> {
+    let mut out: Vec<(PathBuf, u64, String)> = Vec::new();
+    for (path, tomb) in ledger.iter() {
+        if local.files.contains_key(path) {
+            continue;
+        }
+        if let Some(peer_meta) = remote.files.get(path) {
+            if tomb.deleted_at_ms > peer_meta.modified_ms {
+                out.push((path.clone(), tomb.deleted_at_ms, tomb.deleter_node.clone()));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 fn flush_to_server(
     engine: &Arc<SyncEngine>,
     conn: &Arc<Connection>,
@@ -1129,14 +1272,18 @@ fn flush_to_server(
         send_paths_to_server(engine, conn, bus, gui_state, stable)?;
     }
 
-    let (paths, delete_count) = pending.take_deletes(engine.root());
+    let (paths, delete_count) = pending.take_deletes_with_engine(engine);
     if !paths.is_empty() {
         debug!(
             "filesync send: flushing {} delete path(s) ({} pre-expansion)",
             paths.len(),
             delete_count
         );
-        conn.send(&Message::Delete { paths })?;
+        conn.send(&Message::Delete {
+            paths,
+            deleted_at_ms: crate::ledger::now_ms(),
+            deleter: engine.node_id().to_string(),
+        })?;
         if let Some(ref gs) = gui_state {
             gs.write().begin_sync_activity();
         }
