@@ -1,8 +1,8 @@
 use std::fs;
 use std::time::{Duration, Instant};
 
-/// Detects system suspend/resume by comparing wall-clock time against system uptime.
-/// When wall-clock advances significantly more than uptime, the system was suspended.
+const SUSPEND_THRESHOLD_SECS: u64 = 5;
+
 pub struct SuspendDetector {
     last_check: Instant,
     last_uptime: Duration,
@@ -30,8 +30,6 @@ impl SuspendDetector {
         };
 
         let uptime_elapsed = current_uptime.saturating_sub(self.last_uptime);
-
-        const SUSPEND_THRESHOLD_SECS: u64 = 5;
         let suspended = wall_elapsed.as_secs() > uptime_elapsed.as_secs() + SUSPEND_THRESHOLD_SECS;
 
         self.last_check = now;

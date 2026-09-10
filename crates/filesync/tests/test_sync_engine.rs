@@ -6,7 +6,9 @@ use std::{
 
 use bytehive_filesync::{
     exclusions::{ExclusionConfig, Exclusions},
-    protocol::{FileBundle, FileData, FileMetadata},
+    hex,
+    ledger::{now_ms, DeletionLedger},
+    protocol::{FileBundle, FileData, FileMetadata, TombstoneDto},
     sync_engine::{safe_relative, SyncEngine},
 };
 
@@ -239,7 +241,7 @@ fn apply_deletes_removes_file() {
     assert!(dir.join("victim.txt").exists());
 
     let n = engine
-        .apply_deletes(&[PathBuf::from("victim.txt")])
+        .apply_deletes(&[PathBuf::from("victim.txt")], now_ms(), "test-node")
         .unwrap();
     assert_eq!(n, 1);
     assert!(!dir.join("victim.txt").exists());
@@ -253,7 +255,9 @@ fn apply_deletes_nonexistent_file_still_counts() {
     let dir = tmp_dir("delete_nonexistent");
     let engine = make_engine(dir.clone());
 
-    let n = engine.apply_deletes(&[PathBuf::from("ghost.txt")]).unwrap();
+    let n = engine
+        .apply_deletes(&[PathBuf::from("ghost.txt")], now_ms(), "test-node")
+        .unwrap();
     assert_eq!(n, 1);
     fs::remove_dir_all(&dir).unwrap();
 }
@@ -263,7 +267,7 @@ fn apply_deletes_rejects_path_traversal() {
     let dir = tmp_dir("delete_traversal");
     let engine = make_engine(dir.clone());
     let n = engine
-        .apply_deletes(&[PathBuf::from("../not_here")])
+        .apply_deletes(&[PathBuf::from("../not_here")], now_ms(), "test-node")
         .unwrap();
     assert_eq!(n, 0, "path traversal in delete must be silently skipped");
     fs::remove_dir_all(&dir).unwrap();
@@ -275,7 +279,9 @@ fn apply_deletes_removes_directory_recursively() {
     let engine = make_engine(dir.clone());
     engine.apply_bundle(&dir_bundle("mydir")).unwrap();
     fs::write(dir.join("mydir/file.txt"), b"data").unwrap();
-    engine.apply_deletes(&[PathBuf::from("mydir")]).unwrap();
+    engine
+        .apply_deletes(&[PathBuf::from("mydir")], now_ms(), "test-node")
+        .unwrap();
     assert!(!dir.join("mydir").exists());
     fs::remove_dir_all(&dir).unwrap();
 }
@@ -591,7 +597,9 @@ fn apply_deletes_directory_clears_manifest_entries() {
     let before = engine.get_manifest();
     assert!(before.files.contains_key(&PathBuf::from("mydir")));
     assert!(before.files.contains_key(&PathBuf::from("mydir/child.txt")));
-    engine.apply_deletes(&[PathBuf::from("mydir")]).unwrap();
+    engine
+        .apply_deletes(&[PathBuf::from("mydir")], now_ms(), "test-node")
+        .unwrap();
     let after = engine.get_manifest();
     assert!(!after.files.contains_key(&PathBuf::from("mydir")));
     assert!(!after.files.contains_key(&PathBuf::from("mydir/child.txt")));
@@ -693,5 +701,129 @@ fn clear_in_progress_removes_assembly() {
         .commit_large_file(&PathBuf::from("bigfile.bin"), [0u8; 32])
         .unwrap();
     assert!(matches!(result, FinishResult::Committed));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---- Deletion-ledger engine tests, relocated from src/sync_engine.rs ----
+// (repo policy: no inline #[cfg(test)] in implementation files; private
+// `ledger` field access was rewritten through public API + disk reload).
+
+#[test]
+fn apply_deletes_records_tombstone_with_prev_info() {
+    let dir = tmp_dir("ledger_prev_info");
+    let engine = make_engine(dir.clone());
+    fs::write(dir.join("victim.txt"), b"data").unwrap();
+    engine.scan().unwrap();
+    let before = engine
+        .get_manifest()
+        .files
+        .get(&PathBuf::from("victim.txt"))
+        .cloned();
+    assert!(before.is_some());
+    let before = before.unwrap();
+
+    let n = engine
+        .apply_deletes(&[PathBuf::from("victim.txt")], 1_700_000_000_000, "node-peer")
+        .unwrap();
+    assert_eq!(n, 1);
+    assert!(!dir.join("victim.txt").exists());
+
+    // Read back through the persisted ledger (public API only).
+    let tomb = DeletionLedger::load(&dir)
+        .get(&PathBuf::from("victim.txt"))
+        .cloned()
+        .expect("tombstone must be recorded");
+    assert_eq!(tomb.deleted_at_ms, 1_700_000_000_000);
+    assert_eq!(tomb.deleter_node, "node-peer");
+    assert_eq!(tomb.prev_hash.as_deref(), Some(hex(&before.hash).as_str()));
+    assert_eq!(tomb.prev_mtime_ms, Some(before.modified_ms));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn apply_deletes_absent_path_still_records_tombstone() {
+    let dir = tmp_dir("ledger_absent");
+    let engine = make_engine(dir.clone());
+    let n = engine
+        .apply_deletes(&[PathBuf::from("ghost.txt")], 42, "node-peer")
+        .unwrap();
+    assert_eq!(n, 1);
+    let tomb = DeletionLedger::load(&dir)
+        .get(&PathBuf::from("ghost.txt"))
+        .cloned()
+        .expect("absent path must still get a tombstone");
+    assert_eq!(tomb.deleted_at_ms, 42);
+    assert!(tomb.prev_hash.is_none());
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn apply_deletes_preserves_sender_timestamp_lww() {
+    let dir = tmp_dir("ledger_lww");
+    let engine = make_engine(dir.clone());
+    engine
+        .apply_deletes(&[PathBuf::from("a.txt")], 200, "n1")
+        .unwrap();
+    // Older sender timestamp must not clobber the newer tombstone.
+    engine
+        .apply_deletes(&[PathBuf::from("a.txt")], 100, "n2")
+        .unwrap();
+    assert_eq!(
+        DeletionLedger::load(&dir)
+            .get(&PathBuf::from("a.txt"))
+            .unwrap()
+            .deleter_node,
+        "n1"
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn merge_and_export_ledger_entries_roundtrip() {
+    let dir = tmp_dir("ledger_merge");
+    let engine = make_engine(dir.clone());
+    let dtos = vec![TombstoneDto {
+        path: PathBuf::from("r.txt"),
+        deleted_at_ms: 777,
+        deleter_node: "node-remote".to_string(),
+        prev_hash: None,
+        prev_mtime_ms: None,
+    }];
+    assert_eq!(engine.merge_ledger(dtos), 1);
+    let entries = engine.ledger_entries();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path, PathBuf::from("r.txt"));
+    assert_eq!(entries[0].deleted_at_ms, 777);
+    assert!(engine.has_tombstone_newer_than(&PathBuf::from("r.txt"), 776));
+    assert!(!engine.has_tombstone_newer_than(&PathBuf::from("r.txt"), 777));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn prune_ledger_drops_expired_only() {
+    let dir = tmp_dir("ledger_prune");
+    let engine = make_engine(dir.clone());
+    engine.merge_ledger(vec![TombstoneDto {
+        path: PathBuf::from("old.txt"),
+        deleted_at_ms: 1, // ancient
+        deleter_node: "n".to_string(),
+        prev_hash: None,
+        prev_mtime_ms: None,
+    }]);
+    engine.record_delete(PathBuf::from("fresh.txt"), now_ms(), "n", None, None);
+    assert_eq!(engine.prune_ledger(), 1);
+    let loaded = DeletionLedger::load(&dir);
+    assert!(!loaded.contains(&PathBuf::from("old.txt")));
+    assert!(loaded.contains(&PathBuf::from("fresh.txt")));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn clear_tombstones_removes_on_recreate_win() {
+    let dir = tmp_dir("ledger_clear");
+    let engine = make_engine(dir.clone());
+    engine.record_delete(PathBuf::from("back.txt"), 100, "n", None, None);
+    engine.clear_tombstones(&[PathBuf::from("back.txt")]);
+    assert!(!DeletionLedger::load(&dir).contains(&PathBuf::from("back.txt")));
     fs::remove_dir_all(&dir).unwrap();
 }

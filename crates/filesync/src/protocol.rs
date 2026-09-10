@@ -8,7 +8,7 @@ pub const BUNDLE_MAX_FILES: usize = 500;
 pub const LARGE_FILE_THRESHOLD: u64 = 8 * 1024 * 1024;
 pub const FILE_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 pub const DEBOUNCE_MS: u64 = 200;
 pub const FILE_STABILITY_MS: u64 = 500;
 pub const FILE_CHANGE_COALESCE_MS: u64 = 100;
@@ -21,7 +21,7 @@ pub const BH_DIR: &str = ".bh_filesync";
 pub const TMP_DIR: &str = ".bh_filesync/transfers";
 pub const TRASH_DIR: &str = ".bh_filesync/trash";
 pub const TRASH_INDEX_FILE: &str = "index.json";
-pub const FULL_SCAN_INTERVAL_SECS: u64 = 900; // 15 minutes
+pub const FULL_SCAN_INTERVAL_SECS: u64 = 3600; // 1 hour
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMetadata {
@@ -52,6 +52,15 @@ pub struct FileBundle {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TombstoneDto {
+    pub path: PathBuf,
+    pub deleted_at_ms: u64,
+    pub deleter_node: String,
+    pub prev_hash: Option<String>,
+    pub prev_mtime_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
     Hello {
         node_id: String,
@@ -73,6 +82,14 @@ pub enum Message {
     },
     Delete {
         paths: Vec<PathBuf>,
+        deleted_at_ms: u64,
+        deleter: String,
+    },
+    LedgerExchange {
+        entries: Vec<TombstoneDto>,
+    },
+    LedgerAck {
+        received: usize,
     },
     SyncComplete,
     LargeFileStart {

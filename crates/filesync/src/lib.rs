@@ -5,6 +5,7 @@ pub mod common;
 pub mod exclusions;
 pub mod gui;
 pub mod known_hosts;
+pub mod ledger;
 pub mod manifest;
 pub mod protocol;
 pub mod server;
@@ -15,6 +16,7 @@ pub mod watcher;
 
 pub use app::FileSyncApp;
 pub use known_hosts::{ClientStatus, KnownClient, KnownClients, KnownServer, KnownServers};
+pub use ledger::{DeletionLedger, Tombstone, DELETION_LEDGER_TTL_MS};
 
 pub fn timestamp_id() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};

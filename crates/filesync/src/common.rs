@@ -176,6 +176,32 @@ impl PendingChanges {
         expand_deleted_ancestors(root, &mut paths);
         (paths, original_count)
     }
+
+    /// Drain pending deletes and record a local tombstone for each path
+    /// BEFORE it is sent, so a later remote copy cannot resurrect it.
+    /// Tombstones use wall-clock [`crate::ledger::now_ms`] and this node's
+    /// id; prev hash/mtime come from the manifest when available.
+    /// (Next lane: switch client/server flush paths to this method.)
+    pub fn take_deletes_with_engine(
+        &mut self,
+        engine: &SyncEngine,
+    ) -> (Vec<PathBuf>, usize) {
+        let (paths, original_count) = self.take_deletes(engine.root());
+        if !paths.is_empty() {
+            let now = crate::ledger::now_ms();
+            let node = engine.node_id().to_string();
+            let manifest = engine.get_manifest();
+            for p in &paths {
+                let (prev_hash, prev_mtime_ms) = manifest
+                    .files
+                    .get(p)
+                    .map(|m| (Some(crate::hex(&m.hash)), Some(m.modified_ms)))
+                    .unwrap_or((None, None));
+                engine.record_delete(p.clone(), now, &node, prev_hash, prev_mtime_ms);
+            }
+        }
+        (paths, original_count)
+    }
 }
 
 pub fn expand_deleted_ancestors(root: &Path, paths: &mut Vec<PathBuf>) {
@@ -421,20 +447,29 @@ pub fn handle_recv_large_file_end(
     }
 }
 
-pub fn handle_recv_delete(
+/// Apply a remote delete, preserving the SENDER's timestamp/deleter for
+/// last-writer-wins (never re-stamp locally).
+pub fn handle_recv_delete_with_meta(
     engine: &SyncEngine,
     paths: &[PathBuf],
+    deleted_at_ms: u64,
+    deleter: &str,
     peer: &str,
     bus: &Option<Arc<MessageBus>>,
     log_prefix: &str,
 ) -> io::Result<usize> {
-    let n = engine.apply_deletes(paths)?;
+    let n = engine.apply_deletes(paths, deleted_at_ms, deleter)?;
     info!("{log_prefix}: -{n} path(s) from {peer}");
     if let Some(ref bus) = bus {
         bus.publish(
             "filesync",
             "filesync.file_deleted",
-            serde_json::json!({ "paths": paths, "node": peer }),
+            serde_json::json!({
+                "paths": paths,
+                "node": peer,
+                "deleted_at_ms": deleted_at_ms,
+                "deleter": deleter,
+            }),
         );
         bus.publish(
             "filesync",
@@ -447,6 +482,28 @@ pub fn handle_recv_delete(
         );
     }
     Ok(n)
+}
+
+/// Legacy 5-arg entry point kept so the current client/server recv loops
+/// compile untouched in this lane. Stamps with local wall-clock time;
+/// prefer [`handle_recv_delete_with_meta`] (next lane switches callers to
+/// it so sender timestamps survive for LWW).
+pub fn handle_recv_delete(
+    engine: &SyncEngine,
+    paths: &[PathBuf],
+    peer: &str,
+    bus: &Option<Arc<MessageBus>>,
+    log_prefix: &str,
+) -> io::Result<usize> {
+    handle_recv_delete_with_meta(
+        engine,
+        paths,
+        crate::ledger::now_ms(),
+        peer,
+        peer,
+        bus,
+        log_prefix,
+    )
 }
 
 pub fn handle_recv_rename(

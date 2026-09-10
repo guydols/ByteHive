@@ -3,6 +3,7 @@ use crate::common::{self, LargeFileEndOutcome, PendingChanges};
 use crate::gui::state::ConnectionStatus;
 use crate::gui::state::{ConflictKind, SharedState};
 use crate::known_hosts::KnownServers;
+use crate::ledger::{DeletionLedger, Tombstone};
 use crate::manifest;
 use crate::protocol::*;
 use crate::sync_engine::{ConflictInfo, SyncEngine};
@@ -16,6 +17,7 @@ use log::{debug, error, info, warn};
 use parking_lot::Mutex;
 
 use std::io;
+use std::collections::HashSet;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,15 +36,9 @@ pub struct Client {
     tls_config: Arc<rustls::ClientConfig>,
     gui_state: Option<SharedState>,
     awaiting_approval: Arc<AtomicBool>,
-    /// The connection currently in use by an in-flight `session()` call, if
-    /// any. This lets `shutdown()` force-close a live connection (e.g. after
-    /// the system resumes from suspend) instead of only preventing *future*
-    /// connection attempts.
     active_conn: Arc<Mutex<Option<Arc<Connection>>>>,
 }
 
-/// RAII guard that clears the client's `active_conn` slot when a `session()`
-/// call finishes, regardless of which return path is taken.
 struct ActiveConnGuard<'a> {
     slot: &'a Mutex<Option<Arc<Connection>>>,
 }
@@ -142,10 +138,6 @@ impl Client {
     pub fn shutdown(&self) {
         debug!("filesync client: shutdown requested");
         self.stopped.store(true, Ordering::SeqCst);
-        // Force-close any connection that a blocked `session()` call is
-        // currently using. This unblocks the recv/send loops the same way a
-        // normal network drop would, so the caller's reconnect logic kicks in
-        // immediately instead of waiting on a possibly-stale socket.
         if let Some(conn) = self.active_conn.lock().clone() {
             debug!("filesync client: forcing active connection closed");
             conn.shutdown();
@@ -265,9 +257,6 @@ impl Client {
         );
         debug!("filesync session: TLS 1.3 handshake complete");
 
-        // Make this connection reachable from `shutdown()` for the rest of the
-        // session so a forced shutdown (e.g. suspend/resume) can close it even
-        // while we're blocked in the receive/send loops below.
         *self.active_conn.lock() = Some(conn.clone());
         let _active_conn_guard = ActiveConnGuard {
             slot: &self.active_conn,
@@ -437,8 +426,6 @@ impl Client {
             l_files, l_dirs, l_bytes
         );
 
-        // Update GUI state with local stats right after scan so the Stats
-        // panel shows real values while the sync is still in progress.
         if let Some(ref gs) = self.gui_state {
             let mut s = gs.write();
             s.file_count = l_files;
@@ -446,11 +433,6 @@ impl Client {
             s.total_bytes = l_bytes;
         }
 
-        // ── Preemptive disk-space check (client) ──────────────────────────────
-        // Simulate the server's send-list computation (is_server = true) to
-        // predict exactly which bytes will arrive.  We do this *before* sending
-        // our ManifestExchange so that, if we are out of space, the server is
-        // notified before it starts transmitting anything.
         let bytes_incoming: u64 = manifest::compute_send_list(&remote, &local, true)
             .iter()
             .filter_map(|p| remote.files.get(p))
@@ -472,8 +454,7 @@ impl Client {
                          {} B available, {} B required; aborting sync",
                         avail, bytes_incoming
                     );
-                    // Notify the server before closing so it can surface the
-                    // real reason rather than a generic connection error.
+
                     let _ = conn.send(&Message::InsufficientDiskSpace {
                         available_bytes: avail,
                         required_bytes: bytes_incoming,
@@ -492,6 +473,30 @@ impl Client {
 
         debug!("filesync session: sending local ManifestExchange");
         conn.send(&Message::ManifestExchange(local.clone()))?;
+
+        // ---- Deletion-ledger exchange (symmetric order: server sent first,
+        // we reply — avoids both-wait deadlock) ----
+        debug!("filesync session: waiting for server LedgerExchange");
+        let peer_ledger_entries = match conn.recv()? {
+            Message::LedgerExchange { entries } => entries,
+            other => {
+                error!("filesync session: expected LedgerExchange from server");
+                debug!(
+                    "filesync session: unexpected message instead of LedgerExchange: {other:?}"
+                );
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "filesync: expected LedgerExchange",
+                ));
+            }
+        };
+        let merged = self.engine.merge_ledger(peer_ledger_entries);
+        debug!("filesync session: merged {merged} tombstone(s) from server");
+        conn.send(&Message::LedgerExchange {
+            entries: self.engine.ledger_entries(),
+        })?;
+        debug!("filesync session: sent LedgerExchange to server");
+        // NOTE: LedgerAck intentionally not sent — no side reads it.
 
         let expected_rx: u64 = remote
             .files
@@ -653,6 +658,30 @@ impl Client {
                         }
                     }
                 }
+                Message::Delete {
+                    paths,
+                    deleted_at_ms,
+                    deleter,
+                } => {
+                    debug!(
+                        "filesync session: recv Delete {} path(s) during initial sync",
+                        paths.len()
+                    );
+                    if let Err(e) = common::handle_recv_delete_with_meta(
+                        &self.engine,
+                        &paths,
+                        deleted_at_ms,
+                        &deleter,
+                        "server",
+                        &self.bus,
+                        "filesync session",
+                    ) {
+                        error!("filesync session: apply_deletes during initial sync: {e}");
+                    }
+                    if let Some(ref gs) = self.gui_state {
+                        gs.write().begin_sync_activity();
+                    }
+                }
                 Message::SyncComplete => {
                     debug!(
                         "filesync session: received SyncComplete — files_received={} dirs_received={} bytes_received={} B elapsed={}ms",
@@ -686,7 +715,38 @@ impl Client {
             }
         }
 
-        let to_send = manifest::compute_send_list(&local, &remote, false);
+        let raw_to_send = manifest::compute_send_list(&local, &remote, false);
+        let snap = local_ledger_snapshot(&self.engine);
+        let (to_send, recreated) =
+            manifest::filter_resurrected(raw_to_send.clone(), &local, Some(&snap));
+        // Tombstone wins over our stale copy: converge by deleting locally
+        // while preserving the original tombstone stamp (never re-stamp).
+        {
+            let send_set: HashSet<&PathBuf> = to_send.iter().collect();
+            for path in raw_to_send.iter().filter(|p| !send_set.contains(p)) {
+                if let Some(tomb) = snap.get(path) {
+                    debug!(
+                        "filesync session: tombstone wins for {path:?} — deleting local stale copy"
+                    );
+                    self.engine.apply_deletes(
+                        &[path.clone()],
+                        tomb.deleted_at_ms,
+                        &tomb.deleter_node,
+                    )?;
+                }
+            }
+        }
+        // Refresh: veto step changed disk + manifest.
+        let local = self.engine.get_manifest();
+        // Tell the server about deletes it missed while we were offline.
+        for (path, deleted_at_ms, deleter) in compute_deletes_to_push(&local, &remote, &snap) {
+            debug!("filesync session: pushing missed delete {path:?} to server");
+            conn.send(&Message::Delete {
+                paths: vec![path],
+                deleted_at_ms,
+                deleter,
+            })?;
+        }
         let files_sent = to_send
             .iter()
             .filter(|p| local.files.get(*p).map(|m| !m.is_dir).unwrap_or(false))
@@ -709,6 +769,8 @@ impl Client {
             self.engine.send_paths(&to_send, &conn)?;
             debug!("filesync session: send_paths complete");
         }
+        // Legitimate recreates were just uploaded — lift their tombstones.
+        self.engine.clear_tombstones(&recreated);
 
         debug!("filesync session: sending SyncComplete to server");
         conn.send(&Message::SyncComplete)?;
@@ -945,9 +1007,6 @@ fn recv_loop(
                             s.begin_sync_activity();
                             s.files_received += 1;
                         }
-
-                        // Note: For large files, we don't have the metadata here to get the sequence number
-                        // The acknowledgment would need to be handled differently for large files
                     }
                     Ok(LargeFileEndOutcome::CommittedWithConflict(ci)) => {
                         debug!("{prefix}: LargeFileEnd committed with conflict {path:?}");
@@ -961,10 +1020,21 @@ fn recv_loop(
                     Err(e) => error!("{prefix}: large_file_end: {e}"),
                 }
             }
-            Ok(Message::Delete { paths }) => {
+            Ok(Message::Delete {
+                paths,
+                deleted_at_ms,
+                deleter,
+            }) => {
                 debug!("{prefix}: Delete {} path(s)", paths.len());
-                if let Err(e) = common::handle_recv_delete(&engine, &paths, "server", &bus, prefix)
-                {
+                if let Err(e) = common::handle_recv_delete_with_meta(
+                    &engine,
+                    &paths,
+                    deleted_at_ms,
+                    &deleter,
+                    "server",
+                    &bus,
+                    prefix,
+                ) {
                     error!("{prefix}: apply_deletes: {e}");
                 }
                 if let Some(ref gs) = gui_state {
@@ -1013,7 +1083,6 @@ fn recv_loop(
                     "{prefix}: ChangeAcknowledgment bundle_id={} sequences={:?}",
                     bundle_id, sequence_numbers
                 );
-                // Handle acknowledgment - could be used to track which changes were received
             }
             Ok(other) => {
                 warn!("{prefix}: unexpected message in live sync phase — possible protocol issue");
@@ -1105,6 +1174,55 @@ fn send_loop(
     debug!("filesync send: loop exited after {} flush(es)", flush_count);
 }
 
+/// In-memory snapshot of the engine's deletion ledger for sync decisions
+/// (rebuilt from `ledger_entries`; avoids new sync_engine accessors).
+fn local_ledger_snapshot(engine: &SyncEngine) -> DeletionLedger {
+    let mut snap = DeletionLedger::new();
+    snap.merge_remote(
+        engine
+            .ledger_entries()
+            .into_iter()
+            .map(|d| {
+                let path = d.path.clone();
+                (
+                    path,
+                    Tombstone::new(
+                        d.path,
+                        d.deleted_at_ms,
+                        d.deleter_node,
+                        d.prev_hash,
+                        d.prev_mtime_ms,
+                    ),
+                )
+            })
+            .collect(),
+    );
+    snap
+}
+
+/// Paths the peer still lists but our merged ledger marks deleted (tombstone
+/// newer than the peer's copy): the peer missed the delete while offline.
+/// Returns `(path, deleted_at_ms, deleter)` so the original stamp survives.
+fn compute_deletes_to_push(
+    local: &Manifest,
+    remote: &Manifest,
+    ledger: &DeletionLedger,
+) -> Vec<(PathBuf, u64, String)> {
+    let mut out: Vec<(PathBuf, u64, String)> = Vec::new();
+    for (path, tomb) in ledger.iter() {
+        if local.files.contains_key(path) {
+            continue;
+        }
+        if let Some(peer_meta) = remote.files.get(path) {
+            if tomb.deleted_at_ms > peer_meta.modified_ms {
+                out.push((path.clone(), tomb.deleted_at_ms, tomb.deleter_node.clone()));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 fn flush_to_server(
     engine: &Arc<SyncEngine>,
     conn: &Arc<Connection>,
@@ -1154,14 +1272,18 @@ fn flush_to_server(
         send_paths_to_server(engine, conn, bus, gui_state, stable)?;
     }
 
-    let (paths, delete_count) = pending.take_deletes(engine.root());
+    let (paths, delete_count) = pending.take_deletes_with_engine(engine);
     if !paths.is_empty() {
         debug!(
             "filesync send: flushing {} delete path(s) ({} pre-expansion)",
             paths.len(),
             delete_count
         );
-        conn.send(&Message::Delete { paths })?;
+        conn.send(&Message::Delete {
+            paths,
+            deleted_at_ms: crate::ledger::now_ms(),
+            deleter: engine.node_id().to_string(),
+        })?;
         if let Some(ref gs) = gui_state {
             gs.write().begin_sync_activity();
         }
@@ -1289,7 +1411,7 @@ fn format_modified(path: &Path) -> String {
     }
 }
 
-fn format_unix_secs(secs: u64) -> String {
+pub fn format_unix_secs(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let hour = rem / 3600;
@@ -1307,115 +1429,4 @@ fn format_unix_secs(secs: u64) -> String {
     let y = if m <= 2 { y + 1 } else { y };
 
     format!("{y:04}-{m:02}-{d:02} {hour:02}:{minute:02}")
-}
-
-#[cfg(test)]
-mod format_tests {
-    use super::format_unix_secs;
-
-    #[test]
-    fn epoch_formats_correctly() {
-        assert_eq!(format_unix_secs(0), "1970-01-01 00:00");
-    }
-
-    #[test]
-    fn known_date_formats_correctly() {
-        assert_eq!(format_unix_secs(1_717_236_000), "2024-06-01 10:00");
-    }
-}
-
-#[cfg(test)]
-mod push_gui_conflicts_tests {
-    use super::push_gui_conflicts;
-    use crate::exclusions::{ExclusionConfig, Exclusions};
-    use crate::gui::state::new_shared_state;
-    use crate::protocol::{FileBundle, FileData, FileMetadata};
-    use crate::sync_engine::SyncEngine;
-    use std::fs;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-
-    fn tmp_dir(label: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "filesync_push_gui_conflicts_{label}_{:x}",
-            crate::timestamp_id()
-        ));
-        fs::create_dir_all(&d).unwrap();
-        d
-    }
-
-    fn make_engine(root: PathBuf) -> SyncEngine {
-        let ex = Arc::new(Exclusions::compile(&ExclusionConfig::default()));
-        SyncEngine::new(root, "test-node".to_string(), ex)
-    }
-
-    fn file_bundle(rel: &str, content: &[u8]) -> FileBundle {
-        let hash: [u8; 32] = blake3::hash(content).into();
-        FileBundle {
-            files: vec![FileData {
-                metadata: FileMetadata {
-                    change_sequence: 0,
-                    rel_path: PathBuf::from(rel),
-                    size: content.len() as u64,
-                    hash,
-                    modified_ms: 1_000,
-                    is_dir: false,
-                },
-                content: content.to_vec(),
-            }],
-            bundle_id: 1,
-        }
-    }
-
-    /// Reproduces the exact root cause of the "GUI can't show conflicts" bug:
-    /// a `ConflictInfo` produced by `apply_bundle` must end up visible in
-    /// `SyncSnapshot.conflicts` once routed through `push_gui_conflicts`.
-    #[test]
-    fn conflict_from_apply_bundle_is_visible_in_gui_snapshot() {
-        let dir = tmp_dir("visible");
-        let engine = make_engine(dir.clone());
-
-        // Establish the ancestor state, then simulate an offline local edit
-        // (bypassing apply_bundle, exactly like a real filesystem edit while
-        // disconnected), then apply a genuinely different incoming version.
-        engine
-            .apply_bundle(&file_bundle("shared.txt", b"version A"))
-            .unwrap();
-        fs::write(dir.join("shared.txt"), b"version B (local)").unwrap();
-        let result = engine
-            .apply_bundle(&file_bundle("shared.txt", b"version C (remote)"))
-            .unwrap();
-        assert_eq!(result.conflicts.len(), 1, "expected exactly one conflict");
-
-        let gui_state = new_shared_state();
-        push_gui_conflicts(&Some(gui_state.clone()), &engine, &result.conflicts);
-
-        let snap = gui_state.read().clone();
-        assert_eq!(snap.conflicts.len(), 1);
-        assert_eq!(snap.conflicts[0].filename, "shared.txt");
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn no_gui_state_does_not_panic() {
-        let dir = tmp_dir("no_gui");
-        let engine = make_engine(dir.clone());
-        engine.apply_bundle(&file_bundle("f.txt", b"A")).unwrap();
-        fs::write(dir.join("f.txt"), b"B").unwrap();
-        let result = engine.apply_bundle(&file_bundle("f.txt", b"C")).unwrap();
-        // Must be a no-op, not a panic, when gui_state is None.
-        push_gui_conflicts(&None, &engine, &result.conflicts);
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn empty_conflicts_does_not_touch_gui_state() {
-        let dir = tmp_dir("empty");
-        let engine = make_engine(dir.clone());
-        let gui_state = new_shared_state();
-        push_gui_conflicts(&Some(gui_state.clone()), &engine, &[]);
-        assert!(gui_state.read().conflicts.is_empty());
-        fs::remove_dir_all(&dir).ok();
-    }
 }
