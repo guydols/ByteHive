@@ -1,5 +1,6 @@
 use crate::bundler;
 use crate::exclusions::Exclusions;
+use crate::ledger::{now_ms, DeletionLedger, Tombstone, DELETION_LEDGER_TTL_MS};
 use crate::manifest;
 use crate::protocol::FILE_STABILITY_MS;
 use crate::protocol::*;
@@ -101,6 +102,7 @@ pub struct SyncEngine {
     root: PathBuf,
     node_id: String,
     manifest: RwLock<Manifest>,
+    ledger: RwLock<DeletionLedger>,
     suppressed: Arc<RwLock<HashSet<PathBuf>>>,
     suppressed_deletes: Arc<RwLock<HashSet<PathBuf>>>,
     in_progress: RwLock<HashMap<PathBuf, LargeFileAssembly>>,
@@ -190,11 +192,13 @@ impl SyncEngine {
             }
         );
         let trash_manager = TrashManager::new(root.clone(), config.trash_expiry_days);
+        let ledger = DeletionLedger::load(&root);
         Self {
             manifest: RwLock::new(Manifest {
                 files: HashMap::new(),
                 node_id: node_id.clone(),
             }),
+            ledger: RwLock::new(ledger),
             root,
             node_id,
             suppressed: Arc::new(RwLock::new(HashSet::new())),
@@ -301,6 +305,7 @@ impl SyncEngine {
             root: self.root.clone(),
             node_id: self.node_id.clone(),
             manifest: RwLock::new(self.manifest.read().clone()),
+            ledger: RwLock::new(self.ledger.read().clone()),
             suppressed: self.suppressed.clone(),
             suppressed_deletes: self.suppressed_deletes.clone(),
             in_progress: RwLock::new(HashMap::new()),
@@ -339,11 +344,127 @@ impl SyncEngine {
     pub fn scan(&self) -> std::io::Result<Manifest> {
         let m = manifest::build_manifest(&self.root, &self.node_id, &self.exclusions)?;
         *self.manifest.write() = m.clone();
+        // Cheap upkeep (persisted only when entries actually expire).
+        self.prune_ledger();
         Ok(m)
     }
 
     pub fn get_manifest(&self) -> Manifest {
         self.manifest.read().clone()
+    }
+
+    // ---- Deletion ledger (tombstones) ----
+
+    /// Record a deletion tombstone and persist the ledger (best effort:
+    /// save errors are logged, not propagated).
+    pub fn record_delete(
+        &self,
+        path: PathBuf,
+        deleted_at_ms: u64,
+        deleter: &str,
+        prev_hash: Option<String>,
+        prev_mtime_ms: Option<u64>,
+    ) {
+        self.ledger.write().record(
+            path,
+            deleted_at_ms,
+            deleter.to_string(),
+            prev_hash,
+            prev_mtime_ms,
+        );
+        if let Err(e) = self.ledger.read().save_atomic(&self.root) {
+            log::warn!("ledger: save after record failed: {e}");
+        }
+    }
+
+    /// Merge remote tombstones (LWW per path) and persist. Returns the
+    /// number of DTOs received.
+    pub fn merge_ledger(&self, dtos: Vec<TombstoneDto>) -> usize {
+        let n = dtos.len();
+        if n == 0 {
+            return 0;
+        }
+        let remote: HashMap<PathBuf, Tombstone> = dtos
+            .into_iter()
+            .map(|d| {
+                let path = d.path.clone();
+                (
+                    path,
+                    Tombstone::new(
+                        d.path,
+                        d.deleted_at_ms,
+                        d.deleter_node,
+                        d.prev_hash,
+                        d.prev_mtime_ms,
+                    ),
+                )
+            })
+            .collect();
+        self.ledger.write().merge_remote(remote);
+        if let Err(e) = self.ledger.read().save_atomic(&self.root) {
+            log::warn!("ledger: save after merge failed: {e}");
+        }
+        n
+    }
+
+    /// Snapshot local tombstones as DTOs for a LedgerExchange.
+    pub fn ledger_entries(&self) -> Vec<TombstoneDto> {
+        self.ledger
+            .read()
+            .iter()
+            .map(|(_, t)| TombstoneDto {
+                path: t.path.clone(),
+                deleted_at_ms: t.deleted_at_ms,
+                deleter_node: t.deleter_node.clone(),
+                prev_hash: t.prev_hash.clone(),
+                prev_mtime_ms: t.prev_mtime_ms,
+            })
+            .collect()
+    }
+
+    /// Returns true if a tombstone for `path` exists and is strictly newer
+    /// than `mtime_ms`.
+    pub fn has_tombstone_newer_than(&self, path: &Path, mtime_ms: u64) -> bool {
+        self.ledger.read().has_newer_than(path, mtime_ms)
+    }
+
+    /// Drop tombstones older than the 90-day TTL. Persists only when at
+    /// least one entry was pruned. Returns the number removed.
+    pub fn prune_ledger(&self) -> usize {
+        let pruned = self
+            .ledger
+            .write()
+            .prune(now_ms(), DELETION_LEDGER_TTL_MS);
+        if pruned > 0 {
+            if let Err(e) = self.ledger.read().save_atomic(&self.root) {
+                log::warn!("ledger: save after prune failed: {e}");
+            } else {
+                log::info!("ledger: pruned {pruned} expired tombstone(s)");
+            }
+        }
+        pruned
+    }
+
+    /// Clear tombstones for legitimately recreated paths (recreate win)
+    /// and persist once. Used with [`crate::manifest::filter_resurrected`].
+    pub fn clear_tombstones(&self, paths: &[PathBuf]) {
+        if paths.is_empty() {
+            return;
+        }
+        let mut removed_any = false;
+        {
+            let mut ledger = self.ledger.write();
+            for p in paths {
+                if ledger.remove(p).is_some() {
+                    removed_any = true;
+                }
+            }
+        }
+        if removed_any {
+            if let Err(e) = self.ledger.read().save_atomic(&self.root) {
+                log::warn!("ledger: save after clear failed: {e}");
+            }
+        }
     }
 
     pub fn send_paths(&self, paths: &[PathBuf], conn: &Arc<Connection>) -> std::io::Result<()> {
@@ -802,9 +923,16 @@ impl SyncEngine {
         Ok(())
     }
 
-    pub fn apply_deletes(&self, paths: &[PathBuf]) -> std::io::Result<usize> {
+    pub fn apply_deletes(
+        &self,
+        paths: &[PathBuf],
+        deleted_at_ms: u64,
+        deleter: &str,
+    ) -> std::io::Result<usize> {
         let mut removed = Vec::new();
         let mut count = 0usize;
+        // Stage tombstone data in memory; persist once at the end.
+        let mut tombstones: Vec<(PathBuf, Option<String>, Option<u64>)> = Vec::new();
 
         for rel in paths {
             if !safe_relative(rel) {
@@ -813,6 +941,15 @@ impl SyncEngine {
 
             self.suppressed_deletes.write().insert(rel.clone());
             removed.push(rel.clone());
+
+            // Snapshot manifest info BEFORE removal for the tombstone.
+            let (prev_hash, prev_mtime_ms) = self
+                .manifest
+                .read()
+                .files
+                .get(rel)
+                .map(|m| (Some(crate::hex(&m.hash)), Some(m.modified_ms)))
+                .unwrap_or((None, None));
 
             let full = self.root.join(rel);
             if full.is_dir() {
@@ -834,7 +971,29 @@ impl SyncEngine {
                 self.trash_manager.move_to_trash(&full, rel, &self.node_id);
                 self.manifest.write().files.remove(rel);
             }
+            // Record ALWAYS, even when the file was absent on disk and no
+            // manifest entry existed (fixes the silent-absent gap: the peer
+            // may still hold the file and would otherwise resurrect it).
+            tombstones.push((rel.clone(), prev_hash, prev_mtime_ms));
             count += 1;
+        }
+
+        if !tombstones.is_empty() {
+            {
+                let mut ledger = self.ledger.write();
+                for (path, prev_hash, prev_mtime_ms) in tombstones {
+                    ledger.record(
+                        path,
+                        deleted_at_ms,
+                        deleter.to_string(),
+                        prev_hash,
+                        prev_mtime_ms,
+                    );
+                }
+            }
+            if let Err(e) = self.ledger.read().save_atomic(&self.root) {
+                log::warn!("ledger: save after apply_deletes failed: {e}");
+            }
         }
 
         self.schedule_unsuppress_deletes(removed);
