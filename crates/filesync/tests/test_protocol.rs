@@ -79,14 +79,22 @@ fn roundtrip_bundle() {
 fn roundtrip_delete() {
     let msg = Message::Delete {
         paths: vec![PathBuf::from("a.txt"), PathBuf::from("sub/b.txt")],
+        deleted_at_ms: 1_700_000_000_000,
+        deleter: "test-node".to_string(),
     };
     let frame = serialise_message(&msg).unwrap();
     let mut cur = Cursor::new(frame);
     match read_message(&mut cur).unwrap() {
-        Message::Delete { paths } => {
+        Message::Delete {
+            paths,
+            deleted_at_ms,
+            deleter,
+        } => {
             assert_eq!(paths.len(), 2);
             assert_eq!(paths[0], PathBuf::from("a.txt"));
             assert_eq!(paths[1], PathBuf::from("sub/b.txt"));
+            assert_eq!(deleted_at_ms, 1_700_000_000_000);
+            assert_eq!(deleter, "test-node");
         }
         _ => panic!("expected Delete"),
     }
@@ -331,9 +339,13 @@ fn roundtrip_hello_no_credential() {
 fn delete_message_length_prefix_is_consistent() {
     let msg1 = Message::Delete {
         paths: vec![PathBuf::from("a.txt")],
+        deleted_at_ms: 1,
+        deleter: String::new(),
     };
     let msg2 = Message::Delete {
         paths: vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")],
+        deleted_at_ms: 1,
+        deleter: String::new(),
     };
     let frame1 = serialise_message(&msg1).unwrap();
     let frame2 = serialise_message(&msg2).unwrap();
