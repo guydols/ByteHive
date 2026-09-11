@@ -7,6 +7,12 @@ use bytehive_filesync::{
     manifest::{build_manifest, compute_send_list, filter_resurrected},
     protocol::{FileMetadata, Manifest},
 };
+use std::collections::HashSet;
+
+/// Uncached `build_manifest` wrapper returning just the manifest.
+fn build(dir: &PathBuf, node: &str, excl: &Exclusions) -> std::io::Result<Manifest> {
+    build_manifest(dir, node, excl, None, &HashSet::new()).map(|t| t.0)
+}
 
 fn no_exclusions() -> Exclusions {
     Exclusions::compile(&ExclusionConfig::default())
@@ -49,7 +55,7 @@ fn make_manifest(entries: &[(&str, u64, [u8; 32], bool, u64)], node: &str) -> Ma
 #[test]
 fn build_manifest_empty_directory() {
     let dir = tmp_dir("empty");
-    let m = build_manifest(&dir, "node-1", &no_exclusions()).unwrap();
+    let m = build(&dir, "node-1", &no_exclusions()).unwrap();
     assert_eq!(m.node_id, "node-1");
     assert!(m.files.is_empty(), "empty root must produce empty manifest");
     std::fs::remove_dir_all(&dir).unwrap();
@@ -61,7 +67,7 @@ fn build_manifest_single_file_hash_and_size() {
     let content = b"hello filesync";
     std::fs::write(dir.join("hello.txt"), content).unwrap();
 
-    let m = build_manifest(&dir, "n", &no_exclusions()).unwrap();
+    let m = build(&dir, "n", &no_exclusions()).unwrap();
     assert_eq!(m.files.len(), 1);
     let meta = m.files.get(&PathBuf::from("hello.txt")).unwrap();
     let expected: [u8; 32] = blake3::hash(content).into();
@@ -76,7 +82,7 @@ fn build_manifest_directory_entry_has_zero_hash() {
     let dir = tmp_dir("direntry");
     std::fs::create_dir_all(dir.join("subdir")).unwrap();
 
-    let m = build_manifest(&dir, "n", &no_exclusions()).unwrap();
+    let m = build(&dir, "n", &no_exclusions()).unwrap();
     let meta = m.files.get(&PathBuf::from("subdir")).unwrap();
     assert!(meta.is_dir);
     assert_eq!(meta.size, 0);
@@ -91,7 +97,7 @@ fn build_manifest_nested_files_and_dirs() {
     std::fs::write(dir.join("a/b/deep.txt"), b"deep").unwrap();
     std::fs::write(dir.join("root.txt"), b"root").unwrap();
 
-    let m = build_manifest(&dir, "n", &no_exclusions()).unwrap();
+    let m = build(&dir, "n", &no_exclusions()).unwrap();
     assert!(m.files.contains_key(&PathBuf::from("a")));
     assert!(m.files.contains_key(&PathBuf::from("a/b")));
     assert!(m.files.contains_key(&PathBuf::from("a/b/deep.txt")));
@@ -109,7 +115,7 @@ fn build_manifest_respects_glob_exclusion() {
         exclude_patterns: vec!["*.log".to_string()],
         exclude_regex: vec![],
     });
-    let m = build_manifest(&dir, "n", &excl).unwrap();
+    let m = build(&dir, "n", &excl).unwrap();
     assert!(m.files.contains_key(&PathBuf::from("keep.txt")));
     assert!(!m.files.contains_key(&PathBuf::from("skip.log")));
     std::fs::remove_dir_all(&dir).unwrap();
@@ -125,7 +131,7 @@ fn build_manifest_respects_regex_exclusion() {
         exclude_patterns: vec![],
         exclude_regex: vec![r".*\.tmp$".to_string()],
     });
-    let m = build_manifest(&dir, "n", &excl).unwrap();
+    let m = build(&dir, "n", &excl).unwrap();
     assert!(!m.files.contains_key(&PathBuf::from("file.tmp")));
     assert!(m.files.contains_key(&PathBuf::from("file.rs")));
     std::fs::remove_dir_all(&dir).unwrap();
@@ -134,7 +140,7 @@ fn build_manifest_respects_regex_exclusion() {
 #[test]
 fn build_manifest_node_id_is_preserved() {
     let dir = tmp_dir("nodeid");
-    let m = build_manifest(&dir, "my-special-node", &no_exclusions()).unwrap();
+    let m = build(&dir, "my-special-node", &no_exclusions()).unwrap();
     assert_eq!(m.node_id, "my-special-node");
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -219,7 +225,7 @@ fn build_manifest_excludes_filesync_tmp_dir() {
     std::fs::create_dir_all(dir.join(".bh_filesync/transfers")).unwrap();
     std::fs::write(dir.join(".bh_filesync/transfers/partial.tmp"), b"temp").unwrap();
     std::fs::write(dir.join("real.txt"), b"real").unwrap();
-    let m = build_manifest(&dir, "n", &no_exclusions()).unwrap();
+    let m = build(&dir, "n", &no_exclusions()).unwrap();
     assert!(m.files.contains_key(&PathBuf::from("real.txt")));
     assert!(
         !m.files.contains_key(&PathBuf::from(".bh_filesync")),
@@ -238,7 +244,7 @@ fn different_content_produces_different_hashes() {
     let dir = tmp_dir("diff_hash");
     std::fs::write(dir.join("a.bin"), b"content A").unwrap();
     std::fs::write(dir.join("b.bin"), b"content B").unwrap();
-    let m = build_manifest(&dir, "n", &no_exclusions()).unwrap();
+    let m = build(&dir, "n", &no_exclusions()).unwrap();
     let ha = m.files.get(&PathBuf::from("a.bin")).unwrap().hash;
     let hb = m.files.get(&PathBuf::from("b.bin")).unwrap().hash;
     assert_ne!(
