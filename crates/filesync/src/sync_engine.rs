@@ -2,6 +2,7 @@ use crate::bundler;
 use crate::exclusions::Exclusions;
 use crate::ledger::{now_ms, DeletionLedger, Tombstone, DELETION_LEDGER_TTL_MS};
 use crate::manifest;
+use crate::manifest_cache::ManifestCache;
 use crate::protocol::FILE_STABILITY_MS;
 use crate::protocol::*;
 use crate::transport::Connection;
@@ -130,19 +131,9 @@ pub fn conflict_copy_name(rel_path: &Path, node_id: &str, unix_secs: u64) -> Pat
 }
 
 fn hash_file(path: &Path) -> Option<[u8; 32]> {
-    use std::io::Read;
-    let file = fs::File::open(path).ok()?;
-    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
-    let mut hasher = blake3::Hasher::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = reader.read(&mut buf).ok()?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Some(hasher.finalize().into())
+    crate::manifest::hash_file_tiered(path)
+        .ok()
+        .map(|(_, hash)| hash)
 }
 
 fn cleanup_transfer_dirs(root: &Path, tmp_path: &Path) {
@@ -342,7 +333,38 @@ impl SyncEngine {
     }
 
     pub fn scan(&self) -> std::io::Result<Manifest> {
-        let m = manifest::build_manifest(&self.root, &self.node_id, &self.exclusions)?;
+        self.scan_with_dirty(&HashSet::new())
+    }
+
+    /// Full scan with a dirty-path set that bypasses the manifest hash cache
+    /// (e.g. watcher-pending paths). Drains nothing; defaults to empty via
+    /// [`SyncEngine::scan`].
+    pub fn scan_with_dirty(&self, dirty: &HashSet<PathBuf>) -> std::io::Result<Manifest> {
+        let total = std::time::Instant::now();
+        let cache = ManifestCache::load(&self.root);
+        let (m, mut updated, stats) = manifest::build_manifest(
+            &self.root,
+            &self.node_id,
+            &self.exclusions,
+            Some(&cache),
+            dirty,
+        )?;
+        if let Err(e) = updated.save_atomic(&self.root) {
+            log::warn!("filesync: manifest cache save failed: {e}");
+        }
+        log::info!(
+            "filesync: scan complete — {} file(s), {} dir(s), {} byte(s) in {}ms \
+             (walk {}ms, hash {}ms cpu, {:.1} MB/s, cache {} hit/{} miss)",
+            stats.files,
+            stats.dirs,
+            stats.bytes,
+            total.elapsed().as_millis(),
+            stats.walk_ms,
+            stats.hash_ms,
+            stats.hash_mb_s,
+            stats.cache_hits,
+            stats.cache_misses,
+        );
         *self.manifest.write() = m.clone();
         // Cheap upkeep (persisted only when entries actually expire).
         self.prune_ledger();

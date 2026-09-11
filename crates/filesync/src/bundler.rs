@@ -153,18 +153,11 @@ fn stream_large_file(
     );
 
     let hash_start = std::time::Instant::now();
+    // Unified tiered digest (mmap for big files, streaming otherwise);
+    // the chunk protocol below is unchanged.
     let final_hash: [u8; 32] = {
-        let mut hasher = blake3::Hasher::new();
-        let mut f = std::fs::File::open(&full)?;
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            let n = f.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-        }
-        hasher.finalize().into()
+        let (_, h) = crate::manifest::hash_file_tiered(&full)?;
+        h
     };
     debug!(
         "bundler: large file {:?} hash computed in {}ms",

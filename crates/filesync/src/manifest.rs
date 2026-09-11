@@ -1,106 +1,327 @@
 use crate::exclusions::Exclusions;
 use crate::ledger::DeletionLedger;
+use crate::manifest_cache::{inode_of, mtime_parts, CachedEntry, ManifestCache};
 use crate::protocol::{FileMetadata, Manifest, HASH_THREADS};
-use rayon::prelude::*;
-use std::io::Read;
+use crossbeam_channel::bounded;
+use std::collections::{HashMap, HashSet};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
-use walkdir::WalkDir;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Instant, SystemTime};
 
-fn hash_file_streaming(path: &Path) -> io::Result<(u64, [u8; 32])> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
-    let mut hasher = blake3::Hasher::new();
-    let mut buf = [0u8; 64 * 1024];
-    let mut size: u64 = 0;
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
+/// Files at or above this size try `update_mmap_rayon` first (with streaming
+/// fallback); everything else streams with a 256 KiB buffer.
+const TIER_MMAP_MIN_BYTES: u64 = 4 * 1024 * 1024;
+/// Streaming read buffer (also used for files under 128 KiB — a single read).
+const HASH_BUF_BYTES: usize = 256 * 1024;
+/// In-flight paths between the walker and the hash pool (backpressure).
+const WALK_CHANNEL_DEPTH: usize = 1024;
+/// Traversal threads for jwalk's isolated pool (see below).
+const TRAVERSAL_THREADS: usize = 4;
+
+/// Tiered blake3 digest shared by scan / conflict-check / large-file paths.
+/// Returns `(size, hash)`. Never switches algorithms (blake3 only).
+pub fn hash_file_tiered(path: &Path) -> io::Result<(u64, [u8; 32])> {
+    let size = std::fs::metadata(path)?.len();
+    if size >= TIER_MMAP_MIN_BYTES {
+        let mut hasher = blake3::Hasher::new();
+        match hasher.update_mmap_rayon(path) {
+            Ok(_) => return Ok((size, hasher.finalize().into())),
+            Err(e) => {
+                log::debug!(
+                    "hash_file_tiered: mmap failed for {path:?}, streaming fallback: {e}"
+                );
+            }
         }
-        hasher.update(&buf[..n]);
-        size += n as u64;
     }
+    let file = std::fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_reader(std::io::BufReader::with_capacity(HASH_BUF_BYTES, file))?;
     Ok((size, hasher.finalize().into()))
 }
 
-use std::io;
+fn parse_hex32(s: &str) -> Result<[u8; 32], ()> {
+    if s.len() != 64 {
+        return Err(());
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        let hi = (chunk[0] as char).to_digit(16).ok_or(())?;
+        let lo = (chunk[1] as char).to_digit(16).ok_or(())?;
+        out[i] = ((hi << 4) | lo) as u8;
+    }
+    Ok(out)
+}
 
-pub fn build_manifest(root: &Path, node_id: &str, exclusions: &Exclusions) -> io::Result<Manifest> {
-    if HASH_THREADS > 0 {
-        let _ = rayon::ThreadPoolBuilder::new()
-            .num_threads(HASH_THREADS)
-            .build_global();
+/// Per-scan metrics. `hash_ms` is summed cpu time across hash threads;
+/// `walk_ms` is walker wall time (the two overlap by design).
+#[derive(Debug, Clone, Default)]
+pub struct ScanStats {
+    pub walk_ms: u64,
+    pub hash_ms: u64,
+    pub files: usize,
+    pub dirs: usize,
+    pub bytes: u64,
+    pub cache_hits: usize,
+    pub cache_misses: usize,
+    pub hash_mb_s: f64,
+}
+
+struct BuildOutcome {
+    rel: PathBuf,
+    meta: FileMetadata,
+    cache_upsert: Option<(PathBuf, CachedEntry)>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hash_one(
+    root: &Path,
+    rel: &PathBuf,
+    cache: Option<&ManifestCache>,
+    dirty: &HashSet<PathBuf>,
+    hash_nanos: &AtomicU64,
+    hash_bytes: &AtomicU64,
+    hits: &AtomicUsize,
+    misses: &AtomicUsize,
+) -> Option<BuildOutcome> {
+    let full = root.join(rel);
+    let meta = std::fs::metadata(&full).ok()?;
+    let modified_ms = meta
+        .modified()
+        .ok()?
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+
+    if meta.is_dir() {
+        return Some(BuildOutcome {
+            rel: rel.clone(),
+            meta: FileMetadata {
+                rel_path: rel.clone(),
+                size: 0,
+                hash: [0u8; 32],
+                modified_ms,
+                change_sequence: 0,
+                is_dir: true,
+            },
+            cache_upsert: None,
+        });
     }
 
-    let paths: Vec<PathBuf> = WalkDir::new(root)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter_map(|e| {
-            let p = e.into_path();
-            let rel = p.strip_prefix(root).ok()?;
-            if rel.as_os_str().is_empty() {
-                return None;
+    // Fast path: trusted cache hit (stable + old + identity match).
+    if !dirty.contains(rel) {
+        if let Some(cache) = cache {
+            if let Some((mtime_s, mtime_ns)) = mtime_parts(&meta) {
+                let now = crate::ledger::now_ms();
+                if let Some(hex) = cache.lookup(
+                    rel,
+                    meta.len(),
+                    mtime_s,
+                    mtime_ns,
+                    inode_of(&meta),
+                    now,
+                ) {
+                    if let Ok(hash) = parse_hex32(&hex) {
+                        hits.fetch_add(1, Ordering::Relaxed);
+                        log::trace!("manifest: cache hit for {rel:?}");
+                        return Some(BuildOutcome {
+                            rel: rel.clone(),
+                            meta: FileMetadata {
+                                rel_path: rel.clone(),
+                                size: meta.len(),
+                                hash,
+                                modified_ms,
+                                change_sequence: 0,
+                                is_dir: false,
+                            },
+                            cache_upsert: None,
+                        });
+                    }
+                    // Corrupt cache payload: fall through and re-hash
+                    // (the upsert below self-heals the entry).
+                }
             }
+        }
+    }
 
-            if exclusions.is_excluded(rel) {
+    misses.fetch_add(1, Ordering::Relaxed);
+    let t = Instant::now();
+    let (size, hash) = hash_file_tiered(&full).ok()?;
+    hash_nanos.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    hash_bytes.fetch_add(size, Ordering::Relaxed);
+
+    let cache_upsert = mtime_parts(&meta).map(|(mtime_s, mtime_ns)| {
+        (
+            rel.clone(),
+            CachedEntry {
+                size,
+                mtime_s,
+                mtime_ns,
+                inode: inode_of(&meta),
+                hash: crate::hex(&hash),
+            },
+        )
+    });
+
+    Some(BuildOutcome {
+        rel: rel.clone(),
+        meta: FileMetadata {
+            rel_path: rel.clone(),
+            size,
+            hash,
+            modified_ms,
+            change_sequence: 0,
+            is_dir: false,
+        },
+        cache_upsert,
+    })
+}
+
+/// Build a manifest with a pipelined parallel scan: jwalk traverses on the
+/// calling thread and streams relative paths through a bounded channel to a
+/// dedicated rayon hash pool (`max(num_cpus, HASH_THREADS)` threads) —
+/// hashing overlaps walking, no full path vec is collected first.
+///
+/// `cache` enables the hash cache (see [`ManifestCache`]); `dirty` lists
+/// watcher-pending paths that bypass the cache (still re-cached after
+/// hashing). Returns `(manifest, updated_cache, stats)`; the caller owns
+/// pruning/saving the cache.
+pub fn build_manifest(
+    root: &Path,
+    node_id: &str,
+    exclusions: &Exclusions,
+    cache: Option<&ManifestCache>,
+    dirty: &HashSet<PathBuf>,
+) -> io::Result<(Manifest, ManifestCache, ScanStats)> {
+    let threads = num_cpus::get().max(HASH_THREADS);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("hash-{i}"))
+        .build()
+        .map_err(io::Error::other)?;
+
+    let (work_tx, work_rx) = bounded::<PathBuf>(WALK_CHANNEL_DEPTH);
+    let (res_tx, res_rx) = crossbeam_channel::unbounded::<BuildOutcome>();
+    let walk_ms = AtomicU64::new(0);
+    let hash_nanos = AtomicU64::new(0);
+    let hash_bytes = AtomicU64::new(0);
+    let hits = AtomicUsize::new(0);
+    let misses = AtomicUsize::new(0);
+
+    let root_p = root.to_path_buf();
+    // Shared metric refs (Copy) for the worker closures below.
+    let hash_nanos_r = &hash_nanos;
+    let hash_bytes_r = &hash_bytes;
+    let hits_r = &hits;
+    let misses_r = &misses;
+    pool.scope(|s| {
+        for _ in 0..threads {
+            let rx = work_rx.clone();
+            let tx = res_tx.clone();
+            let root_c = root_p.clone();
+            s.spawn(move |_| {
+                for rel in rx {
+                    if let Some(outcome) = hash_one(
+                        &root_c,
+                        &rel,
+                        cache,
+                        dirty,
+                        hash_nanos_r,
+                        hash_bytes_r,
+                        hits_r,
+                        misses_r,
+                    ) {
+                        if tx.send(outcome).is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+        // The scope thread walks: traversal overlaps hashing via backpressure.
+        // NOTE: skip_hidden(false) is required — walkdir parity (hidden files
+        // and .bh_filesync/ are visited, then filtered by exclusions below).
+        // NOTE: isolated RayonNewPool, NOT the rayon global pool — jwalk's
+        // default global-pool handshake (1s busy-timeout, silent abort) can
+        // misfire when many scans share a process, silently degrading to an
+        // EMPTY walk (empty manifest, data looks deleted). Sharing our hash
+        // pool would deadlock instead (all hash threads parked on recv while
+        // traversal waits for a thread). Verified by failing→passing repro;
+        // do not change this without a multi-scan-in-one-process test.
+        let wstart = Instant::now();
+        let walk_opts = jwalk::WalkDir::new(&root_p)
+            .skip_hidden(false)
+            .parallelism(jwalk::Parallelism::RayonNewPool(TRAVERSAL_THREADS));
+        for entry in walk_opts {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let full = entry.path();
+            let rel = match full.strip_prefix(&root_p) {
+                Ok(r) if !r.as_os_str().is_empty() => r.to_path_buf(),
+                _ => continue,
+            };
+            if exclusions.is_excluded(&rel) {
                 log::debug!(
                     "manifest: skipping {:?} (rule: {:?})",
                     rel,
-                    exclusions.matching_rule(rel)
+                    exclusions.matching_rule(&rel)
                 );
-                return None;
+                continue;
             }
-            Some(p)
-        })
-        .collect();
-
-    let entries: Vec<(PathBuf, FileMetadata)> = paths
-        .par_iter()
-        .filter_map(|full| {
-            let rel = full.strip_prefix(root).ok()?.to_path_buf();
-            let meta = std::fs::metadata(full).ok()?;
-            let modified_ms = meta
-                .modified()
-                .ok()?
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .ok()?
-                .as_millis() as u64;
-
-            if meta.is_dir() {
-                return Some((
-                    rel.clone(),
-                    FileMetadata {
-                        rel_path: rel,
-                        size: 0,
-                        hash: [0u8; 32],
-                        modified_ms,
-                        change_sequence: 0,
-                        is_dir: true,
-                    },
-                ));
+            if work_tx.send(rel).is_err() {
+                break;
             }
+        }
+        walk_ms.store(wstart.elapsed().as_millis() as u64, Ordering::Relaxed);
+        drop(work_tx);
+    });
+    drop(work_rx);
+    drop(res_tx);
 
-            let (size, hash) = hash_file_streaming(full).ok()?;
+    let mut files_map: HashMap<PathBuf, FileMetadata> = HashMap::new();
+    let mut updated = cache.cloned().unwrap_or_default();
+    let mut dirs = 0usize;
+    for outcome in res_rx {
+        if outcome.meta.is_dir {
+            dirs += 1;
+        }
+        if let Some((p, e)) = outcome.cache_upsert {
+            updated.upsert(p, e);
+        }
+        files_map.insert(outcome.rel, outcome.meta);
+    }
+    let files = files_map.values().filter(|m| !m.is_dir).count();
+    let bytes: u64 = files_map.values().map(|m| m.size).sum();
+    let existing: HashSet<PathBuf> = files_map.keys().cloned().collect();
+    updated.prune_missing(&existing);
 
-            Some((
-                rel.clone(),
-                FileMetadata {
-                    rel_path: rel,
-                    size,
-                    hash,
-                    modified_ms,
-                    change_sequence: 0,
-                    is_dir: false,
-                },
-            ))
-        })
-        .collect();
+    let nanos = hash_nanos.load(Ordering::Relaxed);
+    let hbytes = hash_bytes.load(Ordering::Relaxed);
+    let stats = ScanStats {
+        walk_ms: walk_ms.load(Ordering::Relaxed),
+        hash_ms: (nanos / 1_000_000) as u64,
+        files,
+        dirs,
+        bytes,
+        cache_hits: hits.load(Ordering::Relaxed),
+        cache_misses: misses.load(Ordering::Relaxed),
+        hash_mb_s: if nanos > 0 {
+            hbytes as f64 / (nanos as f64 / 1e9) / 1e6
+        } else {
+            0.0
+        },
+    };
 
-    Ok(Manifest {
-        files: entries.into_iter().collect(),
-        node_id: node_id.to_string(),
-    })
+    Ok((
+        Manifest {
+            files: files_map,
+            node_id: node_id.to_string(),
+        },
+        updated,
+        stats,
+    ))
 }
 
 pub fn compute_send_list(local: &Manifest, remote: &Manifest, is_server: bool) -> Vec<PathBuf> {
