@@ -116,6 +116,14 @@ pub enum Message {
         from: PathBuf,
         to: PathBuf,
     },
+    // NOTE: a `move_id: u64` (e.g. `timestamp_id()`) was considered for
+    // Rename dedup, but is deliberately omitted: `Message` is serialised
+    // with bincode (positional, not self-describing), so adding a field
+    // breaks wire compat with older peers (old bytes fail to decode, and
+    // new bytes fail on old peers). Dedup instead relies on the idempotent
+    // `apply_rename` (source-absent + dst-present converges the manifest
+    // and returns Ok). If a move id is ever added, it needs a protocol
+    // version bump plus dual-decode handling.
 
     InsufficientDiskSpace {
         available_bytes: u64,

@@ -317,7 +317,29 @@ impl SyncEngine {
     }
 
     pub fn restore_trash_entry(&self, id: &str) -> Result<(), String> {
-        self.trash_manager.restore_entry(id)
+        // Capture the original path first so a successful restore can lift
+        // the tombstones covering that prefix (otherwise the next send
+        // would veto the restored file as a resurrection).
+        let original: Option<PathBuf> = self
+            .trash_manager
+            .list_trash()
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.original_path.clone());
+        let result = self.trash_manager.restore_entry(id);
+        if result.is_ok() {
+            if let Some(prefix) = original {
+                let to_clear: Vec<PathBuf> = self
+                    .ledger
+                    .read()
+                    .iter()
+                    .filter(|(k, _)| *k == &prefix || k.strip_prefix(&prefix).is_ok())
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                self.clear_tombstones(&to_clear);
+            }
+        }
+        result
     }
 
     pub fn purge_trash_entry(&self, id: &str) -> Result<(), String> {
@@ -450,6 +472,46 @@ impl SyncEngine {
         self.ledger.read().has_newer_than(path, mtime_ms)
     }
 
+    /// Covering-tombstone veto: delegates to
+    /// [`DeletionLedger::covering_tombstone`] (nearest tombstone at `path`
+    /// or any ancestor). Returns the tombstoned path when it vetoes `path`
+    /// at `incoming_mtime_ms` (tombstone strictly newer than the incoming
+    /// mtime); returns `None` when there is no covering tombstone or the
+    /// incoming write is a legitimate recreate (incoming mtime strictly
+    /// newer — see `clear_tombstone_on_recreate`).
+    pub fn covering_tombstone_veto(
+        &self,
+        path: &Path,
+        incoming_mtime_ms: u64,
+    ) -> Option<PathBuf> {
+        let ledger = self.ledger.read();
+        match ledger.covering_tombstone(path) {
+            Some(t) if t.deleted_at_ms > incoming_mtime_ms => Some(t.path.clone()),
+            _ => None,
+        }
+    }
+
+    /// Clear the exact-path tombstone when an incoming write is a
+    /// legitimate recreate (incoming mtime strictly newer than the
+    /// tombstone). Persists only when something was removed. Returns true
+    /// when a tombstone was lifted.
+    fn clear_tombstone_on_recreate(&self, path: &Path, incoming_mtime_ms: u64) -> bool {
+        let should_clear = self
+            .ledger
+            .read()
+            .get(path)
+            .map(|t| incoming_mtime_ms > t.deleted_at_ms)
+            .unwrap_or(false);
+        if should_clear {
+            self.ledger.write().remove(path);
+            if let Err(e) = self.ledger.read().save_atomic(&self.root) {
+                log::warn!("ledger: save after recreate-clear failed: {e}");
+            }
+            return true;
+        }
+        false
+    }
+
     /// Drop tombstones older than the 90-day TTL. Persists only when at
     /// least one entry was pruned. Returns the number removed.
     pub fn prune_ledger(&self) -> usize {
@@ -572,6 +634,26 @@ impl SyncEngine {
                 continue;
             }
 
+            // Live resurrection guard: veto writes covered by a tombstone
+            // strictly newer than the incoming mtime (path or ancestor).
+            // A strictly newer incoming mtime is a legitimate recreate and
+            // lifts the exact-path tombstone instead.
+            if let Some(tomb_path) =
+                self.covering_tombstone_veto(&fd.metadata.rel_path, fd.metadata.modified_ms)
+            {
+                log::warn!(
+                    "apply_bundle: vetoing {:?} (covering tombstone {:?} beats incoming mtime {})",
+                    fd.metadata.rel_path,
+                    tomb_path,
+                    fd.metadata.modified_ms,
+                );
+                continue;
+            }
+            self.clear_tombstone_on_recreate(
+                &fd.metadata.rel_path,
+                fd.metadata.modified_ms,
+            );
+
             let full = self.root.join(&fd.metadata.rel_path);
 
             if !fd.metadata.is_dir {
@@ -658,6 +740,22 @@ impl SyncEngine {
             warn!("rejected unsafe large-file path: {:?}", metadata.rel_path);
             return Ok(());
         }
+
+        // Live resurrection guard (same policy as apply_bundle): veto the
+        // stream setup when a covering tombstone beats the incoming mtime;
+        // lift the exact tombstone on a legitimate recreate.
+        if let Some(tomb_path) =
+            self.covering_tombstone_veto(&metadata.rel_path, metadata.modified_ms)
+        {
+            log::warn!(
+                "begin_large_file: vetoing {:?} (covering tombstone {:?} beats incoming mtime {})",
+                metadata.rel_path,
+                tomb_path,
+                metadata.modified_ms,
+            );
+            return Ok(());
+        }
+        self.clear_tombstone_on_recreate(&metadata.rel_path, metadata.modified_ms);
 
         let dst = self.root.join(&metadata.rel_path);
         if let Some(parent) = dst.parent() {
@@ -780,6 +878,20 @@ impl SyncEngine {
                 return Ok(FinishResult::Committed);
             }
         };
+
+        // Re-check the resurrection guard at commit time: a tombstone may
+        // have arrived between LargeFileStart and commit. Veto the write
+        // (clean up tmp) instead of recreating a deleted path.
+        if let Some(tomb_path) = self.covering_tombstone_veto(path, asm.modified_ms) {
+            log::warn!(
+                "commit_large_file: vetoing {path:?} (covering tombstone {tomb_path:?} beats incoming mtime {})",
+                asm.modified_ms,
+            );
+            let _ = fs::remove_file(&asm.tmp_path);
+            cleanup_transfer_dirs(&self.root, &asm.tmp_path);
+            return Ok(FinishResult::Committed);
+        }
+        self.clear_tombstone_on_recreate(path, asm.modified_ms);
 
         {
             use std::io::Read;
@@ -907,41 +1019,148 @@ impl SyncEngine {
         let dst = self.root.join(to);
 
         if !src.exists() {
-            log::debug!("apply_rename: source absent, skipping: {from:?}");
+            // Idempotent retransmit: source gone. If manifest still holds
+            // stale `from`-prefixed keys but `to` already exists on disk,
+            // converge the manifest without touching the filesystem.
+            if dst.exists() {
+                let pairs: Vec<(PathBuf, PathBuf)> = {
+                    let m = self.manifest.read();
+                    let mut v = Vec::new();
+                    for k in m.files.keys() {
+                        if k == from {
+                            v.push((k.clone(), to.clone()));
+                        } else if let Ok(stripped) = k.strip_prefix(from) {
+                            v.push((k.clone(), to.join(stripped)));
+                        }
+                    }
+                    v
+                };
+                if !pairs.is_empty() {
+                    let mut suppressed = Vec::with_capacity(pairs.len() * 2);
+                    {
+                        let mut m = self.manifest.write();
+                        for (old, new) in pairs {
+                            if let Some(mut meta) = m.files.remove(&old) {
+                                meta.rel_path = new.clone();
+                                if meta.is_dir {
+                                    if let Ok(fs_meta) =
+                                        fs::metadata(self.root.join(&new))
+                                    {
+                                        if let Ok(modified) = fs_meta.modified() {
+                                            if let Ok(dur) = modified.duration_since(
+                                                std::time::SystemTime::UNIX_EPOCH,
+                                            ) {
+                                                meta.modified_ms =
+                                                    dur.as_millis() as u64;
+                                            }
+                                        }
+                                    }
+                                }
+                                m.files.insert(new.clone(), meta);
+                            }
+                            suppressed.push(old);
+                            suppressed.push(new);
+                        }
+                    }
+                    {
+                        let mut sup = self.suppressed.write();
+                        for p in &suppressed {
+                            sup.insert(p.clone());
+                        }
+                    }
+                    self.schedule_unsuppress(suppressed);
+                }
+            } else {
+                log::debug!("apply_rename: source absent, skipping: {from:?}");
+            }
             return Ok(());
         }
+
+        // Collect every manifest key under `from` (component-wise via
+        // strip_prefix, so `a/b` does not match `a/bc`) and remap it under
+        // `to`. Includes the top entry itself.
+        let pairs: Vec<(PathBuf, PathBuf)> = {
+            let m = self.manifest.read();
+            let mut v = Vec::new();
+            for k in m.files.keys() {
+                if k == from {
+                    v.push((k.clone(), to.clone()));
+                } else if let Ok(stripped) = k.strip_prefix(from) {
+                    v.push((k.clone(), to.join(stripped)));
+                }
+            }
+            v
+        };
 
         {
             let mut sup = self.suppressed.write();
             sup.insert(from.clone());
             sup.insert(to.clone());
+            for (old, new) in &pairs {
+                sup.insert(old.clone());
+                sup.insert(new.clone());
+            }
         }
 
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        fs::rename(&src, &dst)?;
-
-        {
-            let mut m = self.manifest.write();
-            if let Some(mut meta) = m.files.remove(from) {
-                meta.rel_path = to.clone();
-
-                if let Ok(fs_meta) = fs::metadata(&dst) {
-                    if let Ok(modified) = fs_meta.modified() {
-                        if let Ok(dur) = modified.duration_since(std::time::SystemTime::UNIX_EPOCH)
-                        {
-                            meta.modified_ms = dur.as_millis() as u64;
-                        }
-                    }
-                }
-                m.files.insert(to.clone(), meta);
+        // Idempotent when `dst` already exists (retransmit/race): files
+        // overwrite via rename; a failing dir-onto-dir rename still
+        // converges via the manifest remap below instead of erroring.
+        let rename_result = fs::rename(&src, &dst);
+        if let Err(e) = rename_result {
+            if dst.exists() {
+                log::warn!("apply_rename: {from:?} → {to:?} rename failed but dst exists, converging manifest: {e}");
+            } else {
+                return Err(e);
             }
         }
 
-        log::info!("apply_rename: {from:?} → {to:?}");
-        self.schedule_unsuppress(vec![from.clone(), to.clone()]);
+        {
+            let mut suppressed = Vec::with_capacity(pairs.len() * 2 + 2);
+            suppressed.push(from.clone());
+            suppressed.push(to.clone());
+            {
+                let mut m = self.manifest.write();
+                for (old, new) in pairs {
+                    if let Some(mut meta) = m.files.remove(&old) {
+                        meta.rel_path = new.clone();
+                        // Refresh dir mtime from disk after the move; files
+                        // keep the incoming manifest mtime via watcher/scan.
+                        if meta.is_dir {
+                            if let Ok(fs_meta) = fs::metadata(self.root.join(&new)) {
+                                if let Ok(modified) = fs_meta.modified() {
+                                    if let Ok(dur) = modified.duration_since(
+                                        std::time::SystemTime::UNIX_EPOCH,
+                                    ) {
+                                        meta.modified_ms = dur.as_millis() as u64;
+                                    }
+                                }
+                            }
+                        } else if let Ok(fs_meta) = fs::metadata(self.root.join(&new)) {
+                            if let Ok(modified) = fs_meta.modified() {
+                                if let Ok(dur) = modified.duration_since(
+                                    std::time::SystemTime::UNIX_EPOCH,
+                                ) {
+                                    meta.modified_ms = dur.as_millis() as u64;
+                                }
+                            }
+                        }
+                        m.files.insert(new.clone(), meta);
+                    }
+                    suppressed.push(old);
+                    suppressed.push(new);
+                }
+            }
+            // Deduplicate before scheduling (pairs already include from/to).
+            suppressed.sort();
+            suppressed.dedup();
+
+            log::info!("apply_rename: {from:?} → {to:?}");
+            self.schedule_unsuppress(suppressed);
+        }
         Ok(())
     }
 
@@ -961,8 +1180,29 @@ impl SyncEngine {
                 continue;
             }
 
-            self.suppressed_deletes.write().insert(rel.clone());
-            removed.push(rel.clone());
+            // Collect the top path plus every manifest child under it
+            // (component-wise: `a/b` must not match `a/bc`) BEFORE removal,
+            // so delete-suppression covers the whole subtree recursively.
+            let subtree: Vec<PathBuf> = {
+                let m = self.manifest.read();
+                let mut v = vec![rel.clone()];
+                for k in m.files.keys() {
+                    if k != rel {
+                        if let Ok(stripped) = k.strip_prefix(rel) {
+                            let _ = stripped;
+                            v.push(k.clone());
+                        }
+                    }
+                }
+                v
+            };
+            {
+                let mut sup = self.suppressed_deletes.write();
+                for p in &subtree {
+                    sup.insert(p.clone());
+                    removed.push(p.clone());
+                }
+            }
 
             // Snapshot manifest info BEFORE removal for the tombstone.
             let (prev_hash, prev_mtime_ms) = self
@@ -976,19 +1216,10 @@ impl SyncEngine {
             let full = self.root.join(rel);
             if full.is_dir() {
                 self.trash_manager.move_to_trash(&full, rel, &self.node_id);
-                let children: Vec<PathBuf> = self
-                    .manifest
-                    .read()
-                    .files
-                    .keys()
-                    .filter(|p| p.starts_with(rel))
-                    .cloned()
-                    .collect();
                 let mut m = self.manifest.write();
-                for child in children {
-                    m.files.remove(&child);
+                for child in &subtree {
+                    m.files.remove(child);
                 }
-                m.files.remove(rel);
             } else {
                 self.trash_manager.move_to_trash(&full, rel, &self.node_id);
                 self.manifest.write().files.remove(rel);
@@ -1018,6 +1249,8 @@ impl SyncEngine {
             }
         }
 
+        removed.sort();
+        removed.dedup();
         self.schedule_unsuppress_deletes(removed);
         Ok(count)
     }
