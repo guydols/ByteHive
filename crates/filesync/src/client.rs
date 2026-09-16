@@ -1272,16 +1272,19 @@ fn flush_to_server(
         send_paths_to_server(engine, conn, bus, gui_state, stable)?;
     }
 
-    let (paths, delete_count) = pending.take_deletes_with_engine(engine);
+    let (paths, delete_count, deleted_at_ms) = pending.take_deletes_with_engine(engine);
     if !paths.is_empty() {
         debug!(
             "filesync send: flushing {} delete path(s) ({} pre-expansion)",
             paths.len(),
             delete_count
         );
+        // Reuse the single batch stamp from take_deletes_with_engine so
+        // the ledger tombstone and the wire Delete share one timestamp
+        // (no second now_ms() re-stamp); deleter is this node.
         conn.send(&Message::Delete {
             paths,
-            deleted_at_ms: crate::ledger::now_ms(),
+            deleted_at_ms,
             deleter: engine.node_id().to_string(),
         })?;
         if let Some(ref gs) = gui_state {
@@ -1351,7 +1354,39 @@ fn send_paths_to_server(
     gui_state: &Option<SharedState>,
     paths: Vec<PathBuf>,
 ) -> io::Result<()> {
+    // Outgoing resurrection guard: drop paths whose local version loses
+    // to a covering tombstone (same policy as filter_resurrected, applied
+    // live before streaming). Paths without a manifest entry pass through
+    // (no mtime to compare); legitimate recreates (local mtime strictly
+    // newer) pass through.
     let manifest = engine.get_manifest();
+    let mut vetoed = 0usize;
+    let paths: Vec<PathBuf> = paths
+        .into_iter()
+        .filter(|p| {
+            match manifest.files.get(p) {
+                Some(meta)
+                    if engine
+                        .covering_tombstone_veto(p, meta.modified_ms)
+                        .is_some() =>
+                {
+                    log::warn!(
+                        "filesync send: vetoing {p:?} (covering tombstone beats local mtime {})",
+                        meta.modified_ms,
+                    );
+                    vetoed += 1;
+                    false
+                }
+                _ => true,
+            }
+        })
+        .collect();
+    if paths.is_empty() {
+        if vetoed > 0 {
+            log::debug!("filesync send: all {} path(s) vetoed by tombstones", vetoed);
+        }
+        return Ok(());
+    }
     let files_count = paths
         .iter()
         .filter(|p| manifest.files.get(*p).map(|m| !m.is_dir).unwrap_or(true))
