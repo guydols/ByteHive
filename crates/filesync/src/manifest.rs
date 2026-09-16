@@ -347,16 +347,24 @@ pub fn compute_send_list(local: &Manifest, remote: &Manifest, is_server: bool) -
 /// `send_list` is typically the output of [`compute_send_list`]; `ledger`
 /// is the peer's (or merged) deletion ledger. Returns `(to_send,
 /// resurrected)`:
-/// - A path is vetoed (dropped from `to_send`) when the ledger holds a
-///   tombstone strictly newer than the local file's `modified_ms` (via
-///   [`DeletionLedger::has_newer_than`]) AND the local copy looks like the
-///   same-or-older version the tombstone describes (local content hash
+/// - A path is vetoed (dropped from `to_send`) when the ledger holds an
+///   exact tombstone strictly newer than the local file's `modified_ms`
+///   (via [`DeletionLedger::has_newer_than`]) AND the local copy looks like
+///   the same-or-older version the tombstone describes (local content hash
 ///   equals `prev_hash`, or local mtime is not newer than `prev_mtime_ms`;
 ///   missing prev info fails closed toward the delete).
+/// - A path with no exact tombstone but a covering ancestor tombstone
+///   (e.g. child of a deleted directory, via
+///   [`DeletionLedger::covering_tombstone`]) is vetoed purely on timestamp
+///   ordering: ancestor `deleted_at_ms > local modified_ms` vetoes (the
+///   ancestor's `prev_hash`/`prev_mtime_ms` describe the directory, not the
+///   child, so they are not consulted). This also covers stale directory
+///   entries (`hash == [0; 32]`).
 /// - A path whose local `modified_ms` is strictly newer than the
-///   tombstone is a legitimate recreate: it stays in `to_send` and is
-///   reported in `resurrected` so the caller can drop the stale tombstone
-///   (e.g. via `SyncEngine::clear_tombstones`, which removes + saves).
+///   exact or covering tombstone is a legitimate recreate: it stays in
+///   `to_send` and is reported in `resurrected` so the caller can drop the
+///   stale tombstone (e.g. via `SyncEngine::clear_tombstones`, which
+///   removes + saves).
 /// - `None` ledger (or no tombstone / no local entry) passes through.
 ///
 /// The existing `is_server` tie-break in [`compute_send_list`] is
@@ -377,38 +385,66 @@ pub fn filter_resurrected(
             to_send.push(path);
             continue;
         };
-        let Some(tomb) = ledger.get(&path) else {
+        // Exact tombstone first (preserves prev_hash/prev_mtime semantics);
+        // otherwise fall back to the nearest covering ancestor tombstone.
+        if let Some(tomb) = ledger.get(&path) {
+            if local_meta.modified_ms > tomb.deleted_at_ms {
+                // Legitimate recreate: local version is newer than the delete.
+                resurrected.push(path.clone());
+                to_send.push(path);
+            } else if ledger.has_newer_than(&path, local_meta.modified_ms) {
+                let hash_matches = match &tomb.prev_hash {
+                    Some(prev) => crate::hex(&local_meta.hash) == *prev,
+                    None => true,
+                };
+                let mtime_not_newer = match tomb.prev_mtime_ms {
+                    Some(prev_mtime) => local_meta.modified_ms <= prev_mtime,
+                    None => true,
+                };
+                if hash_matches || mtime_not_newer {
+                    // Stale copy loses to the tombstone — veto the upload.
+                    log::debug!(
+                        "filter_resurrected: vetoing {:?} (tombstone @{} by {} beats local mtime {})",
+                        path,
+                        tomb.deleted_at_ms,
+                        tomb.deleter_node,
+                        local_meta.modified_ms,
+                    );
+                } else {
+                    to_send.push(path);
+                }
+            } else {
+                // Equal timestamps or no ordering signal — pass through and let
+                // the normal sync decision stand.
+                to_send.push(path);
+            }
+            continue;
+        }
+        // No exact tombstone: check for a covering ancestor (dir delete).
+        let Some(cover) = ledger.covering_tombstone(&path) else {
             to_send.push(path);
             continue;
         };
-        if local_meta.modified_ms > tomb.deleted_at_ms {
-            // Legitimate recreate: local version is newer than the delete.
+        if local_meta.modified_ms > cover.deleted_at_ms {
+            // Legitimate recreate under a deleted dir: local version is newer.
             resurrected.push(path.clone());
             to_send.push(path);
-        } else if ledger.has_newer_than(&path, local_meta.modified_ms) {
-            let hash_matches = match &tomb.prev_hash {
-                Some(prev) => crate::hex(&local_meta.hash) == *prev,
-                None => true,
-            };
-            let mtime_not_newer = match tomb.prev_mtime_ms {
-                Some(prev_mtime) => local_meta.modified_ms <= prev_mtime,
-                None => true,
-            };
-            if hash_matches || mtime_not_newer {
-                // Stale copy loses to the tombstone — veto the upload.
-                log::debug!(
-                    "filter_resurrected: vetoing {:?} (tombstone @{} by {} beats local mtime {})",
-                    path,
-                    tomb.deleted_at_ms,
-                    tomb.deleter_node,
-                    local_meta.modified_ms,
-                );
-            } else {
-                to_send.push(path);
-            }
+        } else if cover.deleted_at_ms > local_meta.modified_ms {
+            // Stale child loses to the ancestor delete — veto the upload.
+            // Note: no prev_hash/prev_mtime check here; those describe the
+            // deleted directory itself, not this child (and stale dir
+            // entries with hash == [0; 32] must still be vetoed).
+            log::debug!(
+                "filter_resurrected: vetoing {:?} (covering tombstone {:?} @{} by {} beats local mtime {})",
+                path,
+                cover.path,
+                cover.deleted_at_ms,
+                cover.deleter_node,
+                local_meta.modified_ms,
+            );
         } else {
-            // Equal timestamps or no ordering signal — pass through and let
-            // the normal sync decision stand.
+            // Equal timestamps — pass through and let the normal sync
+            // decision stand.
             to_send.push(path);
         }
     }
@@ -434,4 +470,93 @@ pub fn diff_manifests(old: &Manifest, new: &Manifest) -> (Vec<PathBuf>, Vec<Path
     }
 
     (changed, deleted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::FileMetadata;
+
+    fn meta(path: &str, byte: u8, mtime: u64) -> FileMetadata {
+        FileMetadata {
+            rel_path: PathBuf::from(path),
+            size: 1,
+            hash: [byte; 32],
+            modified_ms: mtime,
+            change_sequence: 0,
+            is_dir: false,
+        }
+    }
+
+    fn dir_meta(path: &str, mtime: u64) -> FileMetadata {
+        FileMetadata {
+            rel_path: PathBuf::from(path),
+            size: 0,
+            hash: [0; 32],
+            modified_ms: mtime,
+            change_sequence: 0,
+            is_dir: true,
+        }
+    }
+
+    fn manifest_with(entries: Vec<FileMetadata>) -> Manifest {
+        Manifest {
+            files: entries.into_iter().map(|m| (m.rel_path.clone(), m)).collect(),
+            node_id: "test".to_string(),
+        }
+    }
+
+    fn ledger_with(path: &str, deleted_at: u64) -> DeletionLedger {
+        let mut l = DeletionLedger::new();
+        l.record(
+            PathBuf::from(path),
+            deleted_at,
+            "peer".to_string(),
+            None,
+            None,
+        );
+        l
+    }
+
+    #[test]
+    fn child_file_vetoed_by_parent_tombstone() {
+        // Dir delete tombstones only the top path; the stale child must veto.
+        let local = manifest_with(vec![meta("docs/a.txt", 0xAA, 50)]);
+        let ledger = ledger_with("docs", 100);
+        let (to_send, resurrected) = filter_resurrected(
+            vec![PathBuf::from("docs/a.txt")],
+            &local,
+            Some(&ledger),
+        );
+        assert!(to_send.is_empty(), "stale child must be vetoed");
+        assert!(resurrected.is_empty());
+    }
+
+    #[test]
+    fn child_recreate_with_newer_mtime_allowed() {
+        // Legitimate recreate wins: child mtime newer than parent delete.
+        let local = manifest_with(vec![meta("docs/a.txt", 0xBB, 150)]);
+        let ledger = ledger_with("docs", 100);
+        let (to_send, resurrected) = filter_resurrected(
+            vec![PathBuf::from("docs/a.txt")],
+            &local,
+            Some(&ledger),
+        );
+        assert_eq!(to_send, vec![PathBuf::from("docs/a.txt")]);
+        assert_eq!(resurrected, vec![PathBuf::from("docs/a.txt")]);
+    }
+
+    #[test]
+    fn stale_dir_entry_vetoed_by_parent_tombstone() {
+        // Directory entries carry hash == [0; 32]; a stale subdir must veto.
+        let local = manifest_with(vec![dir_meta("docs/sub", 50)]);
+        let ledger = ledger_with("docs", 100);
+        let (to_send, resurrected) = filter_resurrected(
+            vec![PathBuf::from("docs/sub")],
+            &local,
+            Some(&ledger),
+        );
+        assert!(to_send.is_empty(), "stale dir child must be vetoed");
+        assert!(resurrected.is_empty());
+    }
 }
