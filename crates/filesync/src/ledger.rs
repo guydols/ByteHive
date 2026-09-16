@@ -148,6 +148,35 @@ impl DeletionLedger {
         }
     }
 
+    /// Nearest tombstone at `path` or any ancestor (prefix) directory.
+    ///
+    /// Walks `path` and its ancestors nearest-first (exact match wins,
+    /// then parent, grandparent, ...). Returns the first tombstone found,
+    /// or `None` when neither `path` nor any ancestor is tombstoned.
+    /// Used so a directory delete (which tombstones only the top path)
+    /// still covers resurrected children.
+    pub fn covering_tombstone(&self, path: &Path) -> Option<&Tombstone> {
+        for ancestor in path.ancestors() {
+            if ancestor.as_os_str().is_empty() {
+                break;
+            }
+            if let Some(t) = self.entries.get(ancestor) {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    /// Prefix-aware variant of [`DeletionLedger::has_newer_than`]: true
+    /// when the exact or any covering ancestor tombstone is strictly newer
+    /// than `mtime_ms`.
+    pub fn has_newer_than_prefix(&self, path: &Path, mtime_ms: u64) -> bool {
+        match self.covering_tombstone(path) {
+            Some(t) => t.deleted_at_ms > mtime_ms,
+            None => false,
+        }
+    }
+
     /// Merge remote tombstones, keeping the newest per path (LWW).
     pub fn merge_remote(&mut self, remote: HashMap<PathBuf, Tombstone>) {
         for (path, tomb) in remote {
@@ -205,5 +234,60 @@ impl DeletionLedger {
 
     pub fn iter(&self) -> impl Iterator<Item = (&PathBuf, &Tombstone)> {
         self.entries.iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tomb(path: &str, at: u64) -> (PathBuf, u64, String, Option<String>, Option<u64>) {
+        (
+            PathBuf::from(path),
+            at,
+            "peer".to_string(),
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn covering_tombstone_finds_parent_prefix() {
+        let mut l = DeletionLedger::new();
+        let (p, at, node, ph, pm) = tomb("docs", 100);
+        l.record(p, at, node, ph, pm);
+        let cover = l
+            .covering_tombstone(Path::new("docs/a.txt"))
+            .expect("child must be covered by parent tombstone");
+        assert_eq!(cover.path, PathBuf::from("docs"));
+        assert!(l.has_newer_than_prefix(Path::new("docs/a.txt"), 50));
+        assert!(!l.has_newer_than_prefix(Path::new("docs/a.txt"), 150));
+    }
+
+    #[test]
+    fn covering_tombstone_prefers_nearest_ancestor() {
+        let mut l = DeletionLedger::new();
+        let (p, at, node, ph, pm) = tomb("docs", 100);
+        l.record(p, at, node, ph, pm);
+        let (p2, at2, node2, ph2, pm2) = tomb("docs/sub", 200);
+        l.record(p2, at2, node2, ph2, pm2);
+        let cover = l
+            .covering_tombstone(Path::new("docs/sub/a.txt"))
+            .expect("must find nearest cover");
+        assert_eq!(cover.path, PathBuf::from("docs/sub"));
+        assert_eq!(cover.deleted_at_ms, 200);
+    }
+
+    #[test]
+    fn covering_tombstone_exact_wins_and_miss_returns_none() {
+        let mut l = DeletionLedger::new();
+        let (p, at, node, ph, pm) = tomb("docs/a.txt", 100);
+        l.record(p, at, node, ph, pm);
+        let exact = l
+            .covering_tombstone(Path::new("docs/a.txt"))
+            .expect("exact match must be returned");
+        assert_eq!(exact.path, PathBuf::from("docs/a.txt"));
+        assert!(l.covering_tombstone(Path::new("other/b.txt")).is_none());
+        assert!(!l.has_newer_than_prefix(Path::new("other/b.txt"), 0));
     }
 }
