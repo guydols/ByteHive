@@ -1113,7 +1113,8 @@ fn flush_local_changes(
             "filesync server: broadcasting {} delete(s)",
             pending.deletes.len()
         );
-        let (paths, _) = pending.take_deletes_with_engine(engine);
+        // Single batch stamp shared between ledger + wire (no re-stamp).
+        let (paths, _, deleted_at_ms) = pending.take_deletes_with_engine(engine);
         if let Some(ref bus) = bus {
             bus.publish(
                 "filesync",
@@ -1135,7 +1136,7 @@ fn flush_local_changes(
             "",
             &Message::Delete {
                 paths,
-                deleted_at_ms: crate::ledger::now_ms(),
+                deleted_at_ms,
                 deleter: engine.node_id().to_string(),
             },
         );
@@ -1152,6 +1153,38 @@ fn broadcast_paths(
     sent_bundles: &Arc<RwLock<HashMap<u64, BundleTracking>>>, // Add this parameter
 ) {
     const BROADCAST_PIPELINE_DEPTH: usize = 128;
+    // Outgoing resurrection guard (same policy as the client send path):
+    // drop paths whose local version loses to a covering tombstone before
+    // streaming. Unknown paths (no manifest entry) pass through.
+    let manifest = engine.get_manifest();
+    let mut vetoed = 0usize;
+    let paths: Vec<PathBuf> = paths
+        .into_iter()
+        .filter(|p| match manifest.files.get(p) {
+            Some(meta)
+                if engine
+                    .covering_tombstone_veto(p, meta.modified_ms)
+                    .is_some() =>
+            {
+                log::warn!(
+                    "filesync server: vetoing {p:?} broadcast (covering tombstone beats local mtime {})",
+                    meta.modified_ms,
+                );
+                vetoed += 1;
+                false
+            }
+            _ => true,
+        })
+        .collect();
+    if paths.is_empty() {
+        if vetoed > 0 {
+            log::debug!(
+                "filesync server: all {} path(s) vetoed by tombstones",
+                vetoed
+            );
+        }
+        return;
+    }
     debug!(
         "filesync server: broadcast_paths — {} path(s) to {} peer(s)",
         paths.len(),

@@ -179,16 +179,37 @@ impl PendingChanges {
 
     /// Drain pending deletes and record a local tombstone for each path
     /// BEFORE it is sent, so a later remote copy cannot resurrect it.
-    /// Tombstones use wall-clock [`crate::ledger::now_ms`] and this node's
-    /// id; prev hash/mtime come from the manifest when available.
+    /// Tombstones use a SINGLE wall-clock [`crate::ledger::now_ms`] stamp
+    /// for the whole batch (returned for reuse as the `deleted_at_ms` on
+    /// the wire — callers must NOT re-stamp with a second `now_ms()`).
+    /// Fabricated ancestor extras from [`expand_deleted_ancestors`] are
+    /// constrained: an extra parent is kept only when it is absent from
+    /// the local manifest (still-listed parents are not deletes) and not
+    /// currently rename-suppressed (rename in-flight race).
     /// (Next lane: switch client/server flush paths to this method.)
     pub fn take_deletes_with_engine(
         &mut self,
         engine: &SyncEngine,
-    ) -> (Vec<PathBuf>, usize) {
-        let (paths, original_count) = self.take_deletes(engine.root());
+    ) -> (Vec<PathBuf>, usize, u64) {
+        let (mut paths, original_count) = self.take_deletes(engine.root());
+        if original_count < paths.len() {
+            // Extras are appended by expand_deleted_ancestors; prune any
+            // that are still live in the manifest or rename-suppressed.
+            let manifest = engine.get_manifest();
+            let mut kept: Vec<PathBuf> = paths.drain(..original_count).collect();
+            for extra in paths {
+                if manifest.files.contains_key(&extra) {
+                    continue;
+                }
+                if engine.is_suppressed(&extra) {
+                    continue;
+                }
+                kept.push(extra);
+            }
+            paths = kept;
+        }
+        let now = crate::ledger::now_ms();
         if !paths.is_empty() {
-            let now = crate::ledger::now_ms();
             let node = engine.node_id().to_string();
             let manifest = engine.get_manifest();
             for p in &paths {
@@ -200,7 +221,7 @@ impl PendingChanges {
                 engine.record_delete(p.clone(), now, &node, prev_hash, prev_mtime_ms);
             }
         }
-        (paths, original_count)
+        (paths, original_count, now)
     }
 }
 
@@ -274,7 +295,42 @@ pub fn handle_recv_bundle(
     bus: &Option<Arc<MessageBus>>,
     log_prefix: &str,
 ) -> io::Result<BundleApplied> {
-    let apply_result = engine.apply_bundle(bundle)?;
+    // Ingress pre-guard (defense in depth; SyncEngine::apply_bundle
+    // enforces the same policy): log vetoes for tombstone-covered paths
+    // and drop them before applying so a stale retransmit cannot
+    // resurrect a deleted path. Legitimate recreates (incoming mtime
+    // strictly newer than the tombstone) pass through.
+    let mut vetoed = 0usize;
+    for fd in &bundle.files {
+        if engine
+            .covering_tombstone_veto(&fd.metadata.rel_path, fd.metadata.modified_ms)
+            .is_some()
+        {
+            warn!(
+                "{log_prefix}: vetoing {:?} from {peer} (covering tombstone beats mtime {})",
+                fd.metadata.rel_path, fd.metadata.modified_ms,
+            );
+            vetoed += 1;
+        }
+    }
+    let apply_result = if vetoed > 0 {
+        let filtered = FileBundle {
+            files: bundle
+                .files
+                .iter()
+                .filter(|fd| {
+                    engine
+                        .covering_tombstone_veto(&fd.metadata.rel_path, fd.metadata.modified_ms)
+                        .is_none()
+                })
+                .cloned()
+                .collect(),
+            bundle_id: bundle.bundle_id,
+        };
+        engine.apply_bundle(&filtered)?
+    } else {
+        engine.apply_bundle(bundle)?
+    };
 
     let files_count = bundle.files.iter().filter(|f| !f.metadata.is_dir).count();
     let dirs_count = bundle.files.iter().filter(|f| f.metadata.is_dir).count();
