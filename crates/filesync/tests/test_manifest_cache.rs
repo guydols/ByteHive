@@ -129,8 +129,34 @@ fn recreate_new_inode_rehashes() {
     let h1 = manifest_hash(&engine, "f.txt");
 
     // Delete + recreate: new inode, same size, same mtime, new content.
+    // NOTE: ext4/overlayfs/tmpfs recycle inode numbers on rapid
+    // unlink+create, so a bare remove+write may land on the SAME ino and
+    // the cache would legitimately hit. Churn dummy files (kept alive
+    // across retries to pin recycled inos) until f.txt gets a genuinely
+    // different inode. Bounded retries; panics loudly if the FS refuses.
+    let old_ino = std::fs::metadata(&f).unwrap().ino();
     std::fs::remove_file(&f).unwrap();
-    std::fs::write(&f, b"content-two!").unwrap();
+    let mut churn_kept: Vec<PathBuf> = Vec::new();
+    for attempt in 0..20 {
+        for k in 0..4 {
+            let p = dir.path().join(format!(".churn-{attempt}-{k}"));
+            std::fs::write(&p, b"churn").unwrap();
+            churn_kept.push(p);
+        }
+        std::fs::write(&f, b"content-two!").unwrap();
+        let new_ino = std::fs::metadata(&f).unwrap().ino();
+        if new_ino != old_ino {
+            break;
+        }
+        // Recycled ino: drop the candidate, keep churn pinned, retry.
+        std::fs::remove_file(&f).unwrap();
+        if attempt == 19 {
+            panic!("could not force a new inode after 20 retries (old ino {old_ino})");
+        }
+    }
+    for p in &churn_kept {
+        let _ = std::fs::remove_file(p);
+    }
     set_mtime(&f, old_ms);
     engine.scan().unwrap();
     let h2 = manifest_hash(&engine, "f.txt");
