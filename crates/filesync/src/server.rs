@@ -6,7 +6,7 @@ use crate::ledger::{DeletionLedger, Tombstone};
 use crate::manifest;
 use crate::protocol::*;
 use crate::sync_engine::SyncEngine;
-use crate::transport::{Connection, Frame};
+use crate::transport::{Connection, Frame, HEARTBEAT_POLL_SECS};
 use crate::watcher::{self, FsEvent};
 
 use bytehive_core::MessageBus;
@@ -193,6 +193,26 @@ impl Server {
     }
 }
 
+/// Blocking recv with heartbeat maintenance: polls with a 2 s timeout so
+/// Ping is sent while idle and a dead peer / suspend-resume gap trips the
+/// heartbeat timeout (returned as Err) instead of hanging forever.
+fn recv_with_heartbeat(conn: &Connection) -> io::Result<Message> {
+    loop {
+        match conn.recv_timeout(Duration::from_secs(HEARTBEAT_POLL_SECS)) {
+            Ok(msg) => return Ok(msg),
+            Err(e)
+                if e.kind() == io::ErrorKind::TimedOut
+                    || e.kind() == io::ErrorKind::WouldBlock =>
+            {
+                // Idle window: send Ping if due, trip timeout if peer is
+                // stale (suspend recovery lands here on next check).
+                conn.heartbeat_maintenance()?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn handle_client(
     stream: TcpStream,
     addr: String,
@@ -228,7 +248,7 @@ fn handle_client(
         active_conns,
     };
 
-    let client_id = match conn.recv()? {
+    let client_id = match recv_with_heartbeat(&conn)? {
         Message::Hello {
             node_id,
             protocol_version,
@@ -343,7 +363,7 @@ fn handle_client(
     conn.send(&Message::ManifestExchange(local.clone()))?;
     debug!("filesync: sent ManifestExchange to {client_id}");
 
-    let remote = match conn.recv()? {
+    let remote = match recv_with_heartbeat(&conn)? {
         Message::ManifestExchange(m) => m,
         Message::InsufficientDiskSpace {
             available_bytes,
@@ -381,7 +401,7 @@ fn handle_client(
         entries: engine.ledger_entries(),
     })?;
     debug!("filesync: sent LedgerExchange to {client_id}");
-    let peer_ledger_entries = match conn.recv()? {
+    let peer_ledger_entries = match recv_with_heartbeat(&conn)? {
         Message::LedgerExchange { entries } => entries,
         _ => {
             return Err(io::Error::new(
@@ -485,7 +505,7 @@ fn handle_client(
 
     let sync_start = Instant::now();
     loop {
-        match conn.recv()? {
+        match recv_with_heartbeat(&conn)? {
             Message::Bundle(b) => {
                 let n_files = b.files.iter().filter(|f| !f.metadata.is_dir).count();
                 let b_bytes: u64 = b.files.iter().map(|f| f.metadata.size).sum();
@@ -731,11 +751,22 @@ fn handle_client(
     let conn_fwd = conn.clone();
     let fwd_handle = thread::Builder::new()
         .name(format!("srv-bcast-fwd-{client_id}"))
-        .spawn(move || {
-            while let Ok(Some(frame)) = bcast_rx.recv() {
-                if conn_fwd.send_frame(frame).is_err() {
-                    break;
+        .spawn(move || loop {
+            match bcast_rx.recv_timeout(Duration::from_secs(HEARTBEAT_POLL_SECS)) {
+                Ok(Some(frame)) => {
+                    if conn_fwd.send_frame(frame).is_err() {
+                        break;
+                    }
                 }
+                Ok(None) => break,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    // Idle window: send Ping if due; break so the peer is
+                    // cleaned up when the heartbeat times out.
+                    if conn_fwd.heartbeat_maintenance().is_err() {
+                        break;
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
         })?;
 
@@ -778,7 +809,7 @@ fn client_recv_loop(
 ) {
     debug!("filesync: recv loop started for {client_id}");
     loop {
-        match conn.recv() {
+        match recv_with_heartbeat(&conn) {
             Ok(Message::Bundle(b)) => {
                 let n_files = b.files.iter().filter(|f| !f.metadata.is_dir).count();
                 let b_bytes: u64 = b.files.iter().map(|f| f.metadata.size).sum();

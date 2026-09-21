@@ -8,7 +8,7 @@ pub const BUNDLE_MAX_FILES: usize = 500;
 pub const LARGE_FILE_THRESHOLD: u64 = 8 * 1024 * 1024;
 pub const FILE_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 pub const DEBOUNCE_MS: u64 = 200;
 pub const FILE_STABILITY_MS: u64 = 500;
 pub const FILE_CHANGE_COALESCE_MS: u64 = 100;
@@ -129,6 +129,11 @@ pub enum Message {
         available_bytes: u64,
         required_bytes: u64,
     },
+    // App-level heartbeat (PROTOCOL_VERSION 9). Appended at END so existing
+    // bincode discriminants are unchanged. Ping/Pong are swallowed in
+    // transport::io_loop and never reach app recv loops.
+    Ping,
+    Pong,
 }
 
 pub fn serialise_message(msg: &Message) -> io::Result<Vec<u8>> {

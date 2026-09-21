@@ -7,8 +7,8 @@ use crate::ledger::{DeletionLedger, Tombstone};
 use crate::manifest;
 use crate::protocol::*;
 use crate::sync_engine::{ConflictInfo, SyncEngine};
+use crate::transport::{Connection, HEARTBEAT_POLL_SECS, is_heartbeat_timeout};
 use crate::timestamp_id;
-use crate::transport::Connection;
 use crate::watcher::{self, FsEvent};
 
 use bytehive_core::MessageBus;
@@ -138,6 +138,12 @@ impl Client {
     pub fn shutdown(&self) {
         debug!("filesync client: shutdown requested");
         self.stopped.store(true, Ordering::SeqCst);
+        self.force_disconnect();
+    }
+
+    /// Force-close the active connection without marking the client stopped,
+    /// so the `run()` loop can reconnect immediately (used on resume).
+    pub fn force_disconnect(&self) {
         if let Some(conn) = self.active_conn.lock().clone() {
             debug!("filesync client: forcing active connection closed");
             conn.shutdown();
@@ -158,6 +164,11 @@ impl Client {
                 break;
             }
             info!("filesync: connecting to {} …", self.server_addr);
+            // Heartbeat fast-path: a heartbeat timeout means the peer is
+            // (probably) gone or we just resumed from suspend — the wall-clock
+            // gap already proved liveness is lost, so reconnect immediately
+            // instead of waiting out the backoff.
+            let mut skip_backoff = false;
             match self.session() {
                 Ok(()) => {
                     info!("filesync: session ended cleanly");
@@ -183,6 +194,10 @@ impl Client {
                         );
                         // Back off a long time; the admin needs to explicitly re-allow.
                         backoff = Duration::from_secs(300);
+                    } else if is_heartbeat_timeout(&e) {
+                        info!("filesync: heartbeat timeout — reconnecting immediately");
+                        backoff = Duration::from_secs(1);
+                        skip_backoff = true;
                     } else {
                         error!("filesync: session error: {e}");
                         debug!("filesync: session error kind={:?}", e.kind());
@@ -192,6 +207,9 @@ impl Client {
             if self.stopped.load(Ordering::SeqCst) {
                 debug!("filesync: run loop: stop flag set after session, exiting");
                 break;
+            }
+            if skip_backoff {
+                continue;
             }
             info!("filesync: reconnecting in {} s …", backoff.as_secs());
             debug!(
@@ -320,7 +338,7 @@ impl Client {
             credential: None,
         })?;
 
-        match conn.recv()? {
+        match recv_with_heartbeat(&conn)? {
             Message::Hello {
                 node_id,
                 protocol_version,
@@ -392,7 +410,7 @@ impl Client {
         }
 
         debug!("filesync session: waiting for server ManifestExchange");
-        let remote = match conn.recv()? {
+        let remote = match recv_with_heartbeat(&conn)? {
             Message::ManifestExchange(m) => m,
             other => {
                 error!("filesync session: expected ManifestExchange from server");
@@ -477,7 +495,7 @@ impl Client {
         // ---- Deletion-ledger exchange (symmetric order: server sent first,
         // we reply — avoids both-wait deadlock) ----
         debug!("filesync session: waiting for server LedgerExchange");
-        let peer_ledger_entries = match conn.recv()? {
+        let peer_ledger_entries = match recv_with_heartbeat(&conn)? {
             Message::LedgerExchange { entries } => entries,
             other => {
                 error!("filesync session: expected LedgerExchange from server");
@@ -536,7 +554,7 @@ impl Client {
 
         debug!("filesync session: entering initial-sync receive loop");
         loop {
-            match conn.recv()? {
+            match recv_with_heartbeat(&conn)? {
                 Message::Bundle(b) => {
                     let n_files = b.files.iter().filter(|f| !f.metadata.is_dir).count();
                     let n_dirs = b.files.iter().filter(|f| f.metadata.is_dir).count();
@@ -882,6 +900,26 @@ impl Client {
     }
 }
 
+/// Blocking recv with heartbeat maintenance: polls with a 2 s timeout so
+/// Ping is sent while idle and a dead peer / suspend-resume gap trips the
+/// heartbeat timeout (returned as Err) instead of hanging forever.
+fn recv_with_heartbeat(conn: &Connection) -> io::Result<Message> {
+    loop {
+        match conn.recv_timeout(Duration::from_secs(HEARTBEAT_POLL_SECS)) {
+            Ok(msg) => return Ok(msg),
+            Err(e)
+                if e.kind() == io::ErrorKind::TimedOut
+                    || e.kind() == io::ErrorKind::WouldBlock =>
+            {
+                // Idle window: send Ping if due, trip timeout if peer is
+                // stale (suspend recovery lands here on next check).
+                conn.heartbeat_maintenance()?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn recv_loop(
     engine: Arc<SyncEngine>,
     conn: Arc<Connection>,
@@ -891,7 +929,7 @@ fn recv_loop(
     let prefix = "filesync recv";
     debug!("{prefix}: loop started, waiting for incremental messages from server");
     loop {
-        match conn.recv() {
+        match recv_with_heartbeat(&conn) {
             Ok(Message::Bundle(b)) => {
                 let n_files = b.files.iter().filter(|f| !f.metadata.is_dir).count();
                 let n_dirs = b.files.iter().filter(|f| f.metadata.is_dir).count();
@@ -1114,6 +1152,18 @@ fn send_loop(
                 break;
             }
             Err(TryRecvError::Empty) => {}
+        }
+
+        // Heartbeat tick (already wakes every DEBOUNCE_MS): sends Ping when
+        // idle, breaks the loop on timeout so the session tears down and
+        // run() reconnects + rescans.
+        if let Err(e) = conn.heartbeat_maintenance() {
+            if is_heartbeat_timeout(&e) {
+                error!("filesync send: heartbeat timeout ({e}), tearing down session");
+            } else {
+                error!("filesync send: heartbeat maintenance failed ({e}), tearing down session");
+            }
+            break;
         }
 
         pending.periodic_rescan(&engine, "filesync");

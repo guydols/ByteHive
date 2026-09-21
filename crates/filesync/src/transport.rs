@@ -7,11 +7,29 @@ use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 pub type Frame = Arc<Vec<u8>>;
+
+/// True when a session error came from heartbeat liveness (stale peer or
+/// suspend/resume gap): TimedOut kind, or a message mentioning "heartbeat".
+/// Used for the reconnect fast-path (skip backoff once).
+pub fn is_heartbeat_timeout(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::TimedOut || e.to_string().contains("heartbeat")
+}
 const READ_POLL_MS: u64 = 5;
 const RECV_CHANNEL_DEPTH: usize = 1024;
+
+/// App-level heartbeat: send Ping after this long without any outbound
+/// traffic, treat the peer as dead after this long without ANY inbound
+/// traffic. 30 s timeout tolerates one missed ping + slow disk; suspend
+/// recovery is still fast because the wall-clock gap trips the timeout on
+/// the next maintenance check after resume.
+pub const HEARTBEAT_INTERVAL_SECS: u64 = 15;
+pub const HEARTBEAT_TIMEOUT_SECS: u64 = 30;
+/// Blocking recv loops poll with this timeout so heartbeat maintenance runs
+/// even while idle (also keeps suspend-resume detection latency ≤ 2 s).
+pub const HEARTBEAT_POLL_SECS: u64 = 2;
 
 enum TlsStream {
     Server(StreamOwned<ServerConnection, TcpStream>),
@@ -138,6 +156,7 @@ fn io_loop(
     mut tls: TlsStream,
     recv_tx: Sender<io::Result<Message>>,
     send_rx: Receiver<Option<Frame>>,
+    last_recv_wall: Arc<Mutex<SystemTime>>,
 ) {
     debug!(
         "tls-io: thread started (send_depth={SEND_QUEUE_DEPTH} recv_depth={RECV_CHANNEL_DEPTH})"
@@ -169,9 +188,37 @@ fn io_loop(
 
         match reader.poll(&mut tls) {
             Ok(Some(msg)) => {
-                if recv_tx.send(Ok(msg)).is_err() {
-                    debug!("tls-io: recv_tx consumer gone, exiting");
-                    return;
+                // Wall-clock liveness: ANY inbound frame (data, Ping, Pong)
+                // proves the peer path is alive. Instant can't be used here —
+                // it pauses during suspend so it can't detect resume gaps.
+                *last_recv_wall.lock() = SystemTime::now();
+                match msg {
+                    // Auto-reply in the io thread: zero app churn, no recv
+                    // loop match arms need changing. Swallow both so the app
+                    // only ever sees data messages.
+                    Message::Ping => {
+                        match protocol::serialise_message(&Message::Pong) {
+                            Ok(frame) => {
+                                if let Err(e) =
+                                    tls.write_all(&frame).and_then(|_| tls.flush())
+                                {
+                                    debug!("tls-io: pong write error (kind={:?}): {e}", e.kind());
+                                    let _ = recv_tx.send(Err(e));
+                                    return;
+                                }
+                            }
+                            Err(e) => {
+                                debug!("tls-io: pong serialise error: {e}");
+                            }
+                        }
+                    }
+                    Message::Pong => {}
+                    msg => {
+                        if recv_tx.send(Ok(msg)).is_err() {
+                            debug!("tls-io: recv_tx consumer gone, exiting");
+                            return;
+                        }
+                    }
                 }
             }
             Ok(None) => {}
@@ -187,6 +234,8 @@ fn io_loop(
 pub struct Connection {
     recv_rx: Mutex<Receiver<io::Result<Message>>>,
     send_tx: Sender<Option<Frame>>,
+    last_send_wall: Mutex<SystemTime>,
+    last_recv_wall: Arc<Mutex<SystemTime>>,
     pub peer_cert: Option<Vec<u8>>,
 }
 
@@ -237,9 +286,12 @@ impl Connection {
         let (recv_tx, recv_rx) = bounded::<io::Result<Message>>(RECV_CHANNEL_DEPTH);
         let (send_tx, send_rx) = bounded::<Option<Frame>>(SEND_QUEUE_DEPTH);
 
+        let now = SystemTime::now();
+        let last_recv_wall = Arc::new(Mutex::new(now));
+        let last_recv_wall_io = last_recv_wall.clone();
         thread::Builder::new()
             .name("tls-io".into())
-            .spawn(move || io_loop(tls, recv_tx, send_rx))
+            .spawn(move || io_loop(tls, recv_tx, send_rx, last_recv_wall_io))
             .expect("spawn tls-io thread");
         debug!(
             "tls: io-loop thread spawned (recv_channel={RECV_CHANNEL_DEPTH} send_channel={SEND_QUEUE_DEPTH})"
@@ -248,8 +300,14 @@ impl Connection {
         Ok(Self {
             recv_rx: Mutex::new(recv_rx),
             send_tx,
+            last_send_wall: Mutex::new(now),
+            last_recv_wall,
             peer_cert,
         })
+    }
+
+    fn record_send(&self) {
+        *self.last_send_wall.lock() = SystemTime::now();
     }
 
     pub fn send(&self, msg: &Message) -> io::Result<()> {
@@ -274,14 +332,22 @@ impl Connection {
                 frame.len()
             );
         }
-        self.send_tx
+        let r = self
+            .send_tx
             .send(Some(frame))
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"));
+        if r.is_ok() {
+            self.record_send();
+        }
+        r
     }
 
     pub fn try_send_frame(&self, frame: Frame) -> bool {
         match self.send_tx.try_send(Some(frame)) {
-            Ok(_) => true,
+            Ok(_) => {
+                self.record_send();
+                true
+            }
             Err(TrySendError::Full(_)) => {
                 warn!(
                     "tls-io: try_send_frame dropped — send queue full ({}/{})",
@@ -306,6 +372,65 @@ impl Connection {
                 "connection closed",
             )),
         }
+    }
+
+    /// Blocking recv with a timeout. Maps channel disconnect to
+    /// ConnectionAborted (same as `recv`) and channel timeout to TimedOut
+    /// (== WouldBlock-family via `is_timeout`-style handling at call sites).
+    pub fn recv_timeout(&self, t: Duration) -> io::Result<Message> {
+        match self.recv_rx.lock().recv_timeout(t) {
+            Ok(Ok(msg)) => Ok(msg),
+            Ok(Err(e)) => Err(e),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "recv timeout",
+            )),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "connection closed",
+            )),
+        }
+    }
+
+    /// Heartbeat maintenance: send Ping when this side has been idle for
+    /// >= HEARTBEAT_INTERVAL_SECS, and fail with TimedOut when nothing has been
+    /// received for >= HEARTBEAT_TIMEOUT_SECS (covers dead peers AND
+    /// suspend/resume gaps — SystemTime keeps advancing across suspend
+    /// while Instant pauses, so the gap trips the timeout on next check).
+    /// Backwards clock jumps re-baseline instead of false-tripping.
+    /// Only short parking_lot critical sections — never blocks on io_loop
+    /// (io_loop only takes last_recv_wall briefly too).
+    pub fn heartbeat_maintenance(&self) -> io::Result<()> {
+        let now = SystemTime::now();
+        let (since_send, since_recv) = {
+            let last_send = *self.last_send_wall.lock();
+            let last_recv = *self.last_recv_wall.lock();
+            match (now.duration_since(last_send), now.duration_since(last_recv)) {
+                (Ok(s), Ok(r)) => (Some(s), Some(r)),
+                // Clock jumped backwards: re-baseline both, don't trip.
+                _ => {
+                    *self.last_send_wall.lock() = now;
+                    *self.last_recv_wall.lock() = now;
+                    return Ok(());
+                }
+            }
+        };
+        let since_send = since_send.unwrap();
+        let since_recv = since_recv.unwrap();
+        if since_send >= Duration::from_secs(HEARTBEAT_INTERVAL_SECS) {
+            // send() records last_send on success.
+            self.send(&Message::Ping)?;
+        }
+        if since_recv >= Duration::from_secs(HEARTBEAT_TIMEOUT_SECS) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "heartbeat timeout: no data for {} s",
+                    since_recv.as_secs()
+                ),
+            ));
+        }
+        Ok(())
     }
 
     pub fn shutdown(&self) {
