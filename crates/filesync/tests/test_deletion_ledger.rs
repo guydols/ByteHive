@@ -46,7 +46,7 @@ fn sorted_entries(engine: &SyncEngine) -> Vec<(PathBuf, u64, String, Option<Stri
 #[test]
 fn ttl_constant_is_90_days() {
     assert_eq!(DELETION_LEDGER_TTL_MS, 90 * DAY_MS);
-    assert_eq!(PROTOCOL_VERSION, 8, "ledger work rode the clean break to v8");
+    assert_eq!(PROTOCOL_VERSION, 9, "heartbeat Ping/Pong bumped the wire to v9");
 }
 
 /// Core resurrection repro: A deletes `f` while B is offline holding a stale
