@@ -63,6 +63,7 @@ fn file_bundle(rel: &str, content: &[u8]) -> FileBundle {
                 is_dir: false,
             },
             content: content.to_vec(),
+            action_ms: None,
         }],
         bundle_id: 1,
     }
@@ -301,6 +302,7 @@ fn no_conflict_for_directory_entries_in_bundle() {
                 is_dir: true,
             },
             content: vec![],
+            action_ms: None,
         }],
         bundle_id: 10,
     };
@@ -539,6 +541,7 @@ fn only_conflicted_files_get_copies_in_multi_file_bundle() {
                     is_dir: false,
                 },
                 content: b"base1".to_vec(),
+                action_ms: None,
             },
             FileData {
                 metadata: FileMetadata {
@@ -550,6 +553,7 @@ fn only_conflicted_files_get_copies_in_multi_file_bundle() {
                     is_dir: false,
                 },
                 content: b"base2".to_vec(),
+                action_ms: None,
             },
         ],
         bundle_id: 1,
@@ -573,6 +577,7 @@ fn only_conflicted_files_get_copies_in_multi_file_bundle() {
                     is_dir: false,
                 },
                 content: b"remote update1".to_vec(),
+                action_ms: None,
             },
             FileData {
                 metadata: FileMetadata {
@@ -584,6 +589,7 @@ fn only_conflicted_files_get_copies_in_multi_file_bundle() {
                     is_dir: false,
                 },
                 content: b"remote update2".to_vec(),
+                action_ms: None,
             },
         ],
         bundle_id: 2,
@@ -626,6 +632,7 @@ fn unsafe_path_still_rejected_even_with_conflict_logic_active() {
                 is_dir: false,
             },
             content: b"evil".to_vec(),
+            action_ms: None,
         }],
         bundle_id: 99,
     };
@@ -1091,6 +1098,7 @@ fn regression_apply_bundle_multiple_files_written_correctly() {
                     is_dir: false,
                 },
                 content: b"aaa".to_vec(),
+                action_ms: None,
             },
             FileData {
                 metadata: FileMetadata {
@@ -1102,6 +1110,7 @@ fn regression_apply_bundle_multiple_files_written_correctly() {
                     is_dir: false,
                 },
                 content: b"bbb".to_vec(),
+                action_ms: None,
             },
         ],
         bundle_id: 5,

@@ -8,7 +8,7 @@ pub const BUNDLE_MAX_FILES: usize = 500;
 pub const LARGE_FILE_THRESHOLD: u64 = 8 * 1024 * 1024;
 pub const FILE_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 pub const DEBOUNCE_MS: u64 = 200;
 pub const FILE_STABILITY_MS: u64 = 500;
 pub const FILE_CHANGE_COALESCE_MS: u64 = 100;
@@ -43,6 +43,10 @@ pub struct Manifest {
 pub struct FileData {
     pub metadata: FileMetadata,
     pub content: Vec<u8>,
+    /// Live user-action time (ms). `Some` marks a live action that is
+    /// admitted against tombstones by this stamp instead of `modified_ms`;
+    /// `None` is a catch-up transfer judged by `modified_ms`.
+    pub action_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,10 +58,14 @@ pub struct FileBundle {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TombstoneDto {
     pub path: PathBuf,
+    /// Tombstone stamp, or the live-action stamp when `alive` is true.
     pub deleted_at_ms: u64,
     pub deleter_node: String,
     pub prev_hash: Option<String>,
     pub prev_mtime_ms: Option<u64>,
+    /// `true` = live-action record (`deleted_at_ms` is the action time),
+    /// `false` = tombstone.
+    pub alive: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +103,8 @@ pub enum Message {
     LargeFileStart {
         metadata: FileMetadata,
         total_chunks: u32,
+        /// See [`FileData::action_ms`].
+        action_ms: Option<u64>,
     },
     LargeFileChunk {
         path: PathBuf,
@@ -115,6 +125,8 @@ pub enum Message {
     Rename {
         from: PathBuf,
         to: PathBuf,
+        /// Live-action time of the rename (admission of `to`).
+        action_ms: u64,
     },
     // NOTE: a `move_id: u64` (e.g. `timestamp_id()`) was considered for
     // Rename dedup, but is deliberately omitted: `Message` is serialised
@@ -134,6 +146,16 @@ pub enum Message {
     // transport::io_loop and never reach app recv loops.
     Ping,
     Pong,
+    // Action-journal drain (PROTOCOL_VERSION 10). Appended at END so the
+    // discriminants above are unchanged. `ActionBatchEnd` closes one chunk
+    // of journalled actions; the peer answers with `ActionBatchAck` once the
+    // chunk is applied, and only then does the sender drop those entries.
+    ActionBatchEnd {
+        upto_seq: u64,
+    },
+    ActionBatchAck {
+        upto_seq: u64,
+    },
 }
 
 pub fn serialise_message(msg: &Message) -> io::Result<Vec<u8>> {

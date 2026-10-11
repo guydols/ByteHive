@@ -1,3 +1,4 @@
+use crate::action_journal::ActionJournal;
 use crate::bundler;
 use crate::exclusions::Exclusions;
 use crate::ledger::{now_ms, DeletionLedger, Tombstone, DELETION_LEDGER_TTL_MS};
@@ -6,13 +7,16 @@ use crate::manifest_cache::ManifestCache;
 use crate::protocol::FILE_STABILITY_MS;
 use crate::protocol::*;
 use crate::transport::Connection;
+use crate::watcher::FsEvent;
 use bytehive_core::TrashManager;
 use crossbeam_channel::bounded;
 use log::warn;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -89,6 +93,7 @@ struct LargeFileAssembly {
     dst: PathBuf,
     file_size: u64,
     modified_ms: u64,
+    action_ms: Option<u64>,
 
     final_hash_pending: Option<[u8; 32]>,
 }
@@ -112,6 +117,9 @@ pub struct SyncEngine {
     full_scan_interval_secs: u64,
     change_sequences: RwLock<HashMap<PathBuf, FileChangeHistory>>,
     last_sequence_number: RwLock<u64>,
+    journal: Arc<ActionJournal>,
+    ledger_dirty: AtomicBool,
+    live_capture: Mutex<bool>,
 }
 
 pub fn conflict_copy_name(rel_path: &Path, node_id: &str, unix_secs: u64) -> PathBuf {
@@ -184,6 +192,7 @@ impl SyncEngine {
         );
         let trash_manager = TrashManager::new(root.clone(), config.trash_expiry_days);
         let ledger = DeletionLedger::load(&root);
+        let journal = Arc::new(ActionJournal::open(&root));
         Self {
             manifest: RwLock::new(Manifest {
                 files: HashMap::new(),
@@ -200,6 +209,9 @@ impl SyncEngine {
             full_scan_interval_secs,
             change_sequences: RwLock::new(HashMap::new()),
             last_sequence_number: RwLock::new(0),
+            journal,
+            ledger_dirty: AtomicBool::new(false),
+            live_capture: Mutex::new(false),
         }
     }
 
@@ -305,6 +317,9 @@ impl SyncEngine {
             full_scan_interval_secs: self.full_scan_interval_secs,
             change_sequences: RwLock::new(HashMap::new()),
             last_sequence_number: RwLock::new(0),
+            journal: self.journal.clone(),
+            ledger_dirty: AtomicBool::new(false),
+            live_capture: Mutex::new(false),
         }
     }
 
@@ -397,7 +412,118 @@ impl SyncEngine {
         self.manifest.read().clone()
     }
 
-    // ---- Deletion ledger (tombstones) ----
+    // ---- Deletion ledger (tombstones + live-action records) ----
+
+    /// Mutate the deletion ledger. Marks it dirty when `f` reports a change;
+    /// persist with [`SyncEngine::flush_ledger`] at the end of a batch.
+    fn ledger_mut(&self, f: impl FnOnce(&mut DeletionLedger) -> bool) {
+        if f(&mut self.ledger.write()) {
+            self.ledger_dirty.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Persist the deletion ledger when it changed since the last save.
+    pub fn flush_ledger(&self) {
+        if !self.ledger_dirty.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        if let Err(e) = self.ledger.read().save_atomic(&self.root) {
+            self.ledger_dirty.store(true, Ordering::SeqCst);
+            log::warn!("ledger: save failed: {e}");
+        }
+    }
+
+    /// Copy of the current deletion ledger (tombstones and live records).
+    pub fn ledger_snapshot(&self) -> DeletionLedger {
+        self.ledger.read().clone()
+    }
+
+    /// Action journal of this sync root (client-side captured user actions).
+    pub fn journal(&self) -> &Arc<ActionJournal> {
+        &self.journal
+    }
+
+    /// Stamp for an outgoing file: the newest of the local live-action record
+    /// and the mtime, or `None` when no live action is recorded (catch-up
+    /// semantics, judged by mtime on the receiver).
+    pub fn wire_action_stamp(&self, rel: &Path, modified_ms: u64) -> Option<u64> {
+        let alive = self.ledger.read().alive_since(rel);
+        if alive > 0 {
+            Some(alive.max(modified_ms))
+        } else {
+            None
+        }
+    }
+
+    /// Start capturing this root's user actions into the journal. Idempotent
+    /// per engine: the watcher lives for the engine's lifetime, so actions are
+    /// journalled while no peer is connected.
+    pub fn start_live_capture(self: &Arc<Self>) -> io::Result<()> {
+        let mut started = self.live_capture.lock();
+        if *started {
+            return Ok(());
+        }
+        let (tx, rx) = bounded::<FsEvent>(4096);
+        crate::watcher::start_watcher(self.root.clone(), tx)?;
+        let engine = Arc::clone(self);
+        thread::Builder::new()
+            .name("action-capture".into())
+            .spawn(move || {
+                for event in rx {
+                    engine.capture_fs_event(event);
+                }
+            })?;
+        *started = true;
+        Ok(())
+    }
+
+    /// Journal one watcher event as a user action, stamped with receipt time.
+    pub fn capture_fs_event(&self, event: FsEvent) {
+        let now = now_ms();
+        let result = match event {
+            FsEvent::Changed(p) | FsEvent::WriteComplete(p) => {
+                if self.is_suppressed(&p) || self.is_excluded(&p) {
+                    return;
+                }
+                self.journal.upsert(p, now)
+            }
+            FsEvent::Deleted(p) => {
+                if self.is_delete_suppressed(&p) || self.is_excluded(&p) {
+                    return;
+                }
+                self.journal.delete(p, now)
+            }
+            FsEvent::Renamed(from, to) => {
+                if self.is_suppressed(&from)
+                    || self.is_suppressed(&to)
+                    || self.is_excluded(&from)
+                    || self.is_excluded(&to)
+                {
+                    return;
+                }
+                self.journal.rename(from, to, now)
+            }
+        };
+        if let Err(e) = result {
+            log::error!("action journal: append failed: {e}");
+        }
+    }
+
+    /// Record server-side live user actions (`(path, action_ms)`) so relays of
+    /// those paths carry a live stamp instead of the possibly old mtime.
+    pub fn record_live_actions(&self, actions: &[(PathBuf, u64)]) {
+        if actions.is_empty() {
+            return;
+        }
+        self.ledger_mut(|l| {
+            let mut changed = false;
+            for (path, at) in actions {
+                changed |= l.record_alive(path, *at);
+            }
+            changed
+        });
+        self.flush_ledger();
+    }
 
     /// Record a deletion tombstone and persist the ledger (best effort:
     /// save errors are logged, not propagated).
@@ -409,31 +535,35 @@ impl SyncEngine {
         prev_hash: Option<String>,
         prev_mtime_ms: Option<u64>,
     ) {
-        self.ledger.write().record(
-            path,
-            deleted_at_ms,
-            deleter.to_string(),
-            prev_hash,
-            prev_mtime_ms,
-        );
-        if let Err(e) = self.ledger.read().save_atomic(&self.root) {
-            log::warn!("ledger: save after record failed: {e}");
-        }
+        self.ledger_mut(|l| {
+            l.record(
+                path,
+                deleted_at_ms,
+                deleter.to_string(),
+                prev_hash,
+                prev_mtime_ms,
+            );
+            true
+        });
+        self.flush_ledger();
     }
 
-    /// Merge remote tombstones (LWW per path) and persist. Returns the
-    /// number of DTOs received.
+    /// Merge remote ledger entries and persist. Live records (`alive`) are
+    /// applied before tombstones, so a stale tombstone is never kept over a
+    /// newer live action. Returns the number of DTOs received.
     pub fn merge_ledger(&self, dtos: Vec<TombstoneDto>) -> usize {
         let n = dtos.len();
         if n == 0 {
             return 0;
         }
-        let remote: HashMap<PathBuf, Tombstone> = dtos
-            .into_iter()
-            .map(|d| {
-                let path = d.path.clone();
-                (
-                    path,
+        let mut alive: Vec<(PathBuf, u64)> = Vec::new();
+        let mut remote: HashMap<PathBuf, Tombstone> = HashMap::new();
+        for d in dtos {
+            if d.alive {
+                alive.push((d.path, d.deleted_at_ms));
+            } else {
+                remote.insert(
+                    d.path.clone(),
                     Tombstone::new(
                         d.path,
                         d.deleted_at_ms,
@@ -441,20 +571,25 @@ impl SyncEngine {
                         d.prev_hash,
                         d.prev_mtime_ms,
                     ),
-                )
-            })
-            .collect();
-        self.ledger.write().merge_remote(remote);
-        if let Err(e) = self.ledger.read().save_atomic(&self.root) {
-            log::warn!("ledger: save after merge failed: {e}");
+                );
+            }
         }
+        self.ledger_mut(|l| {
+            for (path, at) in &alive {
+                l.record_alive(path, *at);
+            }
+            l.merge_remote(remote);
+            true
+        });
+        self.flush_ledger();
         n
     }
 
-    /// Snapshot local tombstones as DTOs for a LedgerExchange.
+    /// Snapshot the ledger as DTOs for a LedgerExchange: tombstones, then
+    /// live-action records (`alive: true`, `deleted_at_ms` = action time).
     pub fn ledger_entries(&self) -> Vec<TombstoneDto> {
-        self.ledger
-            .read()
+        let l = self.ledger.read();
+        let mut out: Vec<TombstoneDto> = l
             .iter()
             .map(|(_, t)| TombstoneDto {
                 path: t.path.clone(),
@@ -462,8 +597,18 @@ impl SyncEngine {
                 deleter_node: t.deleter_node.clone(),
                 prev_hash: t.prev_hash.clone(),
                 prev_mtime_ms: t.prev_mtime_ms,
+                alive: false,
             })
-            .collect()
+            .collect();
+        out.extend(l.alive_iter().map(|(path, at)| TombstoneDto {
+            path: path.clone(),
+            deleted_at_ms: *at,
+            deleter_node: String::new(),
+            prev_hash: None,
+            prev_mtime_ms: None,
+            alive: true,
+        }));
+        out
     }
 
     /// Returns true if a tombstone for `path` exists and is strictly newer
@@ -472,59 +617,60 @@ impl SyncEngine {
         self.ledger.read().has_newer_than(path, mtime_ms)
     }
 
-    /// Covering-tombstone veto: delegates to
-    /// [`DeletionLedger::covering_tombstone`] (nearest tombstone at `path`
-    /// or any ancestor). Returns the tombstoned path when it vetoes `path`
-    /// at `incoming_mtime_ms` (tombstone strictly newer than the incoming
-    /// mtime); returns `None` when there is no covering tombstone or the
-    /// incoming write is a legitimate recreate (incoming mtime strictly
-    /// newer — see `clear_tombstone_on_recreate`).
+    /// Covering-tombstone veto for a catch-up write judged by `incoming_mtime_ms`.
+    /// Returns the tombstoned path when it vetoes `path`.
     pub fn covering_tombstone_veto(
         &self,
         path: &Path,
         incoming_mtime_ms: u64,
     ) -> Option<PathBuf> {
+        self.veto_for(path, None, incoming_mtime_ms)
+    }
+
+    /// Admission check for an incoming write of `rel`. The write is vetoed
+    /// when a covering tombstone is strictly newer than its comparand: the
+    /// live action stamp, or the mtime for catch-up (`action_ms == None`).
+    /// Equal stamps are accepted. Returns the tombstoned path on veto.
+    fn veto_for(&self, rel: &Path, action_ms: Option<u64>, modified_ms: u64) -> Option<PathBuf> {
+        let cmp = action_ms.unwrap_or(modified_ms);
         let ledger = self.ledger.read();
-        match ledger.covering_tombstone(path) {
-            Some(t) if t.deleted_at_ms > incoming_mtime_ms => Some(t.path.clone()),
-            _ => None,
-        }
+        ledger
+            .covering_tombstone(rel)
+            .filter(|t| t.deleted_at_ms > cmp)
+            .map(|t| t.path.clone())
     }
 
-    /// Clear the exact-path tombstone when an incoming write is a
-    /// legitimate recreate (incoming mtime strictly newer than the
-    /// tombstone). Persists only when something was removed. Returns true
-    /// when a tombstone was lifted.
-    fn clear_tombstone_on_recreate(&self, path: &Path, incoming_mtime_ms: u64) -> bool {
-        let should_clear = self
-            .ledger
-            .read()
-            .get(path)
-            .map(|t| incoming_mtime_ms > t.deleted_at_ms)
-            .unwrap_or(false);
-        if should_clear {
-            self.ledger.write().remove(path);
-            if let Err(e) = self.ledger.read().save_atomic(&self.root) {
-                log::warn!("ledger: save after recreate-clear failed: {e}");
+    /// Record an admitted write. A live action raises the live-action record
+    /// for `rel`, lifting any tombstone it supersedes. A catch-up write lifts
+    /// an exact tombstone strictly older than its mtime. Persist via
+    /// [`SyncEngine::flush_ledger`].
+    fn admit_record(&self, rel: &Path, action_ms: Option<u64>, modified_ms: u64) {
+        match action_ms {
+            Some(at) => {
+                if self.ledger.read().alive_record_needed(rel, at) {
+                    self.ledger_mut(|l| l.record_alive(rel, at));
+                }
             }
-            return true;
+            None => {
+                let lift = matches!(
+                    self.ledger.read().get(rel),
+                    Some(t) if modified_ms > t.deleted_at_ms
+                );
+                if lift {
+                    self.ledger_mut(|l| l.record_alive(rel, modified_ms));
+                }
+            }
         }
-        false
     }
 
-    /// Drop tombstones older than the 90-day TTL. Persists only when at
-    /// least one entry was pruned. Returns the number removed.
+    /// Drop tombstones and live records older than the 90-day TTL. Persists
+    /// only when at least one entry was pruned. Returns the number removed.
     pub fn prune_ledger(&self) -> usize {
-        let pruned = self
-            .ledger
-            .write()
-            .prune(now_ms(), DELETION_LEDGER_TTL_MS);
+        let pruned = self.ledger.write().prune(now_ms(), DELETION_LEDGER_TTL_MS);
         if pruned > 0 {
-            if let Err(e) = self.ledger.read().save_atomic(&self.root) {
-                log::warn!("ledger: save after prune failed: {e}");
-            } else {
-                log::info!("ledger: pruned {pruned} expired tombstone(s)");
-            }
+            self.ledger_dirty.store(true, Ordering::SeqCst);
+            self.flush_ledger();
+            log::info!("ledger: pruned {pruned} expired entr(ies)");
         }
         pruned
     }
@@ -535,19 +681,51 @@ impl SyncEngine {
         if paths.is_empty() {
             return;
         }
-        let mut removed_any = false;
-        {
-            let mut ledger = self.ledger.write();
+        self.ledger_mut(|l| {
+            let mut removed_any = false;
             for p in paths {
-                if ledger.remove(p).is_some() {
+                if l.remove(p).is_some() {
                     removed_any = true;
                 }
             }
-        }
-        if removed_any {
-            if let Err(e) = self.ledger.read().save_atomic(&self.root) {
-                log::warn!("ledger: save after clear failed: {e}");
-            }
+            removed_any
+        });
+        self.flush_ledger();
+    }
+
+    /// Covering tombstone that beats a live action stamped `action_ms`
+    /// (strictly newer), or `None` when the action may be admitted.
+    pub fn tombstone_beating(&self, path: &Path, action_ms: u64) -> Option<Tombstone> {
+        self.ledger
+            .read()
+            .covering_tombstone(path)
+            .filter(|t| t.deleted_at_ms > action_ms)
+            .cloned()
+    }
+
+    /// Stage a tombstone for a user delete captured in the journal. The
+    /// manifest supplies the previous content info. Persist with
+    /// [`SyncEngine::flush_ledger`].
+    pub fn stage_delete(&self, path: PathBuf, deleted_at_ms: u64) {
+        let (prev_hash, prev_mtime_ms) = self
+            .manifest
+            .read()
+            .files
+            .get(&path)
+            .map(|m| (Some(crate::hex(&m.hash)), Some(m.modified_ms)))
+            .unwrap_or((None, None));
+        let node = self.node_id.clone();
+        self.ledger_mut(|l| {
+            l.record(path, deleted_at_ms, node, prev_hash, prev_mtime_ms);
+            true
+        });
+    }
+
+    /// Stage a live-action record for a journalled create/modify/rename
+    /// target. Persist with [`SyncEngine::flush_ledger`].
+    pub fn stage_live_action(&self, path: &Path, action_ms: u64) {
+        if self.ledger.read().alive_record_needed(path, action_ms) {
+            self.ledger_mut(|l| l.record_alive(path, action_ms));
         }
     }
 
@@ -559,39 +737,33 @@ impl SyncEngine {
         let chunk_size = (paths.len() + READ_THREADS - 1) / READ_THREADS;
         let (msg_tx, msg_rx) = bounded::<Message>(PIPELINE_DEPTH);
 
-        let handles: Vec<_> = paths
-            .chunks(chunk_size)
-            .map(|slice| {
-                let root = self.root.clone();
-                let slice = slice.to_vec();
+        thread::scope(|s| -> std::io::Result<()> {
+            for slice in paths.chunks(chunk_size) {
                 let tx = msg_tx.clone();
-                thread::Builder::new()
-                    .name("file-reader".into())
-                    .spawn(move || {
-                        bundler::stream_messages(&root, &slice, &tx, None);
-                    })
-                    .expect("spawn file-reader")
-            })
-            .collect();
+                s.spawn(move || {
+                    let stamp = |rel: &Path, mtime: u64| self.wire_action_stamp(rel, mtime);
+                    bundler::stream_messages(&self.root, slice, &tx, None, &stamp);
+                });
+            }
+            drop(msg_tx);
 
-        drop(msg_tx);
-
-        for msg in msg_rx {
-            conn.send(&msg)?;
-        }
-
-        for h in handles {
-            h.join().ok();
-        }
-        Ok(())
+            for msg in msg_rx {
+                conn.send(&msg)?;
+            }
+            Ok(())
+        })
     }
 
     pub fn create_bundles(&self, paths: &[PathBuf]) -> Vec<FileBundle> {
         let (tx, rx) = bounded::<Message>(PIPELINE_DEPTH);
         let root = self.root.clone();
         let paths = paths.to_vec();
-        let engine = self.clone_with_fresh_state();
-        thread::spawn(move || bundler::stream_messages(&root, &paths, &tx, Some(Arc::new(engine))));
+        let engine = Arc::new(self.clone_with_fresh_state());
+        thread::spawn(move || {
+            let stamp_engine = engine.clone();
+            let stamp = move |rel: &Path, mtime: u64| stamp_engine.wire_action_stamp(rel, mtime);
+            bundler::stream_messages(&root, &paths, &tx, Some(engine), &stamp)
+        });
         rx.into_iter()
             .filter_map(|m| {
                 if let Message::Bundle(b) = m {
@@ -634,23 +806,24 @@ impl SyncEngine {
                 continue;
             }
 
-            // Live resurrection guard: veto writes covered by a tombstone
-            // strictly newer than the incoming mtime (path or ancestor).
-            // A strictly newer incoming mtime is a legitimate recreate and
-            // lifts the exact-path tombstone instead.
+            // Resurrection guard: a covering tombstone strictly newer than
+            // the comparand (live action stamp, or mtime for catch-up) vetoes
+            // the write. Admitted writes update the live-action record.
             if let Some(tomb_path) =
-                self.covering_tombstone_veto(&fd.metadata.rel_path, fd.metadata.modified_ms)
+                self.veto_for(&fd.metadata.rel_path, fd.action_ms, fd.metadata.modified_ms)
             {
                 log::warn!(
-                    "apply_bundle: vetoing {:?} (covering tombstone {:?} beats incoming mtime {})",
+                    "apply_bundle: vetoing {:?} (covering tombstone {:?} beats {} {})",
                     fd.metadata.rel_path,
                     tomb_path,
-                    fd.metadata.modified_ms,
+                    if fd.action_ms.is_some() { "live action" } else { "incoming mtime" },
+                    fd.action_ms.unwrap_or(fd.metadata.modified_ms),
                 );
                 continue;
             }
-            self.clear_tombstone_on_recreate(
+            self.admit_record(
                 &fd.metadata.rel_path,
+                fd.action_ms,
                 fd.metadata.modified_ms,
             );
 
@@ -716,6 +889,8 @@ impl SyncEngine {
             result.written += 1;
         }
 
+        self.flush_ledger();
+
         dir_mtimes.sort_by(|a, b| b.0.components().count().cmp(&a.0.components().count()));
         for (path, modified_ms) in dir_mtimes {
             let mtime = filetime::FileTime::from_unix_time(
@@ -731,31 +906,42 @@ impl SyncEngine {
         Ok(result)
     }
 
+    /// Catch-up form of [`SyncEngine::begin_large_file_with_action`].
     pub fn begin_large_file(
         &self,
         metadata: FileMetadata,
         total_chunks: u32,
+    ) -> std::io::Result<()> {
+        self.begin_large_file_with_action(metadata, total_chunks, None)
+    }
+
+    pub fn begin_large_file_with_action(
+        &self,
+        metadata: FileMetadata,
+        total_chunks: u32,
+        action_ms: Option<u64>,
     ) -> std::io::Result<()> {
         if !safe_relative(&metadata.rel_path) {
             warn!("rejected unsafe large-file path: {:?}", metadata.rel_path);
             return Ok(());
         }
 
-        // Live resurrection guard (same policy as apply_bundle): veto the
-        // stream setup when a covering tombstone beats the incoming mtime;
-        // lift the exact tombstone on a legitimate recreate.
+        // Resurrection guard (same policy as apply_bundle): veto the stream
+        // setup when a covering tombstone beats the comparand.
         if let Some(tomb_path) =
-            self.covering_tombstone_veto(&metadata.rel_path, metadata.modified_ms)
+            self.veto_for(&metadata.rel_path, action_ms, metadata.modified_ms)
         {
             log::warn!(
-                "begin_large_file: vetoing {:?} (covering tombstone {:?} beats incoming mtime {})",
+                "begin_large_file: vetoing {:?} (covering tombstone {:?} beats {} {})",
                 metadata.rel_path,
                 tomb_path,
-                metadata.modified_ms,
+                if action_ms.is_some() { "live action" } else { "incoming mtime" },
+                action_ms.unwrap_or(metadata.modified_ms),
             );
             return Ok(());
         }
-        self.clear_tombstone_on_recreate(&metadata.rel_path, metadata.modified_ms);
+        self.admit_record(&metadata.rel_path, action_ms, metadata.modified_ms);
+        self.flush_ledger();
 
         let dst = self.root.join(&metadata.rel_path);
         if let Some(parent) = dst.parent() {
@@ -800,6 +986,7 @@ impl SyncEngine {
                 dst,
                 file_size: metadata.size,
                 modified_ms: metadata.modified_ms,
+                action_ms,
                 final_hash_pending: None,
             },
         );
@@ -882,16 +1069,18 @@ impl SyncEngine {
         // Re-check the resurrection guard at commit time: a tombstone may
         // have arrived between LargeFileStart and commit. Veto the write
         // (clean up tmp) instead of recreating a deleted path.
-        if let Some(tomb_path) = self.covering_tombstone_veto(path, asm.modified_ms) {
+        if let Some(tomb_path) = self.veto_for(path, asm.action_ms, asm.modified_ms) {
             log::warn!(
-                "commit_large_file: vetoing {path:?} (covering tombstone {tomb_path:?} beats incoming mtime {})",
-                asm.modified_ms,
+                "commit_large_file: vetoing {path:?} (covering tombstone {tomb_path:?} beats {} {})",
+                if asm.action_ms.is_some() { "live action" } else { "incoming mtime" },
+                asm.action_ms.unwrap_or(asm.modified_ms),
             );
+            // Owns `asm.tmp_path` exclusively (per-path staging name).
             let _ = fs::remove_file(&asm.tmp_path);
-            cleanup_transfer_dirs(&self.root, &asm.tmp_path);
             return Ok(FinishResult::Committed);
         }
-        self.clear_tombstone_on_recreate(path, asm.modified_ms);
+        self.admit_record(path, asm.action_ms, asm.modified_ms);
+        self.flush_ledger();
 
         {
             use std::io::Read;
@@ -908,6 +1097,8 @@ impl SyncEngine {
             }
             let got: [u8; 32] = hasher.finalize().into();
             if got != final_hash {
+                // Only this transfer's own staging file is removed; siblings
+                // (e.g. pack-X.idx beside pack-X.pack) are untouched.
                 let _ = fs::remove_file(&asm.tmp_path);
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -963,8 +1154,11 @@ impl SyncEngine {
             }
         };
 
+        // Moves only this transfer's staging file into place. The staging
+        // directory is shared by all transfers and is intentionally never
+        // removed here: removing it could race another transfer's
+        // create_dir_all in begin_large_file and make its open() fail.
         fs::rename(&asm.tmp_path, &asm.dst)?;
-        cleanup_transfer_dirs(&self.root, &asm.tmp_path);
 
         let mtime = filetime::FileTime::from_unix_time(
             (asm.modified_ms / 1000) as i64,
@@ -1005,15 +1199,39 @@ impl SyncEngine {
                     warn!("clear_in_progress: removing tmp for {path:?}: {e}");
                 }
             }
-            cleanup_transfer_dirs(&self.root, &asm.tmp_path);
         }
     }
 
+    /// Catch-up/legacy form of [`SyncEngine::apply_rename_at`] stamped now.
     pub fn apply_rename(&self, from: &PathBuf, to: &PathBuf) -> std::io::Result<()> {
+        let node = self.node_id.clone();
+        self.apply_rename_at(from, to, now_ms(), &node)
+    }
+
+    /// Apply a live rename stamped `action_ms`. The destination is admitted
+    /// against tombstones; when vetoed, the moved content is stale and the
+    /// source is deleted at `action_ms` instead (as the rename's effect).
+    pub fn apply_rename_at(
+        &self,
+        from: &PathBuf,
+        to: &PathBuf,
+        action_ms: u64,
+        deleter: &str,
+    ) -> std::io::Result<()> {
         if !safe_relative(from) || !safe_relative(to) {
             warn!("apply_rename: rejected unsafe path(s): {from:?} → {to:?}");
             return Ok(());
         }
+
+        if let Some(tomb_path) = self.veto_for(to, Some(action_ms), 0) {
+            log::warn!(
+                "apply_rename: {to:?} vetoed by covering tombstone {tomb_path:?}; deleting source {from:?}"
+            );
+            self.apply_deletes(&[from.clone()], action_ms, deleter)?;
+            return Ok(());
+        }
+        self.admit_record(to, Some(action_ms), 0);
+        self.flush_ledger();
 
         let src = self.root.join(from);
         let dst = self.root.join(to);
@@ -1196,13 +1414,21 @@ impl SyncEngine {
                 }
                 v
             };
-            {
-                let mut sup = self.suppressed_deletes.write();
-                for p in &subtree {
-                    sup.insert(p.clone());
-                    removed.push(p.clone());
-                }
-            }
+
+            // Live-action guard: a path whose live action is at least as new
+            // as this delete was recreated after the delete was issued. It is
+            // kept, and the delete only removes what it is newer than.
+            let protected: HashSet<PathBuf> = {
+                let ledger = self.ledger.read();
+                subtree
+                    .iter()
+                    .filter(|p| {
+                        let at = ledger.alive_since(p);
+                        at > 0 && at >= deleted_at_ms
+                    })
+                    .cloned()
+                    .collect()
+            };
 
             // Snapshot manifest info BEFORE removal for the tombstone.
             let (prev_hash, prev_mtime_ms) = self
@@ -1214,28 +1440,72 @@ impl SyncEngine {
                 .unwrap_or((None, None));
 
             let full = self.root.join(rel);
-            if full.is_dir() {
-                self.trash_manager.move_to_trash(&full, rel, &self.node_id);
-                let mut m = self.manifest.write();
-                for child in &subtree {
-                    m.files.remove(child);
+            if protected.is_empty() {
+                {
+                    let mut sup = self.suppressed_deletes.write();
+                    for p in &subtree {
+                        sup.insert(p.clone());
+                        removed.push(p.clone());
+                    }
+                }
+                if full.is_dir() {
+                    self.trash_manager.move_to_trash(&full, rel, &self.node_id);
+                    let mut m = self.manifest.write();
+                    for child in &subtree {
+                        m.files.remove(child);
+                    }
+                } else {
+                    self.trash_manager.move_to_trash(&full, rel, &self.node_id);
+                    self.manifest.write().files.remove(rel);
                 }
             } else {
-                self.trash_manager.move_to_trash(&full, rel, &self.node_id);
-                self.manifest.write().files.remove(rel);
+                log::info!(
+                    "apply_deletes: keeping {} live-recreated path(s) under {:?} (action newer than delete @{})",
+                    protected.len(),
+                    rel,
+                    deleted_at_ms
+                );
+                let mut targets: Vec<PathBuf> = subtree
+                    .iter()
+                    .filter(|p| !protected.contains(*p))
+                    .cloned()
+                    .collect();
+                targets.sort_by_key(|p| p.components().count());
+                let mut gone: Vec<PathBuf> = Vec::new();
+                for target in targets {
+                    if gone.iter().any(|g| target.starts_with(g)) {
+                        continue;
+                    }
+                    let target_full = self.root.join(&target);
+                    if target_full.is_dir()
+                        && protected.iter().any(|q| q != &target && q.starts_with(&target))
+                    {
+                        continue;
+                    }
+                    self.suppressed_deletes.write().insert(target.clone());
+                    removed.push(target.clone());
+                    self.trash_manager
+                        .move_to_trash(&target_full, &target, &self.node_id);
+                    self.manifest
+                        .write()
+                        .files
+                        .retain(|k, _| !k.starts_with(&target));
+                    gone.push(target);
+                }
             }
+
             // Record ALWAYS, even when the file was absent on disk and no
             // manifest entry existed (fixes the silent-absent gap: the peer
             // may still hold the file and would otherwise resurrect it).
+            // `record` ignores the tombstone when a newer live action exists.
             tombstones.push((rel.clone(), prev_hash, prev_mtime_ms));
             count += 1;
         }
 
         if !tombstones.is_empty() {
-            {
-                let mut ledger = self.ledger.write();
+            self.ledger_mut(|l| {
                 for (path, prev_hash, prev_mtime_ms) in tombstones {
-                    ledger.record(
+                    l.record(
                         path,
                         deleted_at_ms,
                         deleter.to_string(),
@@ -1243,10 +1513,9 @@ impl SyncEngine {
                         prev_mtime_ms,
                     );
                 }
-            }
-            if let Err(e) = self.ledger.read().save_atomic(&self.root) {
-                log::warn!("ledger: save after apply_deletes failed: {e}");
-            }
+                true
+            });
+            self.flush_ledger();
         }
 
         removed.sort();

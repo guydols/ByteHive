@@ -3,6 +3,9 @@
 //! Foundation for resurrection-safe deletes (TODO 1):
 //! - Tombstones persist in `<root>/.bh_filesync/deletion-ledger.json`
 //! - Last-writer-wins per path on `deleted_at_ms`
+//! - Live-action records (`alive`): the newest user action that created or
+//!   modified a path. A tombstone at or before that stamp is superseded, so
+//!   a live copy is never vetoed by an older delete.
 //! - 90-day TTL via [`DeletionLedger::prune`]
 //! - Never panics on corrupt / missing files: corrupt JSON is backed up
 //!   to `deletion-ledger.corrupt-<ts>.json` and an empty ledger is returned.
@@ -48,11 +51,17 @@ impl Tombstone {
     }
 }
 
-/// Persistent set of deletion tombstones, keyed by relative path.
+/// Persistent set of deletion tombstones, keyed by relative path, plus the
+/// live-action record `A(P)` per path.
+///
+/// Invariant: a stored tombstone at `P` has `deleted_at_ms > A(P)`
+/// (`A(P)` = `alive[P]`, or 0 when absent).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeletionLedger {
     #[serde(default)]
     pub entries: HashMap<PathBuf, Tombstone>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub alive: HashMap<PathBuf, u64>,
 }
 
 fn ledger_path(root: &Path) -> PathBuf {
@@ -72,6 +81,7 @@ impl DeletionLedger {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            alive: HashMap::new(),
         }
     }
 
@@ -92,7 +102,10 @@ impl DeletionLedger {
             return ledger;
         }
         if let Ok(map) = serde_json::from_str::<HashMap<PathBuf, Tombstone>>(&raw) {
-            return Self { entries: map };
+            return Self {
+                entries: map,
+                alive: HashMap::new(),
+            };
         }
         // Corrupt: back up best-effort, then start empty.
         let backup = path.with_extension(format!("corrupt-{}.json", now_ms()));
@@ -114,8 +127,52 @@ impl DeletionLedger {
         Ok(())
     }
 
+    /// Last live-action stamp for `path` (0 when none recorded).
+    pub fn alive_since(&self, path: &Path) -> u64 {
+        self.alive.get(path).copied().unwrap_or(0)
+    }
+
+    /// True when a live action at `path` is at least as new as a tombstone
+    /// stamped `deleted_at_ms` (the tombstone is superseded).
+    fn is_superseded(&self, path: &Path, deleted_at_ms: u64) -> bool {
+        matches!(self.alive.get(path), Some(&a) if deleted_at_ms <= a)
+    }
+
+    /// True when [`DeletionLedger::record_alive`] with `action_ms` would
+    /// change state (new newest action, or a tombstone it would lift).
+    pub fn alive_record_needed(&self, path: &Path, action_ms: u64) -> bool {
+        action_ms > 0
+            && (action_ms > self.alive_since(path)
+                || matches!(self.entries.get(path), Some(t) if t.deleted_at_ms <= action_ms))
+    }
+
+    /// Record a live action at `path` stamped `action_ms`: raises `A(P)` and
+    /// lifts any tombstone at `P` it supersedes (`deleted_at_ms <= action_ms`).
+    /// Returns true when state changed (caller decides when to persist).
+    pub fn record_alive(&mut self, path: &Path, action_ms: u64) -> bool {
+        if action_ms == 0 {
+            return false;
+        }
+        let mut changed = false;
+        if action_ms > self.alive_since(path) {
+            self.alive.insert(path.to_path_buf(), action_ms);
+            changed = true;
+        }
+        if matches!(self.entries.get(path), Some(t) if t.deleted_at_ms <= action_ms) {
+            self.entries.remove(path);
+            changed = true;
+        }
+        changed
+    }
+
+    /// Borrow every live-action record as `(path, action_ms)`.
+    pub fn alive_iter(&self) -> impl Iterator<Item = (&PathBuf, &u64)> {
+        self.alive.iter()
+    }
+
     /// Record a tombstone. Last-writer-wins: keeps whichever entry has the
-    /// newest `deleted_at_ms`.
+    /// newest `deleted_at_ms`. A tombstone not newer than the live-action
+    /// record for `path` is ignored.
     pub fn record(
         &mut self,
         path: PathBuf,
@@ -124,6 +181,9 @@ impl DeletionLedger {
         prev_hash: Option<String>,
         prev_mtime_ms: Option<u64>,
     ) {
+        if self.is_superseded(&path, deleted_at_ms) {
+            return;
+        }
         let entry = Tombstone::new(
             path.clone(),
             deleted_at_ms,
@@ -148,19 +208,24 @@ impl DeletionLedger {
         }
     }
 
-    /// Nearest tombstone at `path` or any ancestor (prefix) directory.
+    /// Nearest tombstone at `path` or any ancestor (prefix) directory that
+    /// still applies to `path`.
     ///
     /// Walks `path` and its ancestors nearest-first (exact match wins,
-    /// then parent, grandparent, ...). Returns the first tombstone found,
-    /// or `None` when neither `path` nor any ancestor is tombstoned.
+    /// then parent, grandparent, ...). A tombstone not newer than the
+    /// live-action record of `path` is skipped and the search continues.
     /// Used so a directory delete (which tombstones only the top path)
     /// still covers resurrected children.
     pub fn covering_tombstone(&self, path: &Path) -> Option<&Tombstone> {
+        let floor = self.alive.get(path).copied();
         for ancestor in path.ancestors() {
             if ancestor.as_os_str().is_empty() {
                 break;
             }
             if let Some(t) = self.entries.get(ancestor) {
+                if matches!(floor, Some(a) if t.deleted_at_ms <= a) {
+                    continue;
+                }
                 return Some(t);
             }
         }
@@ -177,9 +242,13 @@ impl DeletionLedger {
         }
     }
 
-    /// Merge remote tombstones, keeping the newest per path (LWW).
+    /// Merge remote tombstones, keeping the newest per path (LWW). Tombstones
+    /// superseded by a live-action record are dropped.
     pub fn merge_remote(&mut self, remote: HashMap<PathBuf, Tombstone>) {
         for (path, tomb) in remote {
+            if self.is_superseded(&path, tomb.deleted_at_ms) {
+                continue;
+            }
             match self.entries.get(&path) {
                 Some(existing) if existing.deleted_at_ms >= tomb.deleted_at_ms => {}
                 _ => {
@@ -189,9 +258,9 @@ impl DeletionLedger {
         }
     }
 
-    /// Drop tombstones older than `ttl_ms` relative to `now_ms`.
-    /// Entries from the future (`deleted_at_ms > now_ms`) are kept.
-    /// Returns the number of entries removed.
+    /// Drop tombstones and live-action records older than `ttl_ms` relative
+    /// to `now_ms`. Entries from the future (`stamp > now_ms`) are kept.
+    /// Returns the number of entries removed (tombstones + live records).
     pub fn prune(&mut self, now_ms: u64, ttl_ms: u64) -> usize {
         let before = self.entries.len();
         self.entries.retain(|_, t| {
@@ -200,7 +269,14 @@ impl DeletionLedger {
             }
             now_ms.saturating_sub(t.deleted_at_ms) <= ttl_ms
         });
-        before - self.entries.len()
+        let before_alive = self.alive.len();
+        self.alive.retain(|_, a| {
+            if *a > now_ms {
+                return true;
+            }
+            now_ms.saturating_sub(*a) <= ttl_ms
+        });
+        (before - self.entries.len()) + (before_alive - self.alive.len())
     }
 
     /// Drop tombstones older than the default 90-day TTL. Returns the

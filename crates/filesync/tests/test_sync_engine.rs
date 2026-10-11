@@ -42,6 +42,7 @@ fn file_bundle(rel: &str, content: &[u8]) -> FileBundle {
                 is_dir: false,
             },
             content: content.to_vec(),
+            action_ms: None,
         }],
         bundle_id: 1,
     }
@@ -59,6 +60,7 @@ fn dir_bundle(rel: &str) -> FileBundle {
                 is_dir: true,
             },
             content: vec![],
+            action_ms: None,
         }],
         bundle_id: 2,
     }
@@ -148,6 +150,7 @@ fn apply_bundle_rejects_path_traversal() {
                 is_dir: false,
             },
             content: b"evil".to_vec(),
+            action_ms: None,
         }],
         bundle_id: 99,
     };
@@ -172,6 +175,7 @@ fn apply_bundle_rejects_absolute_path() {
                 is_dir: false,
             },
             content: b"evil".to_vec(),
+            action_ms: None,
         }],
         bundle_id: 100,
     };
@@ -208,6 +212,7 @@ fn apply_bundle_handles_multiple_files_in_one_bundle() {
                     is_dir: false,
                 },
                 content: b"a".to_vec(),
+                action_ms: None,
             },
             FileData {
                 metadata: FileMetadata {
@@ -219,6 +224,7 @@ fn apply_bundle_handles_multiple_files_in_one_bundle() {
                     is_dir: false,
                 },
                 content: b"b".to_vec(),
+                action_ms: None,
             },
         ],
         bundle_id: 5,
@@ -788,6 +794,7 @@ fn merge_and_export_ledger_entries_roundtrip() {
         deleter_node: "node-remote".to_string(),
         prev_hash: None,
         prev_mtime_ms: None,
+        alive: false,
     }];
     assert_eq!(engine.merge_ledger(dtos), 1);
     let entries = engine.ledger_entries();
@@ -809,6 +816,7 @@ fn prune_ledger_drops_expired_only() {
         deleter_node: "n".to_string(),
         prev_hash: None,
         prev_mtime_ms: None,
+        alive: false,
     }]);
     engine.record_delete(PathBuf::from("fresh.txt"), now_ms(), "n", None, None);
     assert_eq!(engine.prune_ledger(), 1);

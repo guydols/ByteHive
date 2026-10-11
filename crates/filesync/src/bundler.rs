@@ -10,6 +10,7 @@ use std::time::SystemTime;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+
 fn next_bundle_id() -> u64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
@@ -22,11 +23,14 @@ fn modified_ms(meta: &std::fs::Metadata) -> u64 {
         .as_millis() as u64
 }
 
+/// `stamp(rel_path, modified_ms)` gives each streamed file its action stamp:
+/// `None` for a catch-up transfer, `Some` for a live action.
 pub fn stream_messages(
     root: &Path,
     rel_paths: &[PathBuf],
     tx: &Sender<Message>,
     engine: Option<Arc<SyncEngine>>,
+    stamp: &(dyn Fn(&Path, u64) -> Option<u64> + Send + Sync),
 ) {
     debug!(
         "bundler: stream_messages starting — {} path(s) from {:?}",
@@ -61,6 +65,7 @@ pub fn stream_messages(
                     is_dir: true,
                 },
                 content: Vec::new(),
+                action_ms: stamp(rel, modified_ms(&meta)),
             });
             continue;
         }
@@ -74,7 +79,7 @@ pub fn stream_messages(
             );
             flush_bundle(&mut cur, &mut cur_bytes, tx);
 
-            if let Err(e) = stream_large_file(root, rel, &meta, tx, engine.clone()) {
+            if let Err(e) = stream_large_file(root, rel, &meta, tx, engine.clone(), stamp) {
                 warn!("large-file stream({rel:?}): {e}");
             }
             continue;
@@ -109,6 +114,7 @@ pub fn stream_messages(
                 is_dir: false,
             },
             content,
+            action_ms: stamp(rel, modified_ms(&meta)),
         });
     }
 
@@ -141,6 +147,7 @@ fn stream_large_file(
     meta: &std::fs::Metadata,
     tx: &Sender<Message>,
     engine: Option<Arc<SyncEngine>>,
+    stamp: &(dyn Fn(&Path, u64) -> Option<u64> + Send + Sync),
 ) -> std::io::Result<()> {
     let full = root.join(rel);
     let file_size = meta.len();
@@ -179,6 +186,7 @@ fn stream_large_file(
             is_dir: false,
         },
         total_chunks,
+        action_ms: stamp(rel, mms),
     })
     .ok();
 

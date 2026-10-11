@@ -5,7 +5,6 @@ use crate::watcher::FsEvent;
 
 use bytehive_core::MessageBus;
 use log::{error, info, warn};
-
 use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -33,11 +32,72 @@ pub fn check_disk_space(path: &Path, required_bytes: u64) -> io::Result<u64> {
 
 const MAX_BATCH_MS: u64 = 2_000;
 
+/// Maximum tolerated peer-clock skew for incoming action/delete stamps, in
+/// milliseconds (5 minutes). A peer-supplied `action_ms` / `deleted_at_ms`
+/// beyond `now + skew` is clamped to local `now` (see
+/// [`clamp_future_stamp`]) so a malicious far-future stamp (e.g.
+/// `u64::MAX`) cannot beat every tombstone under last-writer-wins. The
+/// allowance covers ordinary clock skew and NTP drift; legitimate stamps are
+/// never in the future by more than this.
+pub const MAX_FUTURE_SKEW_MS: u64 = 5 * 60 * 1000;
+
+/// Clamp a peer-supplied wall-clock stamp to local `now` when it lies beyond
+/// the skew allowance. Returns the stamp unchanged in the common case; logs
+/// at `warn` when clamping. Call at every peer-stamp ingress point
+/// (bundle `action_ms`, large-file `action_ms`, `deleted_at_ms`, rename
+/// `action_ms`) before admission and before relaying, so neither the local
+/// ledger nor other peers ever observe the fabricated stamp.
+pub fn clamp_future_stamp(raw_ms: u64, peer: &str, what: &str, log_prefix: &str) -> u64 {
+    let now = crate::ledger::now_ms();
+    if raw_ms > now.saturating_add(MAX_FUTURE_SKEW_MS) {
+        warn!(
+            "{log_prefix}: {what} stamp {raw_ms} from {peer} exceeds now {now} + skew {MAX_FUTURE_SKEW_MS}ms — clamping to {now}"
+        );
+        now
+    } else {
+        raw_ms
+    }
+}
+
+/// [`clamp_future_stamp`] for optional stamps (`None` passes through).
+pub fn clamp_future_stamp_opt(
+    raw_ms: Option<u64>,
+    peer: &str,
+    what: &str,
+    log_prefix: &str,
+) -> Option<u64> {
+    raw_ms.map(|ms| clamp_future_stamp(ms, peer, what, log_prefix))
+}
+
+/// Clamp every file's `action_ms` in a received bundle in place. Warns once
+/// per bundle (not per file) when any stamp is clamped.
+pub fn clamp_bundle(bundle: &mut FileBundle, peer: &str, log_prefix: &str) {
+    let now = crate::ledger::now_ms();
+    let limit = now.saturating_add(MAX_FUTURE_SKEW_MS);
+    let mut clamped = 0usize;
+    for fd in &mut bundle.files {
+        if let Some(ms) = fd.action_ms {
+            if ms > limit {
+                fd.action_ms = Some(now);
+                clamped += 1;
+            }
+        }
+    }
+    if clamped > 0 {
+        warn!(
+            "{log_prefix}: {clamped} bundle action_ms stamp(s) from {peer} exceeded now {now} + skew {MAX_FUTURE_SKEW_MS}ms — clamped to {now}"
+        );
+    }
+}
+
 pub struct PendingChanges {
     pub changes: HashSet<PathBuf>,
     pub ready: HashSet<PathBuf>,
     pub deletes: HashSet<PathBuf>,
     pub renames: Vec<(PathBuf, PathBuf)>,
+    /// Live user actions `(path, action_ms)` seen since the last flush;
+    /// recorded as live-action records before their relay is stamped.
+    pub live: Vec<(PathBuf, u64)>,
     pub last_event: Instant,
     pub last_full_scan: Instant,
 }
@@ -49,6 +109,7 @@ impl PendingChanges {
             ready: HashSet::new(),
             deletes: HashSet::new(),
             renames: Vec::new(),
+            live: Vec::new(),
             last_event: Instant::now(),
             last_full_scan: Instant::now(),
         }
@@ -58,6 +119,7 @@ impl PendingChanges {
         match event {
             FsEvent::Changed(p) => {
                 if !engine.is_suppressed(&p) && !engine.is_excluded(&p) {
+                    self.live.push((p.clone(), crate::ledger::now_ms()));
                     self.deletes.remove(&p);
                     if !self.ready.contains(&p) {
                         self.changes.insert(p);
@@ -67,6 +129,7 @@ impl PendingChanges {
             }
             FsEvent::WriteComplete(p) => {
                 if !engine.is_suppressed(&p) && !engine.is_excluded(&p) {
+                    self.live.push((p.clone(), crate::ledger::now_ms()));
                     self.deletes.remove(&p);
                     self.changes.remove(&p);
                     self.ready.insert(p);
@@ -149,6 +212,10 @@ impl PendingChanges {
 
     pub fn take_renames(&mut self) -> Vec<(PathBuf, PathBuf)> {
         std::mem::take(&mut self.renames)
+    }
+
+    pub fn take_live(&mut self) -> Vec<(PathBuf, u64)> {
+        std::mem::take(&mut self.live)
     }
 
     pub fn take_ready(&mut self) -> Vec<PathBuf> {
@@ -295,42 +362,24 @@ pub fn handle_recv_bundle(
     bus: &Option<Arc<MessageBus>>,
     log_prefix: &str,
 ) -> io::Result<BundleApplied> {
-    // Ingress pre-guard (defense in depth; SyncEngine::apply_bundle
-    // enforces the same policy): log vetoes for tombstone-covered paths
-    // and drop them before applying so a stale retransmit cannot
-    // resurrect a deleted path. Legitimate recreates (incoming mtime
-    // strictly newer than the tombstone) pass through.
-    let mut vetoed = 0usize;
-    for fd in &bundle.files {
-        if engine
-            .covering_tombstone_veto(&fd.metadata.rel_path, fd.metadata.modified_ms)
-            .is_some()
-        {
-            warn!(
-                "{log_prefix}: vetoing {:?} from {peer} (covering tombstone beats mtime {})",
-                fd.metadata.rel_path, fd.metadata.modified_ms,
-            );
-            vetoed += 1;
-        }
-    }
-    let apply_result = if vetoed > 0 {
-        let filtered = FileBundle {
-            files: bundle
-                .files
-                .iter()
-                .filter(|fd| {
-                    engine
-                        .covering_tombstone_veto(&fd.metadata.rel_path, fd.metadata.modified_ms)
-                        .is_none()
-                })
-                .cloned()
-                .collect(),
-            bundle_id: bundle.bundle_id,
-        };
-        engine.apply_bundle(&filtered)?
+    // Ingress clamp (defensive: the server also clamps before relaying, so
+    // peers never see the fabricated stamp; the client recv-loop relies on
+    // this copy). Clone only when a stamp actually needs clamping.
+    let now = crate::ledger::now_ms();
+    let limit = now.saturating_add(MAX_FUTURE_SKEW_MS);
+    let needs_clamp = bundle
+        .files
+        .iter()
+        .any(|fd| fd.action_ms.is_some_and(|ms| ms > limit));
+    let mut clamped;
+    let effective = if needs_clamp {
+        clamped = bundle.clone();
+        clamp_bundle(&mut clamped, peer, log_prefix);
+        &clamped
     } else {
-        engine.apply_bundle(bundle)?
+        bundle
     };
+    let apply_result = engine.apply_bundle(effective)?;
 
     let files_count = bundle.files.iter().filter(|f| !f.metadata.is_dir).count();
     let dirs_count = bundle.files.iter().filter(|f| f.metadata.is_dir).count();
@@ -389,11 +438,13 @@ pub fn handle_recv_large_file_start(
     engine: &SyncEngine,
     metadata: FileMetadata,
     total_chunks: u32,
+    action_ms: Option<u64>,
     peer: &str,
     log_prefix: &str,
 ) -> io::Result<()> {
+    let action_ms = clamp_future_stamp_opt(action_ms, peer, "large-file-start", log_prefix);
     engine
-        .begin_large_file(metadata, total_chunks)
+        .begin_large_file_with_action(metadata, total_chunks, action_ms)
         .map_err(|e| {
             error!("{log_prefix}: large_file_start from {peer}: {e}");
             e
@@ -514,6 +565,7 @@ pub fn handle_recv_delete_with_meta(
     bus: &Option<Arc<MessageBus>>,
     log_prefix: &str,
 ) -> io::Result<usize> {
+    let deleted_at_ms = clamp_future_stamp(deleted_at_ms, peer, "delete", log_prefix);
     let n = engine.apply_deletes(paths, deleted_at_ms, deleter)?;
     info!("{log_prefix}: -{n} path(s) from {peer}");
     if let Some(ref bus) = bus {
@@ -566,11 +618,13 @@ pub fn handle_recv_rename(
     engine: &SyncEngine,
     from: &PathBuf,
     to: &PathBuf,
+    action_ms: u64,
     peer: &str,
     bus: &Option<Arc<MessageBus>>,
     log_prefix: &str,
 ) -> io::Result<()> {
-    engine.apply_rename(from, to)?;
+    let action_ms = clamp_future_stamp(action_ms, peer, "rename", log_prefix);
+    engine.apply_rename_at(from, to, action_ms, peer)?;
     info!("{log_prefix}: renamed {from:?} → {to:?} from {peer}");
     if let Some(ref bus) = bus {
         bus.publish(

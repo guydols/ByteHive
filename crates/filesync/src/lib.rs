@@ -1,3 +1,4 @@
+pub mod action_journal;
 pub mod app;
 pub mod bundler;
 pub mod client;

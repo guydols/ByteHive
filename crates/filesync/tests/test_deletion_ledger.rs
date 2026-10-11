@@ -46,7 +46,10 @@ fn sorted_entries(engine: &SyncEngine) -> Vec<(PathBuf, u64, String, Option<Stri
 #[test]
 fn ttl_constant_is_90_days() {
     assert_eq!(DELETION_LEDGER_TTL_MS, 90 * DAY_MS);
-    assert_eq!(PROTOCOL_VERSION, 9, "heartbeat Ping/Pong bumped the wire to v9");
+    assert_eq!(
+        PROTOCOL_VERSION, 10,
+        "action journal drain + live-action stamps bumped the wire to v10"
+    );
 }
 
 /// Core resurrection repro: A deletes `f` while B is offline holding a stale
@@ -229,6 +232,7 @@ fn ledger_exchange_roundtrip() {
                 deleter_node: "node-a".to_string(),
                 prev_hash: Some("ab".repeat(32)),
                 prev_mtime_ms: Some(1_699_999_999_000),
+                alive: false,
             },
             TombstoneDto {
                 path: PathBuf::from("old/dir"),
@@ -236,6 +240,7 @@ fn ledger_exchange_roundtrip() {
                 deleter_node: "node-b".to_string(),
                 prev_hash: None,
                 prev_mtime_ms: None,
+                alive: false,
             },
         ],
     };

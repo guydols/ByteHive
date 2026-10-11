@@ -28,6 +28,7 @@ fn bundle_msg(filename: &str, content: &[u8]) -> Message {
                 is_dir: false,
             },
             content: content.to_vec(),
+            action_ms: None,
         }],
         bundle_id: 42,
     })
@@ -160,6 +161,7 @@ fn roundtrip_large_file_start() {
     let msg = Message::LargeFileStart {
         metadata,
         total_chunks: 4,
+        action_ms: Some(777),
     };
     let frame = serialise_message(&msg).unwrap();
     let mut cur = Cursor::new(frame);
@@ -167,7 +169,9 @@ fn roundtrip_large_file_start() {
         Message::LargeFileStart {
             metadata: m,
             total_chunks,
+            action_ms,
         } => {
+            assert_eq!(action_ms, Some(777));
             assert_eq!(total_chunks, 4);
             assert_eq!(m.size, 32 * 1024 * 1024);
             assert_eq!(m.hash, [0xCDu8; 32]);
@@ -265,13 +269,15 @@ fn roundtrip_rename() {
     let msg = Message::Rename {
         from: PathBuf::from("old/path.txt"),
         to: PathBuf::from("new/path.txt"),
+        action_ms: 4242,
     };
     let frame = serialise_message(&msg).unwrap();
     let mut cur = Cursor::new(frame);
     match read_message(&mut cur).unwrap() {
-        Message::Rename { from, to } => {
+        Message::Rename { from, to, action_ms } => {
             assert_eq!(from, PathBuf::from("old/path.txt"));
             assert_eq!(to, PathBuf::from("new/path.txt"));
+            assert_eq!(action_ms, 4242);
         }
         _ => panic!("expected Rename"),
     }

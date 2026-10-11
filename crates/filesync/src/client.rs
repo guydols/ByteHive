@@ -1,23 +1,24 @@
+use crate::action_journal::{JournalEntry, JournalOp};
+use crate::bundler;
 use crate::cert_fingerprint;
 use crate::common::{self, LargeFileEndOutcome, PendingChanges};
 use crate::gui::state::ConnectionStatus;
 use crate::gui::state::{ConflictKind, SharedState};
 use crate::known_hosts::KnownServers;
-use crate::ledger::{DeletionLedger, Tombstone};
+use crate::ledger::DeletionLedger;
 use crate::manifest;
 use crate::protocol::*;
 use crate::sync_engine::{ConflictInfo, SyncEngine};
-use crate::transport::{Connection, HEARTBEAT_POLL_SECS, is_heartbeat_timeout};
 use crate::timestamp_id;
-use crate::watcher::{self, FsEvent};
+use crate::transport::{is_heartbeat_timeout, Connection, HEARTBEAT_POLL_SECS};
 
 use bytehive_core::MessageBus;
-use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, TryRecvError};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
 use log::{debug, error, info, warn};
 use parking_lot::Mutex;
 
+use std::collections::{HashMap, HashSet};
 use std::io;
-use std::collections::HashSet;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -240,6 +241,9 @@ impl Client {
         self.engine.clear_in_progress();
         debug!("filesync session: cleared any in-progress large-file state");
 
+        // Capture starts once per engine and keeps journalling while disconnected.
+        self.engine.start_live_capture()?;
+
         debug!(
             "filesync session: opening TCP connection to {}",
             self.server_addr
@@ -409,6 +413,64 @@ impl Client {
             }
         }
 
+        // ---- Deletion-ledger exchange (server speaks first, we reply) ----
+        debug!("filesync session: waiting for server LedgerExchange");
+        let peer_ledger_entries = match recv_with_heartbeat(&conn)? {
+            Message::LedgerExchange { entries } => entries,
+            other => {
+                error!("filesync session: expected LedgerExchange from server");
+                debug!(
+                    "filesync session: unexpected message instead of LedgerExchange: {other:?}"
+                );
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "filesync: expected LedgerExchange",
+                ));
+            }
+        };
+        let merged = self.engine.merge_ledger(peer_ledger_entries);
+        debug!("filesync session: merged {merged} tombstone(s) from server");
+        conn.send(&Message::LedgerExchange {
+            entries: self.engine.ledger_entries(),
+        })?;
+        debug!("filesync session: sent LedgerExchange to server");
+
+        // ---- Action-journal drain: user actions captured while disconnected
+        // reach the server before manifests are exchanged, so the server does
+        // not re-send paths this client deleted or renamed offline.
+        let drained = {
+            let mut send = |msg: Message| conn.send(&msg);
+            let mut await_ack = |upto: u64| await_action_ack(&conn, upto);
+            drain_action_journal(&self.engine, &mut send, &mut await_ack)?
+        };
+        if drained.settled_entries > 0 {
+            info!(
+                "filesync: delivered {} journalled action(s) to server ({} file(s), {} B)",
+                drained.settled_entries, drained.files_sent, drained.bytes_sent
+            );
+        }
+
+        debug!(
+            "filesync session: scanning local root {:?}",
+            self.engine.root()
+        );
+        let local = self.engine.scan()?;
+        let (l_files, l_dirs, l_bytes) = count_manifest(&local);
+        debug!(
+            "filesync session: local manifest — {} file(s) {} dir(s) {} B total",
+            l_files, l_dirs, l_bytes
+        );
+
+        if let Some(ref gs) = self.gui_state {
+            let mut s = gs.write();
+            s.file_count = l_files;
+            s.dir_count = l_dirs;
+            s.total_bytes = l_bytes;
+        }
+
+        debug!("filesync session: sending local ManifestExchange");
+        conn.send(&Message::ManifestExchange(local.clone()))?;
+
         debug!("filesync session: waiting for server ManifestExchange");
         let remote = match recv_with_heartbeat(&conn)? {
             Message::ManifestExchange(m) => m,
@@ -431,24 +493,6 @@ impl Client {
                 "filesync session: server manifest received — {} file(s) {} dir(s) {} B total",
                 r_files, r_dirs, r_bytes
             );
-        }
-
-        debug!(
-            "filesync session: scanning local root {:?}",
-            self.engine.root()
-        );
-        let local = self.engine.scan()?;
-        let (l_files, l_dirs, l_bytes) = count_manifest(&local);
-        debug!(
-            "filesync session: local manifest — {} file(s) {} dir(s) {} B total",
-            l_files, l_dirs, l_bytes
-        );
-
-        if let Some(ref gs) = self.gui_state {
-            let mut s = gs.write();
-            s.file_count = l_files;
-            s.dir_count = l_dirs;
-            s.total_bytes = l_bytes;
         }
 
         let bytes_incoming: u64 = manifest::compute_send_list(&remote, &local, true)
@@ -488,33 +532,6 @@ impl Client {
                 }
             }
         }
-
-        debug!("filesync session: sending local ManifestExchange");
-        conn.send(&Message::ManifestExchange(local.clone()))?;
-
-        // ---- Deletion-ledger exchange (symmetric order: server sent first,
-        // we reply — avoids both-wait deadlock) ----
-        debug!("filesync session: waiting for server LedgerExchange");
-        let peer_ledger_entries = match recv_with_heartbeat(&conn)? {
-            Message::LedgerExchange { entries } => entries,
-            other => {
-                error!("filesync session: expected LedgerExchange from server");
-                debug!(
-                    "filesync session: unexpected message instead of LedgerExchange: {other:?}"
-                );
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "filesync: expected LedgerExchange",
-                ));
-            }
-        };
-        let merged = self.engine.merge_ledger(peer_ledger_entries);
-        debug!("filesync session: merged {merged} tombstone(s) from server");
-        conn.send(&Message::LedgerExchange {
-            entries: self.engine.ledger_entries(),
-        })?;
-        debug!("filesync session: sent LedgerExchange to server");
-        // NOTE: LedgerAck intentionally not sent — no side reads it.
 
         let expected_rx: u64 = remote
             .files
@@ -587,6 +604,7 @@ impl Client {
                 Message::LargeFileStart {
                     ref metadata,
                     total_chunks,
+                    action_ms,
                 } => {
                     debug!(
                         "filesync session: recv LargeFileStart path={:?} size={} B chunks={} (~{} B/chunk)",
@@ -594,7 +612,7 @@ impl Client {
                         metadata.size / total_chunks.max(1) as u64
                     );
                     self.engine
-                        .begin_large_file(metadata.clone(), total_chunks)?;
+                        .begin_large_file_with_action(metadata.clone(), total_chunks, action_ms)?;
                 }
                 Message::LargeFileChunk {
                     ref path,
@@ -734,7 +752,7 @@ impl Client {
         }
 
         let raw_to_send = manifest::compute_send_list(&local, &remote, false);
-        let snap = local_ledger_snapshot(&self.engine);
+        let snap = self.engine.ledger_snapshot();
         let (to_send, recreated) =
             manifest::filter_resurrected(raw_to_send.clone(), &local, Some(&snap));
         // Tombstone wins over our stale copy: converge by deleting locally
@@ -854,20 +872,7 @@ impl Client {
 
         info!("filesync: initial sync complete");
 
-        debug!(
-            "filesync session: starting filesystem watcher on {:?}",
-            self.engine.root()
-        );
-        let (fs_tx, fs_rx) = bounded::<FsEvent>(4096);
-        let _watcher = watcher::start_watcher(self.engine.root().into(), fs_tx).map_err(|e| {
-            error!(
-                "filesync session: failed to start watcher on {:?}: {e}",
-                self.engine.root()
-            );
-            e
-        })?;
-        debug!("filesync session: watcher started (fs_rx channel capacity=4096)");
-
+        let (ack_tx, ack_rx) = bounded::<u64>(16);
         let (shut_tx, shut_rx) = bounded::<()>(1);
 
         let eng_r = self.engine.clone();
@@ -878,7 +883,7 @@ impl Client {
         let recv_handle = thread::Builder::new()
             .name("recv-srv".into())
             .spawn(move || {
-                recv_loop(eng_r, conn_r, bus_r, gui_state_r);
+                recv_loop(eng_r, conn_r, bus_r, gui_state_r, ack_tx);
                 let _ = shut_tx.send(());
             })?;
 
@@ -886,8 +891,8 @@ impl Client {
         send_loop(
             self.engine.clone(),
             conn.clone(),
-            fs_rx,
             shut_rx,
+            ack_rx,
             self.bus.clone(),
             self.gui_state.clone(),
         );
@@ -925,6 +930,7 @@ fn recv_loop(
     conn: Arc<Connection>,
     bus: Option<Arc<MessageBus>>,
     gui_state: Option<SharedState>,
+    acks: Sender<u64>,
 ) {
     let prefix = "filesync recv";
     debug!("{prefix}: loop started, waiting for incremental messages from server");
@@ -979,6 +985,7 @@ fn recv_loop(
             Ok(Message::LargeFileStart {
                 ref metadata,
                 total_chunks,
+                action_ms,
             }) => {
                 debug!(
                     "{prefix}: LargeFileStart path={:?} size={} B chunks={}",
@@ -988,6 +995,7 @@ fn recv_loop(
                     &engine,
                     metadata.clone(),
                     total_chunks,
+                    action_ms,
                     "server",
                     prefix,
                 ) {
@@ -1079,11 +1087,15 @@ fn recv_loop(
                     gs.write().begin_sync_activity();
                 }
             }
-            Ok(Message::Rename { from, to }) => {
+            Ok(Message::Rename {
+                from,
+                to,
+                action_ms,
+            }) => {
                 debug!("{prefix}: Rename {from:?} → {to:?}");
-                if let Err(e) =
-                    common::handle_recv_rename(&engine, &from, &to, "server", &bus, prefix)
-                {
+                if let Err(e) = common::handle_recv_rename(
+                    &engine, &from, &to, action_ms, "server", &bus, prefix,
+                ) {
                     error!("{prefix}: apply_rename {from:?} → {to:?}: {e}");
                 }
                 if let Some(ref gs) = gui_state {
@@ -1122,6 +1134,11 @@ fn recv_loop(
                     bundle_id, sequence_numbers
                 );
             }
+            Ok(Message::ActionBatchAck { upto_seq }) => {
+                if acks.send(upto_seq).is_err() {
+                    debug!("{prefix}: ActionBatchAck {upto_seq} dropped (session closing)");
+                }
+            }
             Ok(other) => {
                 warn!("{prefix}: unexpected message in live sync phase — possible protocol issue");
                 debug!("{prefix}: unexpected message variant: {other:?}");
@@ -1130,33 +1147,35 @@ fn recv_loop(
     }
 }
 
+/// Live send loop (connected phase): captures periodic-rescan differences
+/// into the journal and drains it, one acknowledged chunk at a time.
+/// Watcher capture runs independently in the engine's capture thread.
 fn send_loop(
     engine: Arc<SyncEngine>,
     conn: Arc<Connection>,
-    fs_rx: Receiver<FsEvent>,
     shutdown: Receiver<()>,
+    acks: Receiver<u64>,
     bus: Option<Arc<MessageBus>>,
     gui_state: Option<SharedState>,
 ) {
     debug!("filesync send: loop started");
-    let mut pending = PendingChanges::new();
-    let mut flush_count = 0u64;
+    let mut rescan = PendingChanges::new();
+    let mut drain_count = 0u64;
 
     loop {
-        match shutdown.try_recv() {
-            Ok(()) | Err(TryRecvError::Disconnected) => {
+        match shutdown.recv_timeout(Duration::from_millis(DEBOUNCE_MS)) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
                 debug!(
-                    "filesync send: shutdown signal received after {} flush(es), exiting",
-                    flush_count
+                    "filesync send: shutdown signal received after {} drain(s), exiting",
+                    drain_count
                 );
                 break;
             }
-            Err(TryRecvError::Empty) => {}
+            Err(RecvTimeoutError::Timeout) => {}
         }
 
-        // Heartbeat tick (already wakes every DEBOUNCE_MS): sends Ping when
-        // idle, breaks the loop on timeout so the session tears down and
-        // run() reconnects + rescans.
+        // Heartbeat tick: sends Ping when idle, breaks the loop on timeout so
+        // the session tears down and run() reconnects + rescans.
         if let Err(e) = conn.heartbeat_maintenance() {
             if is_heartbeat_timeout(&e) {
                 error!("filesync send: heartbeat timeout ({e}), tearing down session");
@@ -1166,88 +1185,404 @@ fn send_loop(
             break;
         }
 
-        pending.periodic_rescan(&engine, "filesync");
+        rescan_into_journal(&engine, &mut rescan);
 
-        match fs_rx.recv_timeout(Duration::from_millis(DEBOUNCE_MS)) {
-            Ok(event) => {
-                debug!("filesync send: fs event: {:?}", event);
-                pending.collect_event(&engine, event);
-                let total_pending =
-                    pending.changes.len() + pending.ready.len() + pending.deletes.len();
-                if total_pending > 100 {
-                    warn!(
-                        "filesync send: large pending backlog — changes={} ready={} deletes={} renames={}",
-                        pending.changes.len(),
-                        pending.ready.len(),
-                        pending.deletes.len(),
-                        pending.renames.len()
-                    );
-                } else {
+        if engine.journal().is_empty() {
+            continue;
+        }
+        drain_count += 1;
+        let drained = {
+            let mut send = |msg: Message| conn.send(&msg);
+            let mut await_ack = |upto: u64| await_action_ack_live(&acks, &conn, upto);
+            drain_action_journal(&engine, &mut send, &mut await_ack)
+        };
+        match drained {
+            Ok(stats) => {
+                if stats.settled_entries > 0 {
                     debug!(
-                        "filesync send: pending after event — changes={} ready={} deletes={} renames={}",
-                        pending.changes.len(),
-                        pending.ready.len(),
-                        pending.deletes.len(),
-                        pending.renames.len()
+                        "filesync send: drain #{drain_count} settled {} action(s), {} file(s) {} B, acked≤{}",
+                        stats.settled_entries, stats.files_sent, stats.bytes_sent, stats.acked_upto
                     );
+                    if let Some(ref gs) = gui_state {
+                        let mut s = gs.write();
+                        s.begin_sync_activity();
+                        s.files_sent += stats.files_sent as u64;
+                        s.bytes_sent += stats.bytes_sent;
+                    }
+                    if let Some(ref bus) = bus {
+                        bus.publish(
+                            "filesync",
+                            "filesync.incremental_stats",
+                            serde_json::json!({
+                                "node":          engine.node_id(),
+                                "peer":          "server",
+                                "files_changed": stats.files_sent,
+                                "bytes_sent":    stats.bytes_sent,
+                            }),
+                        );
+                    }
                 }
             }
-            Err(RecvTimeoutError::Disconnected) => {
-                debug!("filesync send: watcher channel disconnected, exiting send-loop");
+            Err(e) => {
+                error!("filesync send: journal drain error: {e}");
+                debug!("filesync send: drain error kind={:?}, exiting send-loop", e.kind());
                 break;
             }
-            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+    debug!("filesync send: loop exited after {} drain(s)", drain_count);
+}
+
+/// Feed periodic full-rescan differences into the journal as user actions
+/// (the watcher can miss changes; rescans observe them at scan time).
+fn rescan_into_journal(engine: &SyncEngine, rescan: &mut PendingChanges) {
+    rescan.periodic_rescan(engine, "filesync");
+    if rescan.changes.is_empty() && rescan.ready.is_empty() && rescan.deletes.is_empty() {
+        return;
+    }
+    let now = crate::ledger::now_ms();
+    for p in rescan.changes.drain().chain(rescan.ready.drain()) {
+        if engine.is_suppressed(&p) || engine.is_excluded(&p) {
+            continue;
+        }
+        if let Err(e) = engine.journal().upsert(p.clone(), now) {
+            error!("filesync send: journal append for {p:?} failed: {e}");
+        }
+    }
+    for p in rescan.deletes.drain() {
+        if engine.is_delete_suppressed(&p) || engine.is_excluded(&p) {
+            continue;
+        }
+        if let Err(e) = engine.journal().delete(p.clone(), now) {
+            error!("filesync send: journal append for {p:?} failed: {e}");
+        }
+    }
+}
+
+/// Entries per drain chunk; each chunk ends with one `ActionBatchEnd`.
+const DRAIN_CHUNK_MAX_ENTRIES: usize = 256;
+/// Bounded pipeline between the file reader threads and the sender.
+const DRAIN_PIPELINE_DEPTH: usize = 128;
+
+/// Result of one action-journal drain pass.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DrainStats {
+    /// Journal entries settled: acknowledged by the peer, or resolved locally.
+    pub settled_entries: usize,
+    /// Highest sequence number acknowledged in this pass (0 when none).
+    pub acked_upto: u64,
+    /// Files streamed to the peer.
+    pub files_sent: usize,
+    /// Bytes streamed to the peer, from file sizes at drain time.
+    pub bytes_sent: u64,
+    /// The pass stopped at a file still being written; retry later.
+    pub stopped_unstable: bool,
+}
+
+enum Wire {
+    Upsert {
+        path: PathBuf,
+        action_ms: u64,
+        size: u64,
+    },
+    Rename {
+        from: PathBuf,
+        to: PathBuf,
+        action_ms: u64,
+    },
+    Delete {
+        path: PathBuf,
+        action_ms: u64,
+    },
+}
+
+enum Decision {
+    Send(Wire),
+    Settled,
+    Stop,
+}
+
+/// Deliver the action journal to the peer in acknowledged chunks.
+///
+/// Each entry is first admitted against the local (merged) ledger: a create
+/// or modify, or a rename target, covered by a strictly newer tombstone is
+/// rejected here (the local copy moves to trash, as the peer would do), and
+/// an accepted action is recorded as a live action at its own stamp. Accepted
+/// entries are sent in journal order, then `ActionBatchEnd{upto}` closes the
+/// chunk. `await_ack(upto)` returns the peer's contiguous-applied prefix for
+/// the chunk (which may be less than `upto` when the peer failed to apply
+/// something mid-chunk); only entries at or below that prefix are removed
+/// from the journal, and a short ack stops the pass so the remainder is
+/// redelivered on the next pass starting at `last_ok + 1`. A file still being
+/// written stops the pass; it is retried on the next pass.
+///
+/// `send` and `await_ack` abstract the transport (handshake or live loop).
+pub fn drain_action_journal(
+    engine: &Arc<SyncEngine>,
+    send: &mut dyn FnMut(Message) -> io::Result<()>,
+    await_ack: &mut dyn FnMut(u64) -> io::Result<u64>,
+) -> io::Result<DrainStats> {
+    let journal = engine.journal().clone();
+    let pending = journal.snapshot();
+    let node = engine.node_id().to_string();
+    let mut stats = DrainStats::default();
+    let mut i = 0usize;
+
+    while i < pending.len() {
+        let chunk_start = i;
+        let mut wires: Vec<Wire> = Vec::new();
+        let mut count = 0usize;
+        let mut bytes = 0u64;
+        let mut upto: Option<u64> = None;
+        let mut stop = false;
+
+        while i < pending.len() && count < DRAIN_CHUNK_MAX_ENTRIES {
+            let entry = &pending[i];
+            let size = match entry.op {
+                JournalOp::Upsert => std::fs::metadata(engine.root().join(&entry.path))
+                    .map(|m| m.len())
+                    .unwrap_or(0),
+                _ => 0,
+            };
+            if count > 0 && bytes + size > BUNDLE_MAX_BYTES as u64 {
+                break;
+            }
+            match decide(engine, &node, entry, size) {
+                Decision::Send(wire) => wires.push(wire),
+                Decision::Settled => {}
+                Decision::Stop => {
+                    stop = true;
+                    break;
+                }
+            }
+            count += 1;
+            bytes += size;
+            upto = Some(entry.seq);
+            i += 1;
         }
 
-        if pending.should_flush() {
-            debug!(
-                "filesync send: flush #{} — changes={} ready={} deletes={} renames={}",
-                flush_count + 1,
-                pending.changes.len(),
-                pending.ready.len(),
-                pending.deletes.len(),
-                pending.renames.len()
-            );
-            flush_count += 1;
-            if let Err(e) = flush_to_server(&engine, &conn, &mut pending, &bus, &gui_state) {
-                error!("filesync send: flush #{flush_count} error: {e}");
+        if let Some(upto) = upto {
+            let mut run: Vec<PathBuf> = Vec::new();
+            let mut stamps: HashMap<PathBuf, u64> = HashMap::new();
+            for wire in wires {
+                match wire {
+                    Wire::Upsert {
+                        path,
+                        action_ms,
+                        size,
+                    } => {
+                        stats.files_sent += 1;
+                        stats.bytes_sent += size;
+                        stamps.insert(path.clone(), action_ms);
+                        run.push(path);
+                    }
+                    Wire::Rename {
+                        from,
+                        to,
+                        action_ms,
+                    } => {
+                        stream_upserts(engine, &run, &stamps, send)?;
+                        run.clear();
+                        stamps.clear();
+                        send(Message::Rename {
+                            from,
+                            to,
+                            action_ms,
+                        })?;
+                    }
+                    Wire::Delete { path, action_ms } => {
+                        stream_upserts(engine, &run, &stamps, send)?;
+                        run.clear();
+                        stamps.clear();
+                        send(Message::Delete {
+                            paths: vec![path],
+                            deleted_at_ms: action_ms,
+                            deleter: node.clone(),
+                        })?;
+                    }
+                }
+            }
+            stream_upserts(engine, &run, &stamps, send)?;
+            engine.flush_ledger();
+            send(Message::ActionBatchEnd { upto_seq: upto })?;
+            // The peer acks only its contiguous-applied prefix, which may be
+            // short of `upto` (a mid-chunk apply failure or missing chunks).
+            // Never delete past it: unacked entries stay journalled and are
+            // redelivered on the next pass. Clamp defensively: the ack must
+            // not cover entries beyond this chunk.
+            let acked = await_ack(upto)?.min(upto);
+            journal.ack(acked)?;
+            let settled = pending[chunk_start..i]
+                .iter()
+                .filter(|e| e.seq <= acked)
+                .count();
+            stats.settled_entries += settled;
+            stats.acked_upto = stats.acked_upto.max(acked);
+            if acked < upto {
                 debug!(
-                    "filesync send: flush error kind={:?}, breaking out of send-loop",
-                    e.kind()
+                    "filesync: partial ActionBatchAck {acked} for chunk ≤{upto} — \
+                     {unacked} entr(ies) stay journalled for redelivery",
+                    unacked = count - settled,
                 );
                 break;
             }
-            pending.reset_timer();
-            debug!("filesync send: flush #{flush_count} complete");
+        }
+
+        if stop {
+            stats.stopped_unstable = true;
+            break;
         }
     }
-    debug!("filesync send: loop exited after {} flush(es)", flush_count);
+    Ok(stats)
 }
 
-/// In-memory snapshot of the engine's deletion ledger for sync decisions
-/// (rebuilt from `ledger_entries`; avoids new sync_engine accessors).
-fn local_ledger_snapshot(engine: &SyncEngine) -> DeletionLedger {
-    let mut snap = DeletionLedger::new();
-    snap.merge_remote(
-        engine
-            .ledger_entries()
-            .into_iter()
-            .map(|d| {
-                let path = d.path.clone();
-                (
-                    path,
-                    Tombstone::new(
-                        d.path,
-                        d.deleted_at_ms,
-                        d.deleter_node,
-                        d.prev_hash,
-                        d.prev_mtime_ms,
-                    ),
-                )
+/// Admission and local bookkeeping for one journal entry (see
+/// [`drain_action_journal`]).
+fn decide(engine: &Arc<SyncEngine>, node: &str, entry: &JournalEntry, size: u64) -> Decision {
+    match &entry.op {
+        JournalOp::Upsert => {
+            if !engine.root().join(&entry.path).exists() {
+                // Gone before delivery; a delete entry carries the removal.
+                return Decision::Settled;
+            }
+            if !engine.is_file_stable(&entry.path) {
+                return Decision::Stop;
+            }
+            if let Some(tomb) = engine.tombstone_beating(&entry.path, entry.action_ms) {
+                warn!(
+                    "filesync: local {:?} is older than tombstone @{} by {} — moving local copy to trash",
+                    entry.path, tomb.deleted_at_ms, tomb.deleter_node
+                );
+                if let Err(e) =
+                    engine.apply_deletes(&[entry.path.clone()], tomb.deleted_at_ms, &tomb.deleter_node)
+                {
+                    warn!("filesync: rejecting {:?}: {e}", entry.path);
+                }
+                return Decision::Settled;
+            }
+            engine.stage_live_action(&entry.path, entry.action_ms);
+            Decision::Send(Wire::Upsert {
+                path: entry.path.clone(),
+                action_ms: entry.action_ms,
+                size,
             })
-            .collect(),
-    );
-    snap
+        }
+        JournalOp::Rename { to } => {
+            if let Some(tomb) = engine.tombstone_beating(to, entry.action_ms) {
+                warn!(
+                    "filesync: rename target {:?} is covered by tombstone @{} by {} — deleting {:?}",
+                    to, tomb.deleted_at_ms, tomb.deleter_node, entry.path
+                );
+                if let Err(e) =
+                    engine.apply_deletes(&[to.clone()], tomb.deleted_at_ms, &tomb.deleter_node)
+                {
+                    warn!("filesync: rejecting rename target {to:?}: {e}");
+                }
+                if engine.root().join(&entry.path).exists() {
+                    // Source was recreated locally since the rename: keep it.
+                    return Decision::Settled;
+                }
+                if let Err(e) = engine.apply_deletes(&[entry.path.clone()], entry.action_ms, node) {
+                    warn!("filesync: deleting rename source {:?}: {e}", entry.path);
+                }
+                return Decision::Send(Wire::Delete {
+                    path: entry.path.clone(),
+                    action_ms: entry.action_ms,
+                });
+            }
+            engine.stage_live_action(to, entry.action_ms);
+            Decision::Send(Wire::Rename {
+                from: entry.path.clone(),
+                to: to.clone(),
+                action_ms: entry.action_ms,
+            })
+        }
+        JournalOp::Delete => {
+            if engine.root().join(&entry.path).exists() {
+                // Recreated locally since the delete (a later upsert was not
+                // captured, e.g. a remote apply): keep the content.
+                return Decision::Settled;
+            }
+            engine.stage_delete(entry.path.clone(), entry.action_ms);
+            Decision::Send(Wire::Delete {
+                path: entry.path.clone(),
+                action_ms: entry.action_ms,
+            })
+        }
+    }
+}
+
+/// Stream a run of consecutive upserts through the bundler (preserving
+/// order) and hand each message to `send` as it is produced.
+fn stream_upserts(
+    engine: &Arc<SyncEngine>,
+    paths: &[PathBuf],
+    stamps: &HashMap<PathBuf, u64>,
+    send: &mut dyn FnMut(Message) -> io::Result<()>,
+) -> io::Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let (tx, rx) = bounded::<Message>(DRAIN_PIPELINE_DEPTH);
+    thread::scope(|s| -> io::Result<()> {
+        s.spawn(move || {
+            let stamp = |rel: &Path, _mtime: u64| stamps.get(rel).copied();
+            bundler::stream_messages(engine.root(), paths, &tx, None, &stamp);
+        });
+        for msg in rx {
+            send(msg)?;
+        }
+        Ok(())
+    })
+}
+
+/// Wait (handshake phase) for the `ActionBatchAck` closing `upto` and
+/// return the peer's contiguous-applied prefix, which may be short of `upto`
+/// when the peer failed to apply something mid-chunk. The caller keeps every
+/// entry above the prefix journalled for redelivery.
+fn await_action_ack(conn: &Connection, upto: u64) -> io::Result<u64> {
+    loop {
+        match recv_with_heartbeat(conn)? {
+            Message::ActionBatchAck { upto_seq } => {
+                if upto_seq < upto {
+                    debug!("filesync: partial ActionBatchAck {upto_seq} while awaiting {upto}");
+                }
+                return Ok(upto_seq);
+            }
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("filesync: expected ActionBatchAck, got {other:?}"),
+                ));
+            }
+        }
+    }
+}
+
+/// Wait (live phase) for the ack closing `upto`, keeping heartbeats alive.
+/// Returns the peer's contiguous-applied prefix (possibly short of `upto`).
+fn await_action_ack_live(
+    acks: &Receiver<u64>,
+    conn: &Connection,
+    upto: u64,
+) -> io::Result<u64> {
+    loop {
+        match acks.recv_timeout(Duration::from_secs(HEARTBEAT_POLL_SECS)) {
+            Ok(got) => {
+                if got < upto {
+                    debug!("filesync send: partial ActionBatchAck {got} while awaiting {upto}");
+                }
+                return Ok(got);
+            }
+            Err(RecvTimeoutError::Timeout) => conn.heartbeat_maintenance()?,
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "filesync: connection closed while awaiting journal ack",
+                ));
+            }
+        }
+    }
 }
 
 /// Paths the peer still lists but our merged ledger marks deleted (tombstone
@@ -1271,90 +1606,6 @@ fn compute_deletes_to_push(
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
-}
-
-fn flush_to_server(
-    engine: &Arc<SyncEngine>,
-    conn: &Arc<Connection>,
-    pending: &mut PendingChanges,
-    bus: &Option<Arc<MessageBus>>,
-    gui_state: &Option<SharedState>,
-) -> io::Result<()> {
-    let renames = pending.take_renames();
-    if !renames.is_empty() {
-        debug!("filesync send: flushing {} rename(s)", renames.len());
-    }
-    for (from, to) in renames {
-        info!("filesync send: rename {from:?} → {to:?}");
-        conn.send(&Message::Rename {
-            from: from.clone(),
-            to: to.clone(),
-        })?;
-        if let Some(ref gs) = gui_state {
-            gs.write().begin_sync_activity();
-        }
-        if let Some(ref bus) = bus {
-            bus.publish(
-                "filesync",
-                "filesync.file_renamed",
-                serde_json::json!({
-                    "from": from,
-                    "to":   to,
-                    "node": engine.node_id(),
-                    "peer": "server",
-                }),
-            );
-        }
-    }
-
-    let ready = pending.take_ready();
-    if !ready.is_empty() {
-        debug!("filesync send: flushing {} ready path(s)", ready.len());
-        send_paths_to_server(engine, conn, bus, gui_state, ready)?;
-    }
-
-    let stable = pending.take_stable_changes(engine);
-    if !stable.is_empty() {
-        debug!(
-            "filesync send: flushing {} stable-change path(s)",
-            stable.len()
-        );
-        send_paths_to_server(engine, conn, bus, gui_state, stable)?;
-    }
-
-    let (paths, delete_count, deleted_at_ms) = pending.take_deletes_with_engine(engine);
-    if !paths.is_empty() {
-        debug!(
-            "filesync send: flushing {} delete path(s) ({} pre-expansion)",
-            paths.len(),
-            delete_count
-        );
-        // Reuse the single batch stamp from take_deletes_with_engine so
-        // the ledger tombstone and the wire Delete share one timestamp
-        // (no second now_ms() re-stamp); deleter is this node.
-        conn.send(&Message::Delete {
-            paths,
-            deleted_at_ms,
-            deleter: engine.node_id().to_string(),
-        })?;
-        if let Some(ref gs) = gui_state {
-            gs.write().begin_sync_activity();
-        }
-
-        if let Some(ref bus) = bus {
-            bus.publish(
-                "filesync",
-                "filesync.incremental_stats",
-                serde_json::json!({
-                    "node":          engine.node_id(),
-                    "peer":          "server",
-                    "files_deleted": delete_count,
-                }),
-            );
-        }
-    }
-
-    Ok(())
 }
 
 fn push_gui_conflicts(
@@ -1395,94 +1646,6 @@ fn push_gui_conflicts(
             ci.original_path, ci.conflict_copy_path
         ));
     }
-}
-
-fn send_paths_to_server(
-    engine: &Arc<SyncEngine>,
-    conn: &Arc<Connection>,
-    bus: &Option<Arc<MessageBus>>,
-    gui_state: &Option<SharedState>,
-    paths: Vec<PathBuf>,
-) -> io::Result<()> {
-    // Outgoing resurrection guard: drop paths whose local version loses
-    // to a covering tombstone (same policy as filter_resurrected, applied
-    // live before streaming). Paths without a manifest entry pass through
-    // (no mtime to compare); legitimate recreates (local mtime strictly
-    // newer) pass through.
-    let manifest = engine.get_manifest();
-    let mut vetoed = 0usize;
-    let paths: Vec<PathBuf> = paths
-        .into_iter()
-        .filter(|p| {
-            match manifest.files.get(p) {
-                Some(meta)
-                    if engine
-                        .covering_tombstone_veto(p, meta.modified_ms)
-                        .is_some() =>
-                {
-                    log::warn!(
-                        "filesync send: vetoing {p:?} (covering tombstone beats local mtime {})",
-                        meta.modified_ms,
-                    );
-                    vetoed += 1;
-                    false
-                }
-                _ => true,
-            }
-        })
-        .collect();
-    if paths.is_empty() {
-        if vetoed > 0 {
-            log::debug!("filesync send: all {} path(s) vetoed by tombstones", vetoed);
-        }
-        return Ok(());
-    }
-    let files_count = paths
-        .iter()
-        .filter(|p| manifest.files.get(*p).map(|m| !m.is_dir).unwrap_or(true))
-        .count();
-    let bytes_sent: u64 = paths
-        .iter()
-        .filter_map(|p| manifest.files.get(p))
-        .map(|m| m.size)
-        .sum();
-
-    debug!(
-        "filesync send: send_paths — {} path(s): {} file(s) {} B",
-        paths.len(),
-        files_count,
-        bytes_sent
-    );
-    if let Some(ref gs) = gui_state {
-        gs.write().begin_sync_activity();
-    }
-    engine.send_paths(&paths, conn)?;
-    debug!(
-        "filesync send: send_paths complete — {} file(s) {} B",
-        files_count, bytes_sent
-    );
-    if let Some(ref gs) = gui_state {
-        let mut s = gs.write();
-        s.begin_sync_activity();
-        s.files_sent += files_count as u64;
-        s.bytes_sent += bytes_sent;
-    }
-
-    if files_count > 0 {
-        if let Some(ref bus) = bus {
-            bus.publish(
-                "filesync",
-                "filesync.incremental_stats",
-                serde_json::json!({
-                    "node":          engine.node_id(),
-                    "peer":          "server",
-                    "files_changed": files_count,
-                    "bytes_sent":    bytes_sent,
-                }),
-            );
-        }
-    }
-    Ok(())
 }
 
 fn format_modified(path: &Path) -> String {

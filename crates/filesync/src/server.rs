@@ -2,7 +2,7 @@ use crate::bundler;
 use crate::cert_fingerprint;
 use crate::common::{self, LargeFileEndOutcome, PendingChanges};
 use crate::known_hosts::{ClientStatus, KnownClients};
-use crate::ledger::{DeletionLedger, Tombstone};
+use crate::ledger::DeletionLedger;
 use crate::manifest;
 use crate::protocol::*;
 use crate::sync_engine::SyncEngine;
@@ -347,6 +347,35 @@ fn handle_client(
     })?;
     debug!("filesync: sent Hello response to {client_id}");
 
+    // ---- Deletion-ledger exchange (server speaks first, client replies) ----
+    conn.send(&Message::LedgerExchange {
+        entries: engine.ledger_entries(),
+    })?;
+    debug!("filesync: sent LedgerExchange to {client_id}");
+    let peer_ledger_entries = match recv_with_heartbeat(&conn)? {
+        Message::LedgerExchange { entries } => entries,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "filesync: expected LedgerExchange",
+            ))
+        }
+    };
+    let merged = engine.merge_ledger(peer_ledger_entries);
+    debug!("filesync: merged {merged} tombstone(s) from {client_id}");
+    // NOTE: LedgerAck intentionally not sent — no side reads it.
+
+    // ---- Action-journal drain: the client's offline/live actions are applied
+    // before manifests are compared, so a copy this client deleted or renamed
+    // is not sent back to it. Ends at the client's ManifestExchange.
+    let remote = recv_action_drain(&client_id, &engine, &conn, &peers, &bus)?;
+    let r_files = remote.files.values().filter(|m| !m.is_dir).count();
+    let r_dirs = remote.files.values().filter(|m| m.is_dir).count();
+    debug!(
+        "filesync: {client_id} manifest — {} file(s) {} dir(s)",
+        r_files, r_dirs
+    );
+
     let cached = engine.get_manifest();
     let local = if cached.files.is_empty() {
         debug!("filesync: no cached manifest yet, running full scan for {client_id}");
@@ -367,57 +396,6 @@ fn handle_client(
     );
     conn.send(&Message::ManifestExchange(local.clone()))?;
     debug!("filesync: sent ManifestExchange to {client_id}");
-
-    let remote = match recv_with_heartbeat(&conn)? {
-        Message::ManifestExchange(m) => m,
-        Message::InsufficientDiskSpace {
-            available_bytes,
-            required_bytes,
-        } => {
-            error!(
-                "filesync: client {client_id} reports insufficient disk space — \
-                 {available_bytes} B available, {required_bytes} B required; aborting sync"
-            );
-            return Err(io::Error::new(
-                io::ErrorKind::StorageFull,
-                format!(
-                    "filesync: client {client_id} out of disk space: \
-                     {available_bytes} B available, {required_bytes} B required"
-                ),
-            ));
-        }
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "filesync: expected ManifestExchange",
-            ))
-        }
-    };
-    let r_files = remote.files.values().filter(|m| !m.is_dir).count();
-    let r_dirs = remote.files.values().filter(|m| m.is_dir).count();
-    debug!(
-        "filesync: {client_id} manifest — {} file(s) {} dir(s)",
-        r_files, r_dirs
-    );
-
-    // ---- Deletion-ledger exchange (symmetric order: server sends first,
-    // client replies — avoids both-wait deadlock) ----
-    conn.send(&Message::LedgerExchange {
-        entries: engine.ledger_entries(),
-    })?;
-    debug!("filesync: sent LedgerExchange to {client_id}");
-    let peer_ledger_entries = match recv_with_heartbeat(&conn)? {
-        Message::LedgerExchange { entries } => entries,
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "filesync: expected LedgerExchange",
-            ))
-        }
-    };
-    let merged = engine.merge_ledger(peer_ledger_entries);
-    debug!("filesync: merged {merged} tombstone(s) from {client_id}");
-    // NOTE: LedgerAck intentionally not sent — no side reads it.
 
     let bytes_from_client: u64 = manifest::compute_send_list(&remote, &local, false)
         .iter()
@@ -451,7 +429,7 @@ fn handle_client(
     }
 
     let raw_to_client = manifest::compute_send_list(&local, &remote, true);
-    let snap = local_ledger_snapshot(&engine);
+    let snap = engine.ledger_snapshot();
     let (to_client, recreated) =
         manifest::filter_resurrected(raw_to_client.clone(), &local, Some(&snap));
     // Tombstone wins over our stale copy: converge by deleting locally while
@@ -532,18 +510,20 @@ fn handle_client(
             Message::LargeFileStart {
                 ref metadata,
                 total_chunks,
+                action_ms,
             } => {
                 debug!(
                     "filesync: initial recv LargeFileStart from {client_id}: path={:?} size={} B chunks={}",
                     metadata.rel_path, metadata.size, total_chunks
                 );
-                engine.begin_large_file(metadata.clone(), total_chunks)?;
+                engine.begin_large_file_with_action(metadata.clone(), total_chunks, action_ms)?;
                 broadcast_to_others(
                     &peers,
                     &client_id,
                     &Message::LargeFileStart {
                         metadata: metadata.clone(),
                         total_chunks,
+                        action_ms,
                     },
                 );
             }
@@ -804,6 +784,284 @@ fn handle_client(
     Ok(())
 }
 
+/// Receives the client's action-journal drain. It ends at the client's
+/// ManifestExchange (sent after the drain). Each `ActionBatchEnd` is
+/// acknowledged only up to the contiguous-applied prefix of its chunk: a
+/// message whose apply failed (or a large file still missing chunks) stops
+/// the prefix, and the ack carries the last-ok seq so the client redelivers
+/// from there. The ledger is persisted before every ack.
+fn recv_action_drain(
+    client_id: &str,
+    engine: &Arc<SyncEngine>,
+    conn: &Arc<Connection>,
+    peers: &Arc<RwLock<HashMap<String, Peer>>>,
+    bus: &Option<Arc<MessageBus>>,
+) -> io::Result<Manifest> {
+    let mut last_acked: u64 = 0;
+    let mut chunk_failed = false;
+    loop {
+        match recv_with_heartbeat(conn)? {
+            Message::ManifestExchange(m) => return Ok(m),
+            Message::ActionBatchEnd { upto_seq } => {
+                engine.flush_ledger();
+                let ack_upto = if chunk_failed {
+                    last_acked
+                } else {
+                    upto_seq.max(last_acked)
+                };
+                conn.send(&Message::ActionBatchAck {
+                    upto_seq: ack_upto,
+                })?;
+                if chunk_failed {
+                    debug!(
+                        "filesync: partial ack ≤{ack_upto} to {client_id} (chunk ≤{upto_seq} had failures)"
+                    );
+                } else {
+                    last_acked = ack_upto;
+                    debug!("filesync: acked action batch ≤{ack_upto} from {client_id}");
+                }
+                chunk_failed = false;
+            }
+            Message::InsufficientDiskSpace {
+                available_bytes,
+                required_bytes,
+            } => {
+                error!(
+                    "filesync: client {client_id} reports insufficient disk space — \
+                     {available_bytes} B available, {required_bytes} B required; aborting sync"
+                );
+                return Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    format!(
+                        "filesync: client {client_id} out of disk space: \
+                         {available_bytes} B available, {required_bytes} B required"
+                    ),
+                ));
+            }
+            msg @ (Message::Bundle(_)
+            | Message::LargeFileStart { .. }
+            | Message::LargeFileChunk { .. }
+            | Message::LargeFileEnd { .. }
+            | Message::Delete { .. }
+            | Message::Rename { .. }) => {
+                if !apply_client_action(engine, conn, peers, bus, client_id, msg) {
+                    chunk_failed = true;
+                }
+            }
+            other => {
+                warn!("filesync: unexpected message during action drain from {client_id}: {other:?}");
+            }
+        }
+    }
+}
+
+/// Applies one client-originated action (live or journal drain) and relays
+/// it to the other peers, keeping the action stamp so they judge it the same.
+///
+/// Returns `true` when the action was applied (relayed), `false` when it
+/// failed or is incomplete (`LargeFileEnd` with missing chunks: the
+/// retransmit is requested but the chunk must NOT be acknowledged past this
+/// message). Callers use this to track the contiguous-applied prefix each
+/// `ActionBatchAck` may cover. Peer-supplied stamps are clamped (see
+/// [`common::clamp_future_stamp`]) before applying *and* relaying so a
+/// fabricated far-future stamp never reaches other peers.
+fn apply_client_action(
+    engine: &Arc<SyncEngine>,
+    conn: &Arc<Connection>,
+    peers: &Arc<RwLock<HashMap<String, Peer>>>,
+    bus: &Option<Arc<MessageBus>>,
+    client_id: &str,
+    msg: Message,
+) -> bool {
+    match msg {
+        Message::Bundle(mut b) => {
+            let n_files = b.files.iter().filter(|f| !f.metadata.is_dir).count();
+            let b_bytes: u64 = b.files.iter().map(|f| f.metadata.size).sum();
+            debug!(
+                "filesync: recv Bundle from {client_id}: bundle_id={} files={} size={} B",
+                b.bundle_id, n_files, b_bytes
+            );
+            common::clamp_bundle(&mut b, client_id, "filesync");
+            match common::handle_recv_bundle(engine, &b, client_id, bus, "filesync") {
+                Ok(_) => {
+                    broadcast_to_others(peers, client_id, &Message::Bundle(b));
+                    true
+                }
+                Err(e) => {
+                    error!("filesync: apply_bundle from {client_id}: {e}");
+                    false
+                }
+            }
+        }
+        Message::LargeFileStart {
+            metadata,
+            total_chunks,
+            action_ms,
+        } => {
+            debug!(
+                "filesync: recv LargeFileStart from {client_id}: path={:?} size={} B chunks={}",
+                metadata.rel_path, metadata.size, total_chunks
+            );
+            let action_ms =
+                common::clamp_future_stamp_opt(action_ms, client_id, "large-file-start", "filesync");
+            match common::handle_recv_large_file_start(
+                engine,
+                metadata.clone(),
+                total_chunks,
+                action_ms,
+                client_id,
+                "filesync",
+            ) {
+                Ok(()) => {
+                    broadcast_to_others(
+                        peers,
+                        client_id,
+                        &Message::LargeFileStart {
+                            metadata,
+                            total_chunks,
+                            action_ms,
+                        },
+                    );
+                    true
+                }
+                Err(e) => {
+                    error!("filesync: large_file_start from {client_id}: {e}");
+                    false
+                }
+            }
+        }
+        Message::LargeFileChunk {
+            path,
+            chunk_index,
+            data,
+        } => {
+            debug!(
+                "filesync: recv LargeFileChunk from {client_id}: path={path:?} chunk={chunk_index} size={} B",
+                data.len()
+            );
+            match common::handle_recv_large_file_chunk(
+                engine,
+                &path,
+                chunk_index,
+                &data,
+                client_id,
+                "filesync",
+            ) {
+                Ok(_) => {
+                    broadcast_to_others(
+                        peers,
+                        client_id,
+                        &Message::LargeFileChunk {
+                            path,
+                            chunk_index,
+                            data,
+                        },
+                    );
+                    true
+                }
+                Err(e) => {
+                    error!("filesync: large_file_chunk from {client_id}: {e}");
+                    false
+                }
+            }
+        }
+        Message::LargeFileEnd { path, final_hash } => {
+            debug!("filesync: recv LargeFileEnd from {client_id}: path={path:?}");
+            match common::handle_recv_large_file_end(
+                engine, &path, final_hash, client_id, bus, "filesync",
+            ) {
+                Ok(LargeFileEndOutcome::Committed)
+                | Ok(LargeFileEndOutcome::CommittedWithConflict(_)) => {
+                    broadcast_to_others(
+                        peers,
+                        client_id,
+                        &Message::LargeFileEnd { path, final_hash },
+                    );
+                    true
+                }
+                Ok(LargeFileEndOutcome::MissingChunks(indices)) => {
+                    // Incomplete file: request the missing chunks and report
+                    // failure so the ack does NOT advance past it.
+                    common::request_retransmit(conn, &path, indices, "filesync");
+                    false
+                }
+                Err(e) => {
+                    error!("filesync: large_file_end from {client_id}: {e}");
+                    false
+                }
+            }
+        }
+        Message::Delete {
+            paths,
+            deleted_at_ms,
+            deleter,
+        } => {
+            debug!(
+                "filesync: recv Delete from {client_id}: {} path(s)",
+                paths.len()
+            );
+            let deleted_at_ms =
+                common::clamp_future_stamp(deleted_at_ms, client_id, "delete", "filesync");
+            match common::handle_recv_delete_with_meta(
+                engine,
+                &paths,
+                deleted_at_ms,
+                &deleter,
+                client_id,
+                bus,
+                "filesync",
+            ) {
+                Ok(_) => {
+                    broadcast_to_others(
+                        peers,
+                        client_id,
+                        &Message::Delete {
+                            paths,
+                            deleted_at_ms,
+                            deleter,
+                        },
+                    );
+                    true
+                }
+                Err(e) => {
+                    error!("filesync: apply_deletes from {client_id}: {e}");
+                    false
+                }
+            }
+        }
+        Message::Rename {
+            from,
+            to,
+            action_ms,
+        } => {
+            debug!("filesync: recv Rename from {client_id}: {from:?} → {to:?}");
+            let action_ms =
+                common::clamp_future_stamp(action_ms, client_id, "rename", "filesync");
+            match common::handle_recv_rename(
+                engine, &from, &to, action_ms, client_id, bus, "filesync",
+            ) {
+                Ok(()) => {
+                    broadcast_to_others(
+                        peers,
+                        client_id,
+                        &Message::Rename {
+                            from,
+                            to,
+                            action_ms,
+                        },
+                    );
+                    true
+                }
+                Err(e) => {
+                    error!("filesync: apply_rename from {client_id}: {e}");
+                    false
+                }
+            }
+        }
+        _ => true,
+    }
+}
+
 fn client_recv_loop(
     client_id: String,
     engine: Arc<SyncEngine>,
@@ -813,139 +1071,43 @@ fn client_recv_loop(
     sent_bundles: Arc<RwLock<HashMap<u64, BundleTracking>>>, // Add this parameter
 ) {
     debug!("filesync: recv loop started for {client_id}");
+    // Contiguous-applied prefix for the live journal chunks (same contract
+    // as the drain handler above): a failed message pins the next ack to
+    // `last_acked` so the client redelivers from there.
+    let mut last_acked: u64 = 0;
+    let mut chunk_failed = false;
     loop {
         match recv_with_heartbeat(&conn) {
-            Ok(Message::Bundle(b)) => {
-                let n_files = b.files.iter().filter(|f| !f.metadata.is_dir).count();
-                let b_bytes: u64 = b.files.iter().map(|f| f.metadata.size).sum();
-                debug!(
-                    "filesync: recv Bundle from {client_id}: bundle_id={} files={} size={} B",
-                    b.bundle_id, n_files, b_bytes
-                );
-                match common::handle_recv_bundle(&engine, &b, &client_id, &bus, "filesync") {
-                    Ok(_) => broadcast_to_others(&peers, &client_id, &Message::Bundle(b)),
-                    Err(e) => error!("filesync: apply_bundle from {client_id}: {e}"),
+            Ok(msg @ (Message::Bundle(_)
+            | Message::LargeFileStart { .. }
+            | Message::LargeFileChunk { .. }
+            | Message::LargeFileEnd { .. }
+            | Message::Delete { .. }
+            | Message::Rename { .. })) => {
+                if !apply_client_action(&engine, &conn, &peers, &bus, &client_id, msg) {
+                    chunk_failed = true;
                 }
             }
-            Ok(Message::LargeFileStart {
-                metadata,
-                total_chunks,
-            }) => {
-                debug!(
-                    "filesync: recv LargeFileStart from {client_id}: path={:?} size={} B chunks={}",
-                    metadata.rel_path, metadata.size, total_chunks
-                );
-                if common::handle_recv_large_file_start(
-                    &engine,
-                    metadata.clone(),
-                    total_chunks,
-                    &client_id,
-                    "filesync",
-                )
-                .is_ok()
-                {
-                    broadcast_to_others(
-                        &peers,
-                        &client_id,
-                        &Message::LargeFileStart {
-                            metadata,
-                            total_chunks,
-                        },
+            Ok(Message::ActionBatchEnd { upto_seq }) => {
+                engine.flush_ledger();
+                let ack_upto = if chunk_failed {
+                    last_acked
+                } else {
+                    upto_seq.max(last_acked)
+                };
+                if chunk_failed {
+                    debug!(
+                        "filesync: partial ack ≤{ack_upto} to {client_id} (live chunk ≤{upto_seq} had failures)"
                     );
                 }
-            }
-            Ok(Message::LargeFileChunk {
-                ref path,
-                chunk_index,
-                ref data,
-            }) => {
-                debug!(
-                    "filesync: recv LargeFileChunk from {client_id}: path={path:?} chunk={chunk_index} size={} B",
-                    data.len()
-                );
-                match common::handle_recv_large_file_chunk(
-                    &engine,
-                    path,
-                    chunk_index,
-                    data,
-                    &client_id,
-                    "filesync",
-                ) {
-                    Ok(_) => broadcast_to_others(
-                        &peers,
-                        &client_id,
-                        &Message::LargeFileChunk {
-                            path: path.clone(),
-                            chunk_index,
-                            data: data.clone(),
-                        },
-                    ),
-                    Err(e) => error!("filesync: large_file_chunk from {client_id}: {e}"),
+                if !chunk_failed {
+                    last_acked = ack_upto;
                 }
-            }
-            Ok(Message::LargeFileEnd {
-                ref path,
-                final_hash,
-            }) => {
-                debug!("filesync: recv LargeFileEnd from {client_id}: path={path:?}");
-                match common::handle_recv_large_file_end(
-                    &engine, path, final_hash, &client_id, &bus, "filesync",
-                ) {
-                    Ok(LargeFileEndOutcome::Committed)
-                    | Ok(LargeFileEndOutcome::CommittedWithConflict(_)) => {
-                        broadcast_to_others(
-                            &peers,
-                            &client_id,
-                            &Message::LargeFileEnd {
-                                path: path.clone(),
-                                final_hash,
-                            },
-                        );
-                    }
-                    Ok(LargeFileEndOutcome::MissingChunks(indices)) => {
-                        common::request_retransmit(&conn, path, indices, "filesync");
-                    }
-                    Err(e) => error!("filesync: large_file_end from {client_id}: {e}"),
-                }
-            }
-            Ok(Message::Delete {
-                paths,
-                deleted_at_ms,
-                deleter,
-            }) => {
-                debug!(
-                    "filesync: recv Delete from {client_id}: {} path(s)",
-                    paths.len()
-                );
-                match common::handle_recv_delete_with_meta(
-                    &engine,
-                    &paths,
-                    deleted_at_ms,
-                    &deleter,
-                    &client_id,
-                    &bus,
-                    "filesync",
-                ) {
-                    Ok(_) => broadcast_to_others(
-                        &peers,
-                        &client_id,
-                        &Message::Delete {
-                            paths,
-                            deleted_at_ms,
-                            deleter,
-                        },
-                    ),
-                    Err(e) => error!("filesync: apply_deletes from {client_id}: {e}"),
-                }
-            }
-            Ok(Message::Rename { from, to }) => {
-                debug!("filesync: recv Rename from {client_id}: {from:?} → {to:?}");
-                match common::handle_recv_rename(&engine, &from, &to, &client_id, &bus, "filesync")
-                {
-                    Ok(()) => {
-                        broadcast_to_others(&peers, &client_id, &Message::Rename { from, to })
-                    }
-                    Err(e) => error!("filesync: apply_rename from {client_id}: {e}"),
+                chunk_failed = false;
+                if let Err(e) = conn.send(&Message::ActionBatchAck {
+                    upto_seq: ack_upto,
+                }) {
+                    warn!("filesync: failed to ack action batch {ack_upto} for {client_id}: {e}");
                 }
             }
             Ok(Message::ChangeAcknowledgment {
@@ -1106,11 +1268,19 @@ fn flush_local_changes(
     pending: &mut PendingChanges,
     sent_bundles: &Arc<RwLock<HashMap<u64, BundleTracking>>>, // Add this parameter
 ) {
-    let rn = pending.renames.len();
+    // Local live actions become live-action records before anything is relayed,
+    // so relays carry a stamp newer than any tombstone the peers may hold.
+    let rename_at = crate::ledger::now_ms();
+    let renames = pending.take_renames();
+    let mut actions = pending.take_live();
+    actions.extend(renames.iter().map(|(_, to)| (to.clone(), rename_at)));
+    engine.record_live_actions(&actions);
+
+    let rn = renames.len();
     if rn > 0 {
         debug!("filesync server: broadcasting {} rename(s)", rn);
     }
-    for (from, to) in pending.take_renames() {
+    for (from, to) in renames {
         log::info!("filesync: server broadcast rename {from:?} → {to:?}");
         if let Some(ref bus) = bus {
             bus.publish(
@@ -1123,7 +1293,15 @@ fn flush_local_changes(
                 }),
             );
         }
-        broadcast_to_others(peers, "", &Message::Rename { from, to });
+        broadcast_to_others(
+            peers,
+            "",
+            &Message::Rename {
+                from,
+                to,
+                action_ms: rename_at,
+            },
+        );
     }
 
     let ready_paths = pending.take_ready();
@@ -1189,36 +1367,7 @@ fn broadcast_paths(
     sent_bundles: &Arc<RwLock<HashMap<u64, BundleTracking>>>, // Add this parameter
 ) {
     const BROADCAST_PIPELINE_DEPTH: usize = 128;
-    // Outgoing resurrection guard (same policy as the client send path):
-    // drop paths whose local version loses to a covering tombstone before
-    // streaming. Unknown paths (no manifest entry) pass through.
-    let manifest = engine.get_manifest();
-    let mut vetoed = 0usize;
-    let paths: Vec<PathBuf> = paths
-        .into_iter()
-        .filter(|p| match manifest.files.get(p) {
-            Some(meta)
-                if engine
-                    .covering_tombstone_veto(p, meta.modified_ms)
-                    .is_some() =>
-            {
-                log::warn!(
-                    "filesync server: vetoing {p:?} broadcast (covering tombstone beats local mtime {})",
-                    meta.modified_ms,
-                );
-                vetoed += 1;
-                false
-            }
-            _ => true,
-        })
-        .collect();
     if paths.is_empty() {
-        if vetoed > 0 {
-            log::debug!(
-                "filesync server: all {} path(s) vetoed by tombstones",
-                vetoed
-            );
-        }
         return;
     }
     debug!(
@@ -1234,11 +1383,16 @@ fn broadcast_paths(
     std::thread::Builder::new()
         .name("broadcast-reader".into())
         .spawn(move || {
+            let stamp_engine = engine_for_thread.clone();
+            let stamp = move |rel: &std::path::Path, mtime: u64| {
+                stamp_engine.wire_action_stamp(rel, mtime)
+            };
             bundler::stream_messages(
                 &root,
                 &paths_for_thread,
                 &msg_tx,
-                Some(engine_for_thread.clone()),
+                Some(engine_for_thread),
+                &stamp,
             )
         })
         .expect("spawn broadcast-reader");
@@ -1319,32 +1473,6 @@ fn broadcast_paths(
             );
         }
     }
-}
-
-/// In-memory snapshot of the engine's deletion ledger for sync decisions
-/// (rebuilt from `ledger_entries`; avoids new sync_engine accessors).
-fn local_ledger_snapshot(engine: &SyncEngine) -> DeletionLedger {
-    let mut snap = DeletionLedger::new();
-    snap.merge_remote(
-        engine
-            .ledger_entries()
-            .into_iter()
-            .map(|d| {
-                let path = d.path.clone();
-                (
-                    path,
-                    Tombstone::new(
-                        d.path,
-                        d.deleted_at_ms,
-                        d.deleter_node,
-                        d.prev_hash,
-                        d.prev_mtime_ms,
-                    ),
-                )
-            })
-            .collect(),
-    );
-    snap
 }
 
 /// Paths the peer still lists but our merged ledger marks deleted (tombstone
