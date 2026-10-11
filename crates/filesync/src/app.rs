@@ -289,6 +289,22 @@ impl App for FileSyncApp {
 
         let sub = req.path.strip_prefix("/api/filesync").unwrap_or(&req.path);
 
+        // Admin-only surface, gated on the authenticated context (not on the
+        // route) so that no mutating method on this subtree is reachable by a
+        // non-admin user:
+        //   * all of /known-clients (listing, approve/reject, label, delete);
+        //   * every non-read-only method (anything other than GET/HEAD), which
+        //     covers rescan, trash restore/purge/empty, and any future mutating
+        //     route. This also applies to the unmatched fallthrough, so an
+        //     unknown POST/DELETE cannot be used to probe or mutate as non-admin.
+        // Read-only GETs for status, manifest and trash listing stay open to any
+        // authenticated user.
+        if is_known_clients_path(sub) || !is_read_only_method(&req.method) {
+            if let Some(resp) = admin_gate(req) {
+                return Some(resp);
+            }
+        }
+
         match (req.method.as_str(), sub) {
             ("GET", "" | "/" | "/status") => {
                 let manifest = state.engine.get_manifest();
@@ -379,18 +395,14 @@ impl App for FileSyncApp {
                         "known-clients management is only available in server mode".to_string(),
                     ));
                 };
-                let node_id = {
+                let (node_id, label) = {
                     let mut kc = kc_arc.lock();
                     if !kc.set_status(fp, ClientStatus::Allowed) {
                         return Some(HttpResponse::not_found(format!(
                             "no client with fingerprint {fp}"
                         )));
                     }
-                    kc.list()
-                        .iter()
-                        .find(|c| c.fingerprint == fp)
-                        .map(|c| c.node_id.clone())
-                        .unwrap_or_default()
+                    client_identity(&kc, fp)
                 };
                 state.bus.publish(
                     "filesync",
@@ -398,7 +410,8 @@ impl App for FileSyncApp {
                     json!({ "fingerprint": fp, "node_id": node_id }),
                 );
                 log::info!(
-                    "filesync: client approved — node={node_id} fp={}…",
+                    "filesync: client approved — {} fp={}…",
+                    crate::known_hosts::client_ref(&node_id, &label),
                     &fp[..16.min(fp.len())]
                 );
                 Some(HttpResponse::ok_json(json!({ "ok": true })))
@@ -413,18 +426,14 @@ impl App for FileSyncApp {
                         "known-clients management is only available in server mode".to_string(),
                     ));
                 };
-                let node_id = {
+                let (node_id, label) = {
                     let mut kc = kc_arc.lock();
                     if !kc.set_status(fp, ClientStatus::Rejected) {
                         return Some(HttpResponse::not_found(format!(
                             "no client with fingerprint {fp}"
                         )));
                     }
-                    kc.list()
-                        .iter()
-                        .find(|c| c.fingerprint == fp)
-                        .map(|c| c.node_id.clone())
-                        .unwrap_or_default()
+                    client_identity(&kc, fp)
                 };
                 state.bus.publish(
                     "filesync",
@@ -432,7 +441,8 @@ impl App for FileSyncApp {
                     json!({ "fingerprint": fp, "node_id": node_id }),
                 );
                 log::info!(
-                    "filesync: client rejected — node={node_id} fp={}…",
+                    "filesync: client rejected — {} fp={}…",
+                    crate::known_hosts::client_ref(&node_id, &label),
                     &fp[..16.min(fp.len())]
                 );
                 Some(HttpResponse::ok_json(json!({ "ok": true })))
@@ -447,19 +457,38 @@ impl App for FileSyncApp {
                         "known-clients management is only available in server mode".to_string(),
                     ));
                 };
-                let label = req
+                // A missing or malformed body is an error, not an implicit "clear".
+                let Some(raw) = req
                     .json()
                     .ok()
-                    .and_then(|v: serde_json::Value| v["label"].as_str().map(|s| s.to_string()))
-                    .unwrap_or_default();
+                    .and_then(|v: serde_json::Value| v.get("label")?.as_str().map(str::to_owned))
+                else {
+                    return Some(HttpResponse::bad_request(
+                        "body must be JSON with a string \"label\" field".to_string(),
+                    ));
+                };
+                let label = match crate::known_hosts::validate_label(&raw) {
+                    Ok(l) => l,
+                    Err(e) => return Some(HttpResponse::bad_request(e)),
+                };
                 let mut kc = kc_arc.lock();
-                if kc.set_label(fp, &label) {
-                    Some(HttpResponse::ok_json(json!({ "ok": true })))
-                } else {
-                    Some(HttpResponse::not_found(format!(
+                if !kc.set_label(fp, &label) {
+                    return Some(HttpResponse::not_found(format!(
                         "no client with fingerprint {fp}"
-                    )))
+                    )));
                 }
+                let node_id = kc.get(fp).map(|c| c.node_id.clone()).unwrap_or_default();
+                drop(kc);
+                log::info!(
+                    "filesync: client label changed — node={node_id} fp={}… label={}",
+                    &fp[..16.min(fp.len())],
+                    if label.is_empty() {
+                        "(cleared)".to_string()
+                    } else {
+                        format!("\"{label}\"")
+                    }
+                );
+                Some(HttpResponse::ok_json(json!({ "ok": true, "label": label })))
             }
 
             ("DELETE", sub) if sub.starts_with("/known-clients/") => {
@@ -539,6 +568,34 @@ impl App for FileSyncApp {
     }
 
     fn on_message(&self, _msg: &Arc<BusMessage>) {}
+}
+
+/// True for `/known-clients` and anything beneath it.
+fn is_known_clients_path(sub: &str) -> bool {
+    sub == "/known-clients" || sub.starts_with("/known-clients/")
+}
+
+/// Methods that cannot change state. Everything else is treated as mutating.
+fn is_read_only_method(method: &str) -> bool {
+    matches!(method, "GET" | "HEAD")
+}
+
+/// Admin check, mirroring `admin_middleware` in bytehive-core's http module:
+/// the request must carry an authenticated context whose groups include admin.
+/// `None` means the caller may proceed.
+fn admin_gate(req: &HttpRequest) -> Option<HttpResponse> {
+    match req.auth.as_ref() {
+        Some(ctx) if ctx.is_admin() => None,
+        Some(_) => Some(HttpResponse::forbidden()),
+        None => Some(HttpResponse::unauthorized()),
+    }
+}
+
+/// `(node_id, label)` for a fingerprint, or empty strings if unknown.
+fn client_identity(kc: &KnownClients, fingerprint: &str) -> (String, String) {
+    kc.get(fingerprint)
+        .map(|c| (c.node_id.clone(), c.label.clone()))
+        .unwrap_or_default()
 }
 
 fn spawn_metrics_thread(engine: Arc<SyncEngine>, bus: Arc<MessageBus>, mode: String) {

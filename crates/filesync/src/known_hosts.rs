@@ -40,6 +40,49 @@ pub struct KnownClient {
     pub last_seen_ms: u64,
 }
 
+/// Maximum label length, counted in Unicode scalar values (after trimming).
+pub const MAX_LABEL_CHARS: usize = 64;
+
+/// Validate and normalise a user-supplied client label.
+///
+/// * Leading/trailing whitespace is trimmed.
+/// * An empty (or all-whitespace) input yields `Ok("")`, which clears the label.
+/// * Control characters (including embedded newlines/tabs), Unicode line/paragraph
+///   separators and bidi override/isolate characters are rejected, because labels
+///   are echoed verbatim into log lines.
+/// * More than [`MAX_LABEL_CHARS`] characters is rejected.
+pub fn validate_label(raw: &str) -> Result<String, String> {
+    let label = raw.trim();
+
+    if label.chars().any(is_unsafe_label_char) {
+        return Err("label must not contain control characters".into());
+    }
+    if label.chars().count() > MAX_LABEL_CHARS {
+        return Err(format!(
+            "label must be at most {MAX_LABEL_CHARS} characters"
+        ));
+    }
+    Ok(label.to_string())
+}
+
+fn is_unsafe_label_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{2028}' | '\u{2029}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
+/// Render a client for log output: `"Alice laptop" (node-id)` when labelled,
+/// otherwise just the node id.
+pub fn client_ref(node_id: &str, label: &str) -> String {
+    if label.is_empty() {
+        node_id.to_string()
+    } else {
+        format!("\"{label}\" ({node_id})")
+    }
+}
+
 #[derive(serde::Deserialize, Default)]
 struct KnownClientsRaw {
     #[serde(default)]
@@ -104,6 +147,10 @@ impl KnownClients {
         &self.clients
     }
 
+    pub fn get(&self, fingerprint: &str) -> Option<&KnownClient> {
+        self.clients.iter().find(|c| c.fingerprint == fingerprint)
+    }
+
     pub fn pending_count(&self) -> usize {
         self.clients
             .iter()
@@ -162,6 +209,7 @@ impl KnownClients {
         }
     }
 
+    /// Store `label` verbatim. Callers must run [`validate_label`] first.
     pub fn set_label(&mut self, fingerprint: &str, label: &str) -> bool {
         match self
             .clients
@@ -188,6 +236,10 @@ impl KnownClients {
     }
 
     fn save(&self) {
+        // Hold the shared config-file lock across the read-splice-write so a
+        // concurrent UserStore::persist cannot interleave and drop either block.
+        let _config_guard = bytehive_core::users::config_file_lock().lock();
+
         let original = if self.config_path.exists() {
             match std::fs::read_to_string(&self.config_path) {
                 Ok(s) => s,
@@ -419,5 +471,101 @@ impl KnownServers {
                 log::error!("filesync: failed to serialize known_servers: {e}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+
+    #[test]
+    fn validate_trims_surrounding_whitespace() {
+        assert_eq!(validate_label("  Alice laptop \t").unwrap(), "Alice laptop");
+    }
+
+    #[test]
+    fn validate_empty_clears_label() {
+        assert_eq!(validate_label("").unwrap(), "");
+    }
+
+    #[test]
+    fn validate_whitespace_only_clears_label() {
+        assert_eq!(validate_label("   ").unwrap(), "");
+    }
+
+    #[test]
+    fn validate_accepts_exactly_max_length() {
+        let s = "a".repeat(MAX_LABEL_CHARS);
+        assert_eq!(validate_label(&s).unwrap(), s);
+    }
+
+    #[test]
+    fn validate_rejects_one_over_max_length() {
+        let s = "a".repeat(MAX_LABEL_CHARS + 1);
+        assert!(validate_label(&s).is_err());
+    }
+
+    #[test]
+    fn validate_counts_characters_not_bytes() {
+        // 64 two-byte chars: 128 bytes, but within the 64-character limit.
+        let s = "é".repeat(MAX_LABEL_CHARS);
+        assert_eq!(validate_label(&s).unwrap(), s);
+        let too_long = "é".repeat(MAX_LABEL_CHARS + 1);
+        assert!(validate_label(&too_long).is_err());
+    }
+
+    #[test]
+    fn validate_length_is_checked_after_trim() {
+        let padded = format!("  {}  ", "a".repeat(MAX_LABEL_CHARS));
+        assert_eq!(
+            validate_label(&padded).unwrap(),
+            "a".repeat(MAX_LABEL_CHARS)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_embedded_newline() {
+        assert!(validate_label("Alice\nFAKE LOG LINE").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_embedded_tab_and_nul() {
+        assert!(validate_label("a\tb").is_err());
+        assert!(validate_label("a\0b").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_del_and_c1_controls() {
+        assert!(validate_label("a\u{7f}b").is_err());
+        assert!(validate_label("a\u{9b}b").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_line_separators_and_bidi_overrides() {
+        assert!(validate_label("a\u{2028}b").is_err());
+        assert!(validate_label("a\u{2029}b").is_err());
+        assert!(validate_label("evil\u{202E}txt.exe").is_err());
+        assert!(validate_label("a\u{2066}b").is_err());
+    }
+
+    #[test]
+    fn validate_accepts_ordinary_unicode_and_punctuation() {
+        assert_eq!(
+            validate_label("Søren's “MacBook” #2").unwrap(),
+            "Søren's “MacBook” #2"
+        );
+    }
+
+    #[test]
+    fn client_ref_without_label_is_node_id() {
+        assert_eq!(client_ref("gui-18dd", ""), "gui-18dd");
+    }
+
+    #[test]
+    fn client_ref_with_label_shows_both() {
+        assert_eq!(
+            client_ref("gui-18dd", "Alice laptop"),
+            "\"Alice laptop\" (gui-18dd)"
+        );
     }
 }

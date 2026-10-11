@@ -414,3 +414,63 @@ fn remove_group_not_found_returns_error() {
     let err = store.remove_group("nonexistent_group").unwrap_err();
     assert!(err.contains("not found"));
 }
+
+/// persist() must splice into the file as it is now, so edits made by other
+/// writers after startup (here: a hand-edited [framework] value and a
+/// foreign array-of-tables block) survive a user mutation.
+#[test]
+fn persist_preserves_sections_changed_on_disk_after_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "[framework]\nhttp_addr = \"127.0.0.1:9000\"\n\n[[other_block]]\nkey = \"before\"\n",
+    )
+    .unwrap();
+    let snapshot = std::fs::read_to_string(&path).unwrap();
+    let store = UserStore::new(vec![], vec![], vec![], "", Some(path.clone()), snapshot);
+
+    // Another writer changes the file after startup.
+    std::fs::write(
+        &path,
+        "[framework]\nhttp_addr = \"127.0.0.1:9100\"\n\n[[other_block]]\nkey = \"after\"\n",
+    )
+    .unwrap();
+
+    store
+        .add_user(UserEntry {
+            username: "dana".into(),
+            password_hash: UserStore::hash_password("pw"),
+            display_name: String::new(),
+        })
+        .unwrap();
+
+    let v: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(v["framework"]["http_addr"].as_str(), Some("127.0.0.1:9100"));
+    assert_eq!(v["other_block"][0]["key"].as_str(), Some("after"));
+    assert_eq!(v["users"][0]["username"].as_str(), Some("dana"));
+}
+
+#[test]
+fn persist_falls_back_to_snapshot_when_file_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("missing.toml");
+    let store = UserStore::new(
+        vec![],
+        vec![],
+        vec![],
+        "",
+        Some(path.clone()),
+        "[framework]\nhttp_addr = \"x:1\"\n".to_string(),
+    );
+    store
+        .add_user(UserEntry {
+            username: "erin".into(),
+            password_hash: UserStore::hash_password("pw"),
+            display_name: String::new(),
+        })
+        .unwrap();
+    let v: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(v["framework"]["http_addr"].as_str(), Some("x:1"));
+    assert_eq!(v["users"][0]["username"].as_str(), Some("erin"));
+}

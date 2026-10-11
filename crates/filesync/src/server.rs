@@ -265,24 +265,29 @@ fn handle_client(
             }
             debug!("filesync: received Hello from {node_id} proto={protocol_version}");
 
-            let status = {
+            let (status, is_new, label) = {
                 let mut kc = known_clients.lock();
                 let is_new = kc.upsert_pending(&node_id, &client_fp, &addr);
                 let status = kc.status(&client_fp).unwrap_or(ClientStatus::Pending);
-                (status, is_new)
+                let label = kc
+                    .get(&client_fp)
+                    .map(|c| c.label.clone())
+                    .unwrap_or_default();
+                (status, is_new, label)
             };
+            let who = crate::known_hosts::client_ref(&node_id, &label);
 
-            match status {
+            match (status, is_new) {
                 (ClientStatus::Allowed, _) => {
                     info!(
-                        "filesync: client {node_id} authorized (fp: {}…)",
+                        "filesync: client {who} authorized (fp: {}…)",
                         &client_fp[..16]
                     );
                 }
                 (ClientStatus::Pending, is_new) => {
                     if is_new {
                         info!(
-                            "filesync: unknown client {node_id} (fp: {}…) — pending admin approval",
+                            "filesync: unknown client {who} (fp: {}…) — pending admin approval",
                             &client_fp[..16]
                         );
                         if let Some(ref bus) = bus {
@@ -298,7 +303,7 @@ fn handle_client(
                         }
                     } else {
                         debug!(
-                            "filesync: client {node_id} still pending (fp: {}…)",
+                            "filesync: client {who} still pending (fp: {}…)",
                             &client_fp[..16]
                         );
                     }
@@ -312,7 +317,7 @@ fn handle_client(
                 }
                 (ClientStatus::Rejected, _) => {
                     warn!(
-                        "filesync: rejected client {node_id} (fp: {}…)",
+                        "filesync: rejected client {who} (fp: {}…)",
                         &client_fp[..16]
                     );
                     let _ = conn.send(&Message::Rejected {

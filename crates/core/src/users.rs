@@ -2,7 +2,7 @@ use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -551,12 +551,27 @@ impl UserStore {
             return;
         };
 
+        let _config_guard = CONFIG_FILE_LOCK.lock();
+
         let users = self.users.read().clone();
         let groups = self.groups.read().clone();
         let api_keys = self.api_keys.read().clone();
-        let base = self.raw_config.read().clone();
 
         let fresh_auth = serialize_auth_sections(&users, &groups, &api_keys);
+
+        // Splice into the file as it is *now*, not the startup snapshot in
+        // `raw_config`. Other writers (e.g. filesync's [[filesync_known_clients]]
+        // block) update the file independently; basing the write on a stale
+        // snapshot would silently revert their changes. Only fall back to the
+        // snapshot when the file does not exist yet.
+        let base = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.raw_config.read().clone(),
+            Err(e) => {
+                log::error!("persist: cannot read {path:?} before write, not saving: {e}");
+                return;
+            }
+        };
 
         let output = splice_auth_sections(&base, &fresh_auth);
 
@@ -568,6 +583,18 @@ impl UserStore {
             Err(e) => log::error!("persist: write {:?}: {e}", path),
         }
     }
+}
+
+/// Process-wide lock serialising read-modify-write cycles on the framework
+/// config file. Every component that rewrites a section of the config file
+/// (UserStore for auth sections, filesync for `[[filesync_known_clients]]`)
+/// must hold this across its read and write, otherwise one writer can clobber
+/// the other's section.
+static CONFIG_FILE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Shared lock for config-file read-modify-write cycles. See [`CONFIG_FILE_LOCK`].
+pub fn config_file_lock() -> &'static Mutex<()> {
+    &CONFIG_FILE_LOCK
 }
 
 #[derive(serde::Serialize)]
