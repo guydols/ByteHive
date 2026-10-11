@@ -1068,6 +1068,179 @@
             .inline-msg.err {
                 color: var(--bh-hi);
             }
+            /* Known clients: display names */
+            .kc-name {
+                display: flex;
+                align-items: flex-start;
+                gap: 0.5rem;
+                min-width: 0;
+            }
+            .kc-name-main {
+                flex: 0 1 auto;
+                min-width: 0;
+            }
+            .kc-name-label {
+                font-weight: 500;
+                color: var(--text);
+                overflow-wrap: anywhere;
+            }
+            .kc-name-id {
+                font-size: var(--fs-xs);
+                color: var(--muted);
+                overflow-wrap: anywhere;
+                margin-top: 0.1rem;
+            }
+            .kc-name-unset {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: baseline;
+                gap: 0.1rem 0.5rem;
+                font-weight: 500;
+                color: var(--text);
+                overflow-wrap: anywhere;
+            }
+            .kc-name-none {
+                font-size: var(--fs-xs);
+                font-weight: 400;
+                font-style: italic;
+                color: var(--muted);
+            }
+            .kc-name-note {
+                font-size: var(--fs-xs);
+                margin-top: 0.2rem;
+                animation: fadeIn 0.2s ease;
+            }
+            .kc-name-note.ok {
+                color: var(--bh-hi);
+            }
+            .kc-name-note.err {
+                color: var(--danger-lo);
+            }
+            .kc-edit {
+                display: inline-flex;
+                align-items: center;
+                gap: 0.3rem;
+                flex: none;
+                min-height: 28px;
+                padding: 0.2rem 0.45rem;
+                background: transparent;
+                border: 1px solid transparent;
+                border-radius: var(--r);
+                color: var(--muted);
+                font-family: var(--sans);
+                font-size: var(--fs-xs);
+                font-weight: 500;
+                cursor: pointer;
+                transition:
+                    color var(--tr),
+                    border-color var(--tr),
+                    background var(--tr);
+            }
+            .kc-edit.is-add {
+                color: var(--lo);
+                border-color: var(--bd);
+            }
+            .kc-edit:hover {
+                color: var(--text);
+                border-color: var(--bd2);
+                background: var(--sf2);
+            }
+            .kc-edit .material-icons {
+                font-size: 0.95rem;
+                width: 0.95rem;
+                height: 0.95rem;
+            }
+            .kc-edit:focus-visible,
+            .kc-icon-btn:focus-visible {
+                outline: none;
+                box-shadow: 0 0 0 2px var(--focus-ring);
+            }
+            .kc-name-form {
+                display: flex;
+                flex-wrap: nowrap;
+                align-items: center;
+                gap: 0.35rem;
+            }
+            .kc-name-input {
+                flex: 0 1 14rem;
+                width: 14rem;
+                min-width: 8rem;
+                min-height: 30px;
+                padding: 0.25rem 0.5rem;
+                font-size: var(--fs-sm);
+                font-weight: 500;
+            }
+            .kc-name-input[aria-invalid="true"] {
+                border-color: rgba(229, 77, 46, 0.7);
+            }
+            .kc-name-input:disabled {
+                opacity: 0.6;
+            }
+            .kc-icon-btn {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                flex: none;
+                width: 30px;
+                height: 30px;
+                padding: 0;
+                background: transparent;
+                border: 1px solid var(--bd);
+                border-radius: var(--r);
+                color: var(--lo);
+                cursor: pointer;
+                transition:
+                    color var(--tr),
+                    border-color var(--tr),
+                    background var(--tr);
+            }
+            .kc-icon-btn .material-icons {
+                font-size: 1rem;
+                width: 1rem;
+                height: 1rem;
+            }
+            .kc-icon-btn:hover:not(:disabled) {
+                color: var(--text);
+                border-color: var(--bd2);
+                background: var(--sf3);
+            }
+            .kc-icon-btn.kc-save {
+                color: var(--bh-hi);
+                border-color: rgba(255, 172, 28, 0.55);
+            }
+            .kc-icon-btn.kc-save:hover:not(:disabled) {
+                background: var(--a-glow);
+                border-color: var(--bh-lo);
+            }
+            .kc-icon-btn:disabled {
+                opacity: 0.35;
+                cursor: not-allowed;
+            }
+            .kc-name-meta {
+                display: flex;
+                align-items: baseline;
+                justify-content: space-between;
+                gap: 0.75rem;
+                margin-top: 0.3rem;
+            }
+            .kc-name-count {
+                flex: none;
+                font-family: var(--mono);
+                font-size: var(--fs-xs);
+                color: var(--muted);
+                white-space: nowrap;
+            }
+            .kc-name-count.over {
+                color: var(--danger-lo);
+            }
+            .kc-name-hint {
+                min-height: 1em;
+                font-size: var(--fs-xs);
+                color: var(--muted);
+            }
+            .kc-name-hint.err {
+                color: var(--danger-lo);
+            }
             .empty-row {
                 text-align: center;
                 color: var(--muted);
@@ -1920,7 +2093,8 @@
                         return;
                     }
                     const { clients } = await r.json();
-                    renderKnownClientsPanel(clients || []);
+                    kcClients = clients || [];
+                    renderKnownClientsPanel(kcClients);
                 } catch (e) {
                     p.innerHTML = `<div class="err-box">✗ ${esc(e.message)}</div>`;
                 }
@@ -1931,6 +2105,12 @@
                 const pending = clients.filter((c) => c.status === "pending");
                 const allowed = clients.filter((c) => c.status === "allowed");
                 const rejected = clients.filter((c) => c.status === "rejected");
+
+                // Forget name-editing state for clients that no longer exist
+                for (const fp of [...kcNameUi.keys()]) {
+                    if (!clients.some((c) => c.fingerprint === fp))
+                        kcNameUi.delete(fp);
+                }
 
                 // Update pending badge in sidebar
                 const badge = $("kc-pending-badge");
@@ -1959,10 +2139,7 @@
                               ? "var(--warn)"
                               : "var(--danger-lo)";
                     return `<tr>
-            <td>
-                <div style="font-weight:500;color:var(--text)">${esc(c.node_id || "—")}</div>
-                ${c.label ? `<div style="font-size:var(--fs-xs);color:var(--muted)">${esc(c.label)}</div>` : ""}
-            </td>
+            <td data-kc-name="${escAttr(c.fingerprint)}">${kcNameInner(c)}</td>
             <td class="mono" style="font-size:var(--fs-xs);color:var(--lo)" title="${esc(c.fingerprint)}">${esc(fpShort(c.fingerprint))}</td>
             <td style="color:var(--lo)">${esc(c.addr || "—")}</td>
             <td style="color:var(--lo)">${fmtTs(c.first_seen_ms)}</td>
@@ -2001,7 +2178,7 @@ ${
 <div class="sec-title">Pending Approval</div>
 <div style="overflow-x:auto">
 <table class="tbl">
-    <thead><tr><th>Node ID</th><th>Fingerprint</th><th>Address</th><th>First Seen</th><th>Last Seen</th><th>Status</th><th></th></tr></thead>
+    <thead><tr><th>Client</th><th>Fingerprint</th><th>Address</th><th>First Seen</th><th>Last Seen</th><th>Status</th><th></th></tr></thead>
     <tbody>${
         pending.length
             ? pending.map((c) => clientRow(c, true, true, true)).join("")
@@ -2013,7 +2190,7 @@ ${
 <div class="sec-title" style="margin-top:1.5rem">Allowed</div>
 <div style="overflow-x:auto">
 <table class="tbl">
-    <thead><tr><th>Node ID</th><th>Fingerprint</th><th>Address</th><th>First Seen</th><th>Last Seen</th><th>Status</th><th></th></tr></thead>
+    <thead><tr><th>Client</th><th>Fingerprint</th><th>Address</th><th>First Seen</th><th>Last Seen</th><th>Status</th><th></th></tr></thead>
     <tbody>${
         allowed.length
             ? allowed.map((c) => clientRow(c, false, true, true)).join("")
@@ -2028,7 +2205,7 @@ ${
 <div class="sec-title" style="margin-top:1.5rem">Rejected</div>
 <div style="overflow-x:auto">
 <table class="tbl">
-    <thead><tr><th>Node ID</th><th>Fingerprint</th><th>Address</th><th>First Seen</th><th>Last Seen</th><th>Status</th><th></th></tr></thead>
+    <thead><tr><th>Client</th><th>Fingerprint</th><th>Address</th><th>First Seen</th><th>Last Seen</th><th>Status</th><th></th></tr></thead>
     <tbody>${rejected.map((c) => clientRow(c, true, false, true)).join("")}</tbody>
 </table>
 </div>`
@@ -2037,6 +2214,303 @@ ${
 
 <div class="inline-msg" id="kc-panel-msg"></div>`;
             }
+
+            /* ── Known clients: display names ── */
+            const KC_NAME_MAX = 64;
+            let kcClients = [];
+            // fingerprint -> { mode: "view" | "edit" | "saving", draft, error, note, noteKind, token }
+            const kcNameUi = new Map();
+            let kcRendering = false;
+            let kcNoteSeq = 0;
+
+            function escAttr(s) {
+                return esc(s).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+            }
+            // Returns a problem message, or "" when the name can be saved.
+            // Backend also checks this; the client check only stops bad input early.
+            function kcNameProblem(trimmed) {
+                if ([...trimmed].length > KC_NAME_MAX)
+                    return `Use ${KC_NAME_MAX} characters or fewer`;
+                if (/[\u0000-\u001f\u007f-\u009f]/.test(trimmed))
+                    return "Name contains characters that cannot be used";
+                return "";
+            }
+            function kcEditorState(ui) {
+                const trimmed = (ui.draft || "").trim();
+                const problem = kcNameProblem(trimmed);
+                const saving = ui.mode === "saving";
+                let hint = "Press Enter to save, Esc to cancel";
+                let cls = "";
+                if (saving) {
+                    hint = "Saving…";
+                } else if (problem) {
+                    hint = problem;
+                    cls = "err";
+                } else if (ui.error != null) {
+                    hint = ui.error
+                        ? `Could not save name. ${ui.error}`
+                        : "Could not save name. Try again.";
+                    cls = "err";
+                }
+                return {
+                    len: [...trimmed].length,
+                    invalid: !!problem,
+                    saving,
+                    blocked: saving || !!problem,
+                    hint,
+                    cls,
+                };
+            }
+            function kcNameInner(c) {
+                const ui = kcNameUi.get(c.fingerprint);
+                if (ui && (ui.mode === "edit" || ui.mode === "saving"))
+                    return kcNameEditor(c, ui);
+
+                const label = (c.label || "").trim();
+                const node = c.node_id || "—";
+                const fp = escAttr(c.fingerprint);
+                const who = label || node;
+                const addLabel = label ? "Edit name" : "Add name";
+                const note =
+                    ui && ui.note
+                        ? `<div class="kc-name-note ${ui.noteKind || ""}" role="status">${esc(ui.note)}</div>`
+                        : "";
+                const main = label
+                    ? `<div class="kc-name-label">${esc(label)}</div>
+                       <div class="kc-name-id mono">${esc(node)}</div>`
+                    : `<div class="kc-name-unset"><span>${esc(node)}</span><span class="kc-name-none">No name</span></div>`;
+                return `
+    <div class="kc-name">
+        <div class="kc-name-main">${main}${note}</div>
+        <button type="button" class="kc-edit${label ? "" : " is-add"}" data-kc-action="edit" data-kc-fp="${fp}" aria-label="${escAttr(addLabel + " for " + who)}" title="${addLabel}">
+            <span class="material-icons" aria-hidden="true">edit</span>${label ? "" : "Add name"}
+        </button>
+    </div>`;
+            }
+            function kcNameEditor(c, ui) {
+                const fp = escAttr(c.fingerprint);
+                const who = escAttr(c.node_id || "client");
+                const hintId = "kc-hint-" + c.fingerprint.replace(/[^A-Za-z0-9]/g, "");
+                const st = kcEditorState(ui);
+                return `
+    <div class="kc-name kc-name-editing">
+        <div class="kc-name-main">
+            <div class="kc-name-form">
+                <input type="text" class="kc-name-input" data-kc-fp="${fp}" value="${escAttr(ui.draft || "")}" placeholder="e.g. Office laptop" aria-label="Name for ${who}" aria-describedby="${hintId}" aria-invalid="${st.invalid ? "true" : "false"}" autocomplete="off" spellcheck="false"${st.saving ? " disabled" : ""}>
+                <button type="button" class="kc-icon-btn kc-save" data-kc-action="save" data-kc-fp="${fp}" aria-label="Save name" title="Save name"${st.blocked ? " disabled" : ""}><span class="material-icons" aria-hidden="true">check</span></button>
+                <button type="button" class="kc-icon-btn" data-kc-action="cancel" data-kc-fp="${fp}" aria-label="Cancel" title="Cancel (Esc)"${st.saving ? " disabled" : ""}><span class="material-icons" aria-hidden="true">close</span></button>
+            </div>
+            <div class="kc-name-meta">
+                <div class="kc-name-hint${st.cls ? " " + st.cls : ""}" id="${hintId}" role="status">${esc(st.hint)}</div>
+                <span class="kc-name-count${st.len > KC_NAME_MAX ? " over" : ""}">${st.len}/${KC_NAME_MAX}</span>
+            </div>
+        </div>
+    </div>`;
+            }
+            function kcCellFor(fp) {
+                const cells = document.querySelectorAll(
+                    "#panel-known-clients td[data-kc-name]",
+                );
+                for (const td of cells) {
+                    if (td.dataset.kcName === fp) return td;
+                }
+                return null;
+            }
+            // Redraws one name cell in place, so the rest of the table is untouched.
+            // focus: "input" | "edit" | null
+            function kcRefreshCell(fp, focus) {
+                const cell = kcCellFor(fp);
+                const c = kcClients.find((x) => x.fingerprint === fp);
+                if (!cell || !c) return;
+                kcRendering = true;
+                cell.innerHTML = kcNameInner(c);
+                kcRendering = false;
+                if (focus === "input") {
+                    const input = cell.querySelector(".kc-name-input");
+                    if (input) {
+                        input.focus();
+                        const n = input.value.length;
+                        input.setSelectionRange(n, n);
+                    }
+                } else if (focus === "edit") {
+                    const btn = cell.querySelector(".kc-edit");
+                    if (btn) btn.focus();
+                }
+            }
+            function kcUpdateEditorChrome(cell, ui) {
+                const st = kcEditorState(ui);
+                const input = cell.querySelector(".kc-name-input");
+                const save = cell.querySelector('[data-kc-action="save"]');
+                const count = cell.querySelector(".kc-name-count");
+                const hint = cell.querySelector(".kc-name-hint");
+                if (input)
+                    input.setAttribute(
+                        "aria-invalid",
+                        st.invalid ? "true" : "false",
+                    );
+                if (save) save.disabled = st.blocked;
+                if (count) {
+                    count.textContent = `${st.len}/${KC_NAME_MAX}`;
+                    count.classList.toggle("over", st.len > KC_NAME_MAX);
+                }
+                if (hint) {
+                    hint.className = "kc-name-hint" + (st.cls ? " " + st.cls : "");
+                    hint.textContent = st.hint;
+                }
+            }
+            function kcStartName(fp) {
+                const c = kcClients.find((x) => x.fingerprint === fp);
+                if (!c) return;
+                for (const [other, ui] of [...kcNameUi]) {
+                    if (other !== fp && ui.mode === "edit") {
+                        kcNameUi.delete(other);
+                        kcRefreshCell(other, null);
+                    }
+                }
+                kcNameUi.set(fp, { mode: "edit", draft: c.label || "", error: null });
+                kcRefreshCell(fp, "input");
+            }
+            function kcCancelName(fp, opts = {}) {
+                const ui = kcNameUi.get(fp);
+                if (!ui || ui.mode !== "edit") return;
+                if (opts.note) {
+                    kcNameUi.set(fp, {
+                        mode: "view",
+                        note: opts.note,
+                        noteKind: opts.kind || "err",
+                    });
+                } else {
+                    kcNameUi.delete(fp);
+                }
+                kcRefreshCell(fp, opts.focus ? "edit" : null);
+            }
+            function kcClearNote(fp, token) {
+                const ui = kcNameUi.get(fp);
+                if (!ui || ui.mode !== "view" || ui.token !== token) return;
+                kcNameUi.delete(fp);
+                kcRefreshCell(fp, null);
+            }
+            // via: "enter" | "button" | "blur"
+            async function kcSaveName(fp, via) {
+                const ui = kcNameUi.get(fp);
+                if (!ui || ui.mode !== "edit") return;
+                const c = kcClients.find((x) => x.fingerprint === fp);
+                if (!c) return;
+
+                const value = (ui.draft || "").trim();
+                const problem = kcNameProblem(value);
+                if (problem) {
+                    if (via === "blur") {
+                        kcCancelName(fp, {
+                            note: `Name not saved. ${problem}.`,
+                            kind: "err",
+                        });
+                    } else {
+                        const cell = kcCellFor(fp);
+                        if (cell) kcUpdateEditorChrome(cell, ui);
+                    }
+                    return;
+                }
+
+                // Nothing changed: just close the editor.
+                if (value === (c.label || "").trim()) {
+                    kcCancelName(fp, { focus: via !== "blur" });
+                    return;
+                }
+
+                ui.mode = "saving";
+                ui.draft = value;
+                ui.error = null;
+                kcRefreshCell(fp, null);
+
+                let detail = "";
+                try {
+                    const r = await api(
+                        "POST",
+                        `/api/filesync/known-clients/${encodeURIComponent(fp)}/label`,
+                        { label: value },
+                    );
+                    if (r.ok) {
+                        // Use the current list entry: a refresh may have replaced it mid-save.
+                        const cur = kcClients.find((x) => x.fingerprint === fp);
+                        if (cur) cur.label = value;
+                        const token = ++kcNoteSeq;
+                        kcNameUi.set(fp, {
+                            mode: "view",
+                            note: value ? "✓ Name saved" : "✓ Name removed",
+                            noteKind: "ok",
+                            token,
+                        });
+                        kcRefreshCell(fp, via === "blur" ? null : "edit");
+                        setTimeout(() => kcClearNote(fp, token), 2500);
+                        return;
+                    }
+                    const d = await r.json().catch(() => ({}));
+                    detail = typeof d.error === "string" ? d.error : "";
+                } catch (_) {
+                    detail = "";
+                }
+                // Failed: keep the typed name so it can be fixed or retried.
+                kcNameUi.set(fp, { mode: "edit", draft: value, error: detail });
+                kcRefreshCell(fp, via === "blur" ? null : "input");
+            }
+
+            const kcPanel = $("panel-known-clients");
+            kcPanel.addEventListener("mousedown", (e) => {
+                // Keep focus in the name field when pressing its save/cancel buttons,
+                // so the blur-to-save rule does not fire first.
+                if (e.target.closest && e.target.closest(".kc-name-editing button"))
+                    e.preventDefault();
+            });
+            kcPanel.addEventListener("click", (e) => {
+                const btn = e.target.closest && e.target.closest("[data-kc-action]");
+                if (!btn) return;
+                const fp = btn.dataset.kcFp;
+                switch (btn.dataset.kcAction) {
+                    case "edit":
+                        kcStartName(fp);
+                        break;
+                    case "save":
+                        kcSaveName(fp, "button");
+                        break;
+                    case "cancel":
+                        kcCancelName(fp, { focus: true });
+                        break;
+                }
+            });
+            kcPanel.addEventListener("keydown", (e) => {
+                const input = e.target;
+                if (!input.classList || !input.classList.contains("kc-name-input")) return;
+                if (e.key === "Enter") {
+                    if (e.isComposing) return;
+                    e.preventDefault();
+                    kcSaveName(input.dataset.kcFp, "enter");
+                } else if (e.key === "Escape") {
+                    e.preventDefault();
+                    kcCancelName(input.dataset.kcFp, { focus: true });
+                }
+            });
+            kcPanel.addEventListener("input", (e) => {
+                const input = e.target;
+                if (!input.classList || !input.classList.contains("kc-name-input")) return;
+                const ui = kcNameUi.get(input.dataset.kcFp);
+                if (!ui || ui.mode !== "edit") return;
+                ui.draft = input.value;
+                ui.error = null;
+                const cell = input.closest("[data-kc-name]");
+                if (cell) kcUpdateEditorChrome(cell, ui);
+            });
+            kcPanel.addEventListener("focusout", (e) => {
+                if (kcRendering) return;
+                const input = e.target;
+                if (!input.classList || !input.classList.contains("kc-name-input")) return;
+                const cell = input.closest("[data-kc-name]");
+                if (e.relatedTarget && cell && cell.contains(e.relatedTarget)) return;
+                const fp = input.dataset.kcFp;
+                const ui = kcNameUi.get(fp);
+                if (!ui || ui.mode !== "edit") return;
+                kcSaveName(fp, "blur");
+            });
 
             async function approveClient(fp) {
                 const r = await api(
