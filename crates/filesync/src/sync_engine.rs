@@ -144,18 +144,30 @@ fn hash_file(path: &Path) -> Option<[u8; 32]> {
         .map(|(_, hash)| hash)
 }
 
-fn cleanup_transfer_dirs(root: &Path, tmp_path: &Path) {
-    let transfers_dir = root.join(crate::protocol::TMP_DIR);
-    let mut current = tmp_path.parent();
-    while let Some(dir) = current {
-        if dir == transfers_dir || !dir.starts_with(&transfers_dir) {
-            break;
+/// Local staging file for an in-flight large-file transfer of `rel`.
+///
+/// Flat layout: `<root>/.bh_filesync/transfers/<blake3(rel)>.part`.
+///
+/// * Unique per relative path. The name is derived from the *whole* path
+///   (components joined with `/`), never from `with_extension`, so
+///   `pack-X.pack`, `pack-X.idx`, `pack-X.rev`, `pack-X.bitmap`, `x` and
+///   `x.tmp` all get distinct staging files, and so do same-named files in
+///   different directories.
+/// * Local state only: the staging name never crosses the wire. Chunks and
+///   Start/End messages are keyed by the relative path.
+/// * Flat, so no staging directory is ever created or removed per transfer
+///   (see [`SyncEngine::commit_large_file`] for why that matters).
+pub fn staging_path(root: &Path, rel: &Path) -> PathBuf {
+    let mut hasher = blake3::Hasher::new();
+    for c in rel.components() {
+        if let Component::Normal(s) = c {
+            hasher.update(s.as_encoded_bytes());
+            hasher.update(b"/");
         }
-        if fs::remove_dir(dir).is_err() {
-            break;
-        }
-        current = dir.parent();
     }
+    let digest = hasher.finalize();
+    root.join(crate::protocol::TMP_DIR)
+        .join(format!("{}.part", digest.to_hex()))
 }
 
 impl SyncEngine {
@@ -948,11 +960,10 @@ impl SyncEngine {
             fs::create_dir_all(parent)?;
         }
 
-        let tmp_path = self
-            .root
-            .join(crate::protocol::TMP_DIR)
-            .join(&metadata.rel_path)
-            .with_extension("tmp");
+        // Per-path staging file (see `staging_path`). Never shared with a
+        // sibling transfer, so this begin's truncate/set_len cannot touch
+        // another transfer's bytes.
+        let tmp_path = staging_path(&self.root, &metadata.rel_path);
         if let Some(p) = tmp_path.parent() {
             fs::create_dir_all(p)?;
         }
