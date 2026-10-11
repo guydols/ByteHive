@@ -44,6 +44,7 @@ fn app_config_empty_returns_default() {
         groups: vec![],
         api_keys: vec![],
         apps: HashMap::new(),
+        logging: Default::default(),
     };
     let app_cfg = config.app_config("nonexistent");
     assert_eq!(app_cfg.raw().as_table().unwrap().len(), 0);

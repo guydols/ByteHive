@@ -80,6 +80,7 @@ fn create_test_server() -> (TestHttpServer, Arc<UserStore>) {
         groups: vec![],
         api_keys: vec![],
         apps: HashMap::new(),
+        logging: Default::default(),
     });
     let users = UserStore::empty();
     let registry = AppRegistry::new(bus.clone(), config, users.clone(), std::env::temp_dir());

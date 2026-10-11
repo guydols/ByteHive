@@ -12,6 +12,7 @@ fn make_fw_config() -> FrameworkConfig {
         groups: vec![],
         api_keys: vec![],
         apps: HashMap::new(),
+        logging: Default::default(),
     }
 }
 

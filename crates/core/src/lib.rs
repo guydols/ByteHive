@@ -5,6 +5,7 @@ pub mod config;
 pub mod error;
 pub mod html;
 pub mod http;
+pub mod logging;
 pub mod registry;
 pub mod trash;
 pub mod users;

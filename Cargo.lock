@@ -592,6 +592,7 @@ dependencies = [
  "argon2",
  "axum",
  "crossbeam-channel",
+ "env_logger",
  "futures-util",
  "log",
  "parking_lot",

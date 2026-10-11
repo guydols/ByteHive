@@ -27,6 +27,69 @@ log_level = "info"
 
 
 # =============================================================================
+# Logging  (optional — every key has the default shown; omit the whole section
+# to use all defaults)
+#
+# Output
+# ──────
+#   stderr      Same records as before (filtered by log_level).
+#   server log  Every record shown on stderr is also appended to
+#               <logs>/server/server.log   (format: "<UTC time> LEVEL [target] msg")
+#   bus log     Every message on the internal message bus is appended to
+#               <logs>/bus/bus.jsonl       (one JSON object per line):
+#                 {"timestamp":"2026-10-11T12:00:00.123Z","id":42,
+#                  "source":"filesync","topic":"filesync.sync_complete",
+#                  "payload":{...}}
+#               Payload values under credential-like keys are replaced with
+#               "[REDACTED]" before writing (keys containing: password, passwd,
+#               secret, token, apikey, authorization, cookie, credential; and
+#               exact keys: login, auth, pass, pwd, key, session, sessionid),
+#               and strings starting with "Bearer " / "Basic " are redacted.
+#
+# Rotation
+# ────────
+#   When a file would exceed max_file_mb it is renamed name.log → name.log.1
+#   → … → name.log.<max_files>; the oldest copy is deleted. Active files are
+#   never deleted by cleanup.
+#
+# Cleanup (runs at startup and every cleanup_interval_secs)
+# ───────
+#   1. Rotated files (*.log.N, *.jsonl.N) older than retention_days are deleted.
+#   2. If the logs dir is still above max_total_mb, rotated files are deleted
+#      oldest-first until it fits.
+#
+# Dropped bus messages: the bus logger has a large queue (65 536 messages). If
+# it still falls behind, the number of dropped messages is logged at WARN.
+#
+# If the logs directory cannot be written, the server keeps running and logs
+# to stderr only; the failure is reported once, and again when writes recover.
+# =============================================================================
+
+# [logging]
+#
+# Logs root. Leave unset to use <directory of the bytehive binary>/logs.
+# Layout beneath it: server/server.log and bus/bus.jsonl (+ rotated copies).
+# dir = "/var/log/bytehive"
+#
+# Rotate a log file once it would exceed this many MiB. 0 = never rotate.
+# max_file_mb = 10
+#
+# Rotated copies kept per stream (server.log.1 … server.log.N). 0 = keep none.
+# max_files = 5
+#
+# Delete rotated files older than this many days. 0 = keep forever.
+# retention_days = 14
+#
+# Cap on the total size of the logs dir in MiB; oldest rotated files go first.
+# Active files are never deleted, so the cap can be exceeded if they alone are
+# larger. 0 = no cap.
+# max_total_mb = 500
+#
+# Seconds between cleanup passes. 0 = cleanup once, at startup.
+# cleanup_interval_secs = 3600
+
+
+# =============================================================================
 # User accounts
 #
 # Access level is determined by group membership, not a role field.

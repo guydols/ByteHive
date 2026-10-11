@@ -18,7 +18,16 @@ pub struct BusMessage {
 
 pub struct BusReceiver {
     pub rx: Receiver<Arc<BusMessage>>,
+    dropped: Arc<AtomicU64>,
     _token: Arc<()>,
+}
+
+impl BusReceiver {
+    /// Number of messages dropped for this subscriber because its queue was
+    /// full at publish time. Monotonically increasing.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
 }
 
 impl std::ops::Deref for BusReceiver {
@@ -41,6 +50,7 @@ impl IntoIterator for BusReceiver {
 struct Sub {
     tx: Sender<Arc<BusMessage>>,
     alive: Weak<()>,
+    dropped: Arc<AtomicU64>,
 }
 
 pub struct MessageBus {
@@ -60,12 +70,21 @@ impl MessageBus {
         let (tx, rx) = bounded(queue);
         let token = Arc::new(());
         let alive = Arc::downgrade(&token);
+        let dropped = Arc::new(AtomicU64::new(0));
         self.subs
             .write()
             .entry(pattern.into())
             .or_default()
-            .push(Sub { tx, alive });
-        BusReceiver { rx, _token: token }
+            .push(Sub {
+                tx,
+                alive,
+                dropped: Arc::clone(&dropped),
+            });
+        BusReceiver {
+            rx,
+            dropped,
+            _token: token,
+        }
     }
 
     pub fn sub(&self, pattern: impl Into<String>) -> BusReceiver {
@@ -89,6 +108,7 @@ impl MessageBus {
                     match sub.tx.try_send(Arc::clone(&msg)) {
                         Ok(_) => {}
                         Err(TrySendError::Full(_)) => {
+                            sub.dropped.fetch_add(1, Ordering::Relaxed);
                             log::warn!(
                                 "bus: subscriber queue full for topic '{}' — message dropped",
                                 topic
@@ -125,4 +145,53 @@ fn topic_matches(pattern: &str, topic: &str) -> bool {
         return topic.starts_with(&expected) || topic == prefix;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn drop_counter_counts_queue_full_drops() {
+        let bus = MessageBus::new();
+        let rx = bus.subscribe("t", 4);
+        for i in 0..10 {
+            bus.publish("s", "t", json!(i));
+        }
+        let mut received = 0u64;
+        while rx.try_recv().is_ok() {
+            received += 1;
+        }
+        assert_eq!(received, 4);
+        assert_eq!(rx.dropped(), 6);
+        assert_eq!(received + rx.dropped(), 10);
+    }
+
+    #[test]
+    fn large_queue_absorbs_burst_without_drops() {
+        let bus = MessageBus::new();
+        let rx = bus.subscribe("*", 16_384);
+        for i in 0..10_000u64 {
+            bus.publish("s", "burst.topic", json!({ "i": i }));
+        }
+        assert_eq!(rx.dropped(), 0);
+        let mut received = 0u64;
+        while rx.try_recv().is_ok() {
+            received += 1;
+        }
+        assert_eq!(received, 10_000);
+    }
+
+    #[test]
+    fn drop_counter_is_per_subscriber() {
+        let bus = MessageBus::new();
+        let small = bus.subscribe("*", 1);
+        let big = bus.subscribe("*", 100);
+        for i in 0..5 {
+            bus.publish("s", "t", json!(i));
+        }
+        assert_eq!(small.dropped(), 4);
+        assert_eq!(big.dropped(), 0);
+    }
 }

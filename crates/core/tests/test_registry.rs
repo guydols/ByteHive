@@ -62,6 +62,7 @@ fn test_setup() -> (Arc<AppRegistry>, Arc<MockApp>) {
         groups: vec![],
         api_keys: vec![],
         apps: HashMap::new(),
+        logging: Default::default(),
     });
     let user_store = UserStore::empty();
     let reg = AppRegistry::new(bus, config, user_store, std::path::PathBuf::from("."));
@@ -172,6 +173,7 @@ fn responder_setup() -> Arc<AppRegistry> {
         groups: vec![],
         api_keys: vec![],
         apps: HashMap::new(),
+        logging: Default::default(),
     });
     let user_store = UserStore::empty();
     AppRegistry::new(bus, config, user_store, std::path::PathBuf::from("."))
