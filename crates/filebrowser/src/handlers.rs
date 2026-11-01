@@ -1,7 +1,7 @@
 use crate::app::FileBrowserApp;
 use crate::crypto::now_ms;
 use crate::file_type::{is_text_file, monaco_language, sniff_is_text};
-use crate::fs_util::{copy_dir_all, mime_for_file, resolve, search_dir, zip_directory};
+use crate::fs_util::{copy_dir_all, mime_for_file, resolve, search_dir, zip_directory, zip_paths};
 use crate::http_util::{query_param, share_error_page, share_password_page};
 use crate::share::Share;
 use bytehive_core::{HttpRequest, HttpResponse};
@@ -242,6 +242,99 @@ impl FileBrowserApp {
         HttpResponse::ok_json(json!({"ok": true}))
     }
 
+    pub fn handle_download_zip(&self, req: &HttpRequest) -> HttpResponse {
+        let root = match self.root() {
+            Some(r) => r,
+            None => return HttpResponse::internal_error("not running"),
+        };
+
+        let body: Value = match serde_json::from_slice(&req.body) {
+            Ok(v) => v,
+            Err(_) => return HttpResponse::bad_request("expected JSON {paths: [...]}"),
+        };
+
+        let paths: Vec<String> = match body.get("paths").and_then(|p| p.as_array()) {
+            Some(arr) => arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .filter(|s| !s.is_empty())
+                .collect(),
+            None => return HttpResponse::bad_request("paths required"),
+        };
+
+        match zip_paths(&root, &paths) {
+            Ok(resp) => resp,
+            Err(e) => HttpResponse::bad_request(e),
+        }
+    }
+
+    pub fn handle_batch_delete(&self, req: &HttpRequest, deleted_by: &str) -> HttpResponse {
+        let guard = self.inner.read();
+        let inner = match guard.as_ref() {
+            Some(i) => i,
+            None => return HttpResponse::internal_error("not running"),
+        };
+
+        if !inner.allow_delete {
+            return HttpResponse::unauthorized();
+        }
+
+        let body: Value = match serde_json::from_slice(&req.body) {
+            Ok(v) => v,
+            Err(_) => return HttpResponse::bad_request("expected JSON {paths: [...]}"),
+        };
+
+        let paths: Vec<String> = match body.get("paths").and_then(|p| p.as_array()) {
+            Some(arr) => arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .filter(|s| !s.is_empty())
+                .collect(),
+            None => return HttpResponse::bad_request("paths required"),
+        };
+
+        if paths.is_empty() {
+            return HttpResponse::bad_request("no paths selected");
+        }
+        if paths.len() > 500 {
+            return HttpResponse::bad_request("too many paths selected (max 500)");
+        }
+
+        let who = if deleted_by.is_empty() {
+            "filebrowser"
+        } else {
+            deleted_by
+        };
+        let mut deleted = 0usize;
+        let mut failed: Vec<Value> = Vec::new();
+        for rel in &paths {
+            match resolve(&inner.root, rel) {
+                Err(e) => failed.push(json!({"path": rel, "error": e})),
+                Ok(abs) => {
+                    if !abs.exists() {
+                        failed.push(json!({"path": rel, "error": "not found"}));
+                        continue;
+                    }
+                    let rel_path =
+                        abs.strip_prefix(&inner.root).unwrap_or(&abs).to_path_buf();
+                    inner.trash_manager.move_to_trash(&abs, &rel_path, who);
+                    if abs.exists() {
+                        failed.push(json!({"path": rel, "error": "could not move to trash"}));
+                    } else {
+                        deleted += 1;
+                    }
+                }
+            }
+        }
+
+        HttpResponse::ok_json(json!({
+            "ok": true,
+            "deleted": deleted,
+            "requested": paths.len(),
+            "failed": failed,
+        }))
+    }
+
     pub fn handle_rename(&self, req: &HttpRequest) -> HttpResponse {
         let root = match self.root() {
             Some(r) => r,
@@ -332,6 +425,84 @@ impl FileBrowserApp {
 
         self.shares.write().insert(token, share);
         HttpResponse::ok_json(resp)
+    }
+
+    /// Create one share link per path. Keeps the single-share behaviour
+    /// (one token per file or folder) and just runs it in a loop, so every
+    /// entry in the response can be opened and revoked on its own.
+    pub fn handle_batch_share(&self, req: &HttpRequest, created_by: &str) -> HttpResponse {
+        let root = match self.root() {
+            Some(r) => r,
+            None => return HttpResponse::internal_error("not running"),
+        };
+
+        let body: Value = match serde_json::from_slice(&req.body) {
+            Ok(v) => v,
+            Err(_) => return HttpResponse::bad_request("expected JSON {paths: [...]}"),
+        };
+
+        let paths: Vec<String> = match body.get("paths").and_then(|p| p.as_array()) {
+            Some(arr) => arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .filter(|s| !s.is_empty())
+                .collect(),
+            None => return HttpResponse::bad_request("paths required"),
+        };
+        if paths.is_empty() {
+            return HttpResponse::bad_request("no paths selected");
+        }
+        if paths.len() > 100 {
+            return HttpResponse::bad_request("too many paths selected (max 100)");
+        }
+
+        let password = body["password"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let expires_hours = body["expires_hours"].as_u64();
+
+        let mut shares_out: Vec<Value> = Vec::new();
+        let mut failed: Vec<Value> = Vec::new();
+        for rel in paths {
+            let abs = match resolve(&root, &rel) {
+                Ok(p) => p,
+                Err(e) => {
+                    failed.push(json!({"path": rel, "error": e}));
+                    continue;
+                }
+            };
+            if !abs.exists() {
+                failed.push(json!({"path": rel, "error": "not found"}));
+                continue;
+            }
+            let token = Uuid::new_v4().to_string().replace('-', "");
+            let name = abs
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| rel.clone());
+            let share = Share {
+                token: token.clone(),
+                path: rel.clone(),
+                is_dir: abs.is_dir(),
+                name,
+                password_protected: password.is_some(),
+                password_hash: password.as_deref().map(crate::crypto::hash_password),
+                expires_ms: expires_hours.map(|h| now_ms() + h * 3600 * 1000),
+                created_by: created_by.to_string(),
+                created_ms: now_ms(),
+                download_count: 0,
+            };
+            let url = format!("/s/{}", token);
+            shares_out.push(json!({"token": token, "url": url, "path": rel}));
+            self.shares.write().insert(token, share);
+        }
+
+        HttpResponse::ok_json(json!({
+            "ok": true,
+            "shares": shares_out,
+            "failed": failed,
+        }))
     }
 
     pub fn handle_list_shares(&self, _role: &str) -> HttpResponse {
@@ -640,6 +811,144 @@ impl FileBrowserApp {
         }
     }
 
+    pub fn handle_batch_copy(&self, req: &HttpRequest) -> HttpResponse {
+        let root = match self.root() {
+            Some(r) => r,
+            None => return HttpResponse::internal_error("not running"),
+        };
+
+        let body: Value = match serde_json::from_slice(&req.body) {
+            Ok(v) => v,
+            Err(_) => return HttpResponse::bad_request("expected JSON"),
+        };
+
+        // Two shapes: {copies: [{from, to}]} for explicit renames, or
+        // {paths: [...], dest_dir: "folder"} to copy everything into one folder.
+        let mut jobs: Vec<(String, String)> = Vec::new();
+        if let Some(copies) = body.get("copies").and_then(|c| c.as_array()) {
+            for c in copies {
+                let from = c.get("from").and_then(|v| v.as_str()).unwrap_or("");
+                let to = c.get("to").and_then(|v| v.as_str()).unwrap_or("");
+                if from.is_empty() || to.is_empty() {
+                    continue;
+                }
+                jobs.push((from.to_string(), to.to_string()));
+            }
+            if jobs.is_empty() {
+                return HttpResponse::bad_request("no valid copies");
+            }
+        } else {
+            let paths: Vec<String> = match body.get("paths").and_then(|p| p.as_array()) {
+                Some(arr) => arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+                None => {
+                    return HttpResponse::bad_request(
+                        "expected {paths: [...], dest_dir} or {copies: [{from, to}]}",
+                    )
+                }
+            };
+            if paths.is_empty() {
+                return HttpResponse::bad_request("no paths selected");
+            }
+            if paths.len() > 500 {
+                return HttpResponse::bad_request("too many paths selected (max 500)");
+            }
+            let dest_dir = body
+                .get("dest_dir")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            // Validate the destination folder early so traversal is rejected
+            // before anything is copied.
+            let abs_dest_dir = match resolve(&root, dest_dir) {
+                Ok(p) => p,
+                Err(e) => return HttpResponse::bad_request(e),
+            };
+            if abs_dest_dir.exists() && !abs_dest_dir.is_dir() {
+                return HttpResponse::bad_request("destination is not a folder");
+            }
+            if !abs_dest_dir.exists() {
+                if let Err(e) = std::fs::create_dir_all(&abs_dest_dir) {
+                    return HttpResponse::internal_error(e.to_string());
+                }
+            }
+            for p in paths {
+                let base = p
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&p)
+                    .to_string();
+                if base.is_empty() {
+                    continue;
+                }
+                let to = if dest_dir.is_empty() {
+                    base
+                } else {
+                    format!("{}/{}", dest_dir.trim_end_matches('/'), base)
+                };
+                jobs.push((p, to));
+            }
+        }
+
+        if jobs.len() > 500 {
+            return HttpResponse::bad_request("too many copies (max 500)");
+        }
+
+        let mut copied: Vec<Value> = Vec::new();
+        let mut failed: Vec<Value> = Vec::new();
+        for (from, to) in jobs {
+            let abs_from = match resolve(&root, &from) {
+                Ok(p) => p,
+                Err(e) => {
+                    failed.push(json!({"path": from, "error": e}));
+                    continue;
+                }
+            };
+            let abs_to = match resolve(&root, &to) {
+                Ok(p) => p,
+                Err(e) => {
+                    failed.push(json!({"path": from, "error": e}));
+                    continue;
+                }
+            };
+            if !abs_from.exists() {
+                failed.push(json!({"path": from, "error": "not found"}));
+                continue;
+            }
+            if abs_to.exists() {
+                failed.push(json!({"path": from, "to": to, "error": "destination already exists"}));
+                continue;
+            }
+            if let Some(parent) = abs_to.parent() {
+                if !parent.exists() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        failed.push(json!({"path": from, "error": e.to_string()}));
+                        continue;
+                    }
+                }
+            }
+            let result = if abs_from.is_dir() {
+                copy_dir_all(&abs_from, &abs_to)
+            } else {
+                std::fs::copy(&abs_from, &abs_to)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            };
+            match result {
+                Ok(()) => copied.push(json!({"from": from, "to": to})),
+                Err(e) => failed.push(json!({"path": from, "error": e})),
+            }
+        }
+
+        HttpResponse::ok_json(json!({
+            "ok": true,
+            "copied": copied,
+            "failed": failed,
+        }))
+    }
+
     pub fn handle_search(&self, req: &HttpRequest) -> HttpResponse {
         let root = match self.root() {
             Some(r) => r,
@@ -741,15 +1050,41 @@ impl FileBrowserApp {
         HttpResponse::ok_json(json!({ "entries": entries }))
     }
 
-    pub fn handle_trash_restore(&self, id: &str) -> HttpResponse {
+    pub fn handle_trash_restore(&self, id: &str, req: &HttpRequest) -> HttpResponse {
         let guard = self.inner.read();
         let inner = match guard.as_ref() {
             Some(i) => i,
             None => return HttpResponse::internal_error("not running"),
         };
-        match inner.trash_manager.restore_entry(id) {
-            Ok(()) => HttpResponse::ok_json(json!({ "ok": true })),
-            Err(e) => HttpResponse::bad_request(e),
+        let original: Option<std::path::PathBuf> = inner
+            .trash_manager
+            .list_trash()
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.original_path.clone());
+        let dest: Option<std::path::PathBuf> = req
+            .json()
+            .ok()
+            .and_then(|v: Value| {
+                v.get("dest")
+                    .and_then(|d| d.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(std::path::PathBuf::from)
+            });
+        match inner
+            .trash_manager
+            .restore_entry_with_dest(id, dest.as_deref())
+        {
+            Ok(restored) => {
+                if let Some(prefix) = original {
+                    bytehive_core::clear_ledger_covering(&inner.root, &[prefix]);
+                }
+                HttpResponse::ok_json(json!({ "ok": true, "path": restored }))
+            }
+            Err(bytehive_core::TrashRestoreError::DestinationExists(p)) => {
+                HttpResponse::conflict(format!("destination already exists: {p:?}"))
+            }
+            Err(e) => HttpResponse::bad_request(e.to_string()),
         }
     }
 
@@ -759,8 +1094,19 @@ impl FileBrowserApp {
             Some(i) => i,
             None => return HttpResponse::internal_error("not running"),
         };
+        let prefix: Option<std::path::PathBuf> = inner
+            .trash_manager
+            .list_trash()
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.original_path.clone());
         match inner.trash_manager.purge_entry(id) {
-            Ok(()) => HttpResponse::ok_json(json!({ "ok": true })),
+            Ok(()) => {
+                if let Some(p) = prefix {
+                    bytehive_core::clear_ledger_covering(&inner.root, &[p]);
+                }
+                HttpResponse::ok_json(json!({ "ok": true }))
+            }
             Err(e) => HttpResponse::not_found(e),
         }
     }
@@ -771,7 +1117,16 @@ impl FileBrowserApp {
             Some(i) => i,
             None => return HttpResponse::internal_error("not running"),
         };
+        let prefixes: Vec<std::path::PathBuf> = inner
+            .trash_manager
+            .list_trash()
+            .into_iter()
+            .map(|e| e.original_path)
+            .collect();
         let count = inner.trash_manager.empty();
+        if !prefixes.is_empty() {
+            bytehive_core::clear_ledger_covering(&inner.root, &prefixes);
+        }
         HttpResponse::ok_json(json!({ "ok": true, "purged": count }))
     }
 
@@ -781,7 +1136,24 @@ impl FileBrowserApp {
             Some(i) => i,
             None => return HttpResponse::internal_error("not running"),
         };
+        let before = inner.trash_manager.list_trash();
         let count = inner.trash_manager.purge_expired();
+        if count > 0 {
+            let after_ids: std::collections::HashSet<String> = inner
+                .trash_manager
+                .list_trash()
+                .into_iter()
+                .map(|e| e.id)
+                .collect();
+            let purged: Vec<std::path::PathBuf> = before
+                .into_iter()
+                .filter(|e| !after_ids.contains(&e.id))
+                .map(|e| e.original_path)
+                .collect();
+            if !purged.is_empty() {
+                bytehive_core::clear_ledger_covering(&inner.root, &purged);
+            }
+        }
         HttpResponse::ok_json(json!({ "ok": true, "purged": count }))
     }
 }
