@@ -1,18 +1,27 @@
+use std::collections::HashMap;
+
 use iced::{
     widget::{button, column, container, row, text, Space},
     Alignment, Background, Border, Color, Element, Length,
 };
 
 use crate::gui::app::Message;
-use crate::gui::components::{conflicts, stats_panel};
+use crate::gui::components::{conflicts, stats_panel, trash};
 use crate::gui::state::{SideTab, SyncSnapshot};
 use crate::gui::theme;
 
-pub fn view<'a>(snap: &'a SyncSnapshot, active_tab: &'a SideTab) -> Element<'a, Message> {
+pub fn view<'a>(
+    snap: &'a SyncSnapshot,
+    active_tab: &'a SideTab,
+    dest_inputs: &'a HashMap<String, String>,
+    trash_error: Option<&'a str>,
+    trash_info: Option<&'a str>,
+) -> Element<'a, Message> {
     let tab_bar = build_tab_bar(snap, active_tab);
     let content = match active_tab {
         SideTab::Stats => stats_panel::view(snap),
         SideTab::Conflicts => conflicts::view(&snap.conflicts),
+        SideTab::Trash => trash::view(&snap.trash, dest_inputs, trash_error, trash_info),
     };
 
     let panel = column![tab_bar, Space::new().height(14), content,]
@@ -30,14 +39,18 @@ pub fn view<'a>(snap: &'a SyncSnapshot, active_tab: &'a SideTab) -> Element<'a, 
 
 fn build_tab_bar<'a>(snap: &'a SyncSnapshot, active_tab: &'a SideTab) -> Element<'a, Message> {
     let conflict_count = snap.conflicts.len();
+    let trash_count = snap.trash.len();
 
     let stats_tab = tab_button("Stats", SideTab::Stats, active_tab, 0);
     let conflicts_tab = tab_button("Conflicts", SideTab::Conflicts, active_tab, conflict_count);
+    let trash_tab = tab_button("Trash", SideTab::Trash, active_tab, trash_count);
 
     let bar = row![
         stats_tab,
         Space::new().width(4),
         conflicts_tab,
+        Space::new().width(4),
+        trash_tab,
         Space::new().width(Length::Fill),
     ]
     .align_y(Alignment::End)
@@ -202,16 +215,27 @@ fn tab_button<'a>(
 
 #[cfg(test)]
 mod tests {
-    use crate::gui::state::{Conflict, ConflictKind, SideTab, SyncSnapshot};
+    use crate::gui::state::{Conflict, ConflictKind, SideTab, SyncSnapshot, TrashItem};
+    use std::collections::HashMap;
+
+    fn empty_dests() -> HashMap<String, String> {
+        HashMap::new()
+    }
 
     #[test]
     fn view_stats_tab_default_snapshot_does_not_panic() {
-        let _ = super::view(&SyncSnapshot::default(), &SideTab::Stats);
+        let _ = super::view(&SyncSnapshot::default(), &SideTab::Stats, &empty_dests(), None, None);
     }
 
     #[test]
     fn view_conflicts_tab_no_conflicts_does_not_panic() {
-        let _ = super::view(&SyncSnapshot::default(), &SideTab::Conflicts);
+        let _ = super::view(
+            &SyncSnapshot::default(),
+            &SideTab::Conflicts,
+            &empty_dests(),
+            None,
+            None,
+        );
     }
 
     #[test]
@@ -225,7 +249,7 @@ mod tests {
             remote_modified: "2024-01-02".into(),
             kind: ConflictKind::BothModified,
         });
-        let _ = super::view(&snap, &SideTab::Conflicts);
+        let _ = super::view(&snap, &SideTab::Conflicts, &empty_dests(), None, None);
     }
 
     #[test]
@@ -247,7 +271,7 @@ mod tests {
                 kind,
             });
         }
-        let _ = super::view(&snap, &SideTab::Conflicts);
+        let _ = super::view(&snap, &SideTab::Conflicts, &empty_dests(), None, None);
     }
 
     #[test]
@@ -261,7 +285,7 @@ mod tests {
             remote_modified: "t2".into(),
             kind: ConflictKind::BothModified,
         });
-        let _ = super::view(&snap, &SideTab::Stats);
+        let _ = super::view(&snap, &SideTab::Stats, &empty_dests(), None, None);
     }
 
     #[test]
@@ -272,6 +296,49 @@ mod tests {
         snap.total_bytes = 2_147_483_648;
         snap.bytes_sent = 1_048_576;
         snap.bytes_received = 524_288;
-        let _ = super::view(&snap, &SideTab::Stats);
+        let _ = super::view(&snap, &SideTab::Stats, &empty_dests(), None, None);
+    }
+
+    #[test]
+    fn view_trash_tab_empty_does_not_panic() {
+        let _ = super::view(
+            &SyncSnapshot::default(),
+            &SideTab::Trash,
+            &empty_dests(),
+            None,
+            None,
+        );
+    }
+
+    #[test]
+    fn view_trash_tab_with_items_does_not_panic() {
+        let mut snap = SyncSnapshot::default();
+        snap.trash.push(TrashItem {
+            id: "abc".into(),
+            original_path: "docs/note.txt".into(),
+            size: 120,
+            deleted_at_ms: 0,
+            is_dir: false,
+        });
+        let _ = super::view(&snap, &SideTab::Trash, &empty_dests(), None, None);
+    }
+
+    #[test]
+    fn view_trash_tab_with_error_does_not_panic() {
+        let mut snap = SyncSnapshot::default();
+        snap.trash.push(TrashItem {
+            id: "abc".into(),
+            original_path: "docs/note.txt".into(),
+            size: 120,
+            deleted_at_ms: 0,
+            is_dir: false,
+        });
+        let _ = super::view(
+            &snap,
+            &SideTab::Trash,
+            &empty_dests(),
+            Some("That place already has a file."),
+            None,
+        );
     }
 }

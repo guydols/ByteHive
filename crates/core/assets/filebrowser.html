@@ -1462,6 +1462,113 @@
                 border-color: rgba(255, 172, 28, 0.45);
                 background: rgba(255, 172, 28, 0.08);
             }
+
+            /* ── Selection checkboxes ── */
+            .sel-check {
+                width: 15px;
+                height: 15px;
+                accent-color: var(--bh-hi);
+                cursor: pointer;
+                flex-shrink: 0;
+                vertical-align: middle;
+            }
+            th.th-check,
+            td.td-check {
+                width: 30px;
+                min-width: 30px;
+                max-width: 30px;
+                text-align: center;
+                padding-right: 0;
+            }
+            .grid-cell .grid-check {
+                position: absolute;
+                top: 0.35rem;
+                left: 0.35rem;
+                width: 16px;
+                height: 16px;
+                accent-color: var(--bh-hi);
+                cursor: pointer;
+                display: none;
+            }
+            .grid-cell:hover .grid-check,
+            .grid-cell.selected .grid-check {
+                display: block;
+            }
+
+            /* ── Trash view ── */
+            #trash-bar {
+                display: none;
+                align-items: center;
+                gap: 0.55rem;
+                flex-wrap: wrap;
+                background: var(--sf);
+                border: 1px solid var(--bd);
+                border-radius: var(--r2);
+                padding: 0.6rem 0.8rem;
+                margin-bottom: 0.65rem;
+                font-size: 0.78rem;
+                color: var(--lo);
+            }
+            #trash-bar.visible {
+                display: flex;
+            }
+            #trash-bar .trash-note {
+                flex: 1;
+                min-width: 180px;
+                color: var(--muted);
+                font-size: 0.72rem;
+                line-height: 1.45;
+            }
+            .trash-actions {
+                display: inline-flex;
+                gap: 0.4rem;
+            }
+            .row-btn {
+                background: none;
+                border: 1px solid var(--bd);
+                color: var(--lo);
+                border-radius: var(--r);
+                padding: 0.2rem 0.55rem;
+                font-size: 0.72rem;
+                cursor: pointer;
+                font-family: var(--sans);
+                transition:
+                    color var(--tr),
+                    border-color var(--tr);
+                white-space: nowrap;
+            }
+            .row-btn:hover {
+                color: var(--text);
+                border-color: var(--bd2);
+            }
+            .row-btn.danger {
+                color: var(--danger);
+                border-color: rgba(229, 77, 46, 0.4);
+            }
+            .row-btn.danger:hover {
+                background: rgba(229, 77, 46, 0.1);
+                border-color: var(--danger);
+            }
+            .share-link-item {
+                background: var(--sf2);
+                border: 1px solid var(--bd);
+                border-radius: var(--r);
+                padding: 0.4rem 0.55rem;
+                font-family: var(--mono);
+                font-size: 0.7rem;
+                color: var(--a);
+                word-break: break-all;
+                margin-top: 0.35rem;
+                cursor: pointer;
+            }
+            .share-link-item:hover {
+                border-color: var(--bh-lo);
+            }
+            .share-link-path {
+                color: var(--muted);
+                font-size: 0.66rem;
+                margin-bottom: 0.15rem;
+            }
         </style>
     </head>
     <body>
@@ -1527,6 +1634,7 @@
                     <button
                         class="tbtn accent"
                         type="button"
+                        id="btn-upload"
                         onclick="openUpload()"
                         title="Upload files (U)"
                     >
@@ -1537,6 +1645,7 @@
                     <button
                         class="tbtn"
                         type="button"
+                        id="btn-mkdir"
                         onclick="openMkdir()"
                         title="New folder (N)"
                     >
@@ -1617,6 +1726,17 @@
                         >Shares
                     </button>
                     <button
+                        class="tbtn"
+                        type="button"
+                        id="btn-trash"
+                        onclick="showTrash()"
+                        title="Trash — restore or delete forever"
+                    >
+                        <span class="material-icons" aria-hidden="true"
+                            >delete_outline</span
+                        >Trash
+                    </button>
+                    <button
                         class="tbtn tbtn-ic"
                         type="button"
                         id="btn-view-toggle"
@@ -1663,9 +1783,54 @@
 
                 <div style="display: flex; flex: 1; overflow: hidden">
                     <div id="file-area">
+                        <div id="trash-bar">
+                            <span
+                                class="material-icons"
+                                aria-hidden="true"
+                                style="color: var(--bh-hi)"
+                                >delete_outline</span
+                            >
+                            <span class="trash-note" id="trash-count"
+                                >Trash is empty.</span
+                            >
+                            <span class="trash-note">
+                                Restored files go back to their original
+                                place. Deleting forever also clears the
+                                leftover sync record, so the file will not
+                                come back.
+                            </span>
+                            <span class="trash-actions">
+                                <button
+                                    class="row-btn"
+                                    type="button"
+                                    onclick="purgeExpiredTrash()"
+                                    title="Remove only items past their keep time"
+                                >
+                                    Clean expired
+                                </button>
+                                <button
+                                    class="row-btn danger"
+                                    type="button"
+                                    onclick="emptyTrash()"
+                                    title="Delete everything in trash forever"
+                                >
+                                    Empty trash
+                                </button>
+                            </span>
+                        </div>
                         <table id="file-table" style="display: none">
                             <thead>
                                 <tr>
+                                    <th class="th-check">
+                                        <input
+                                            type="checkbox"
+                                            class="sel-check"
+                                            id="sel-all"
+                                            onclick="toggleSelectAll(event)"
+                                            title="Select all"
+                                            aria-label="Select all"
+                                        />
+                                    </th>
                                     <th onclick="sortBy('name')" id="th-name">
                                         Name
                                     </th>
@@ -1878,7 +2043,7 @@
                 <button class="modal-close" onclick="closeModal('modal-copy')">
                     ✕
                 </button>
-                <h3>⎘ Copy to…</h3>
+                <h3 id="copy-title">⎘ Copy to…</h3>
                 <div class="modal-field">
                     <label>Source</label>
                     <input
@@ -1889,7 +2054,9 @@
                     />
                 </div>
                 <div class="modal-field">
-                    <label>Destination path (relative)</label>
+                    <label id="copy-to-label"
+                        >Destination path (relative)</label
+                    >
                     <input
                         type="text"
                         id="copy-to"
@@ -1899,6 +2066,14 @@
                         autocapitalize="off"
                     />
                 </div>
+                <div
+                    id="copy-hint"
+                    style="
+                        color: var(--muted);
+                        font-size: 0.72rem;
+                        line-height: 1.5;
+                    "
+                ></div>
                 <div class="modal-actions">
                     <button class="mbtn" onclick="closeModal('modal-copy')">
                         Cancel
@@ -1916,7 +2091,16 @@
                 <button class="modal-close" onclick="closeModal('modal-share')">
                     ✕
                 </button>
-                <h3>⬡ Share File</h3>
+                <h3 id="share-title">⬡ Share File</h3>
+                <div
+                    id="share-sources"
+                    style="
+                        color: var(--muted);
+                        font-size: 0.72rem;
+                        margin-bottom: 0.6rem;
+                        line-height: 1.5;
+                    "
+                ></div>
                 <div class="modal-field">
                     <label>Password (optional)</label>
                     <input
@@ -1953,6 +2137,7 @@
                             id="share-url-display"
                             onclick="copyShareUrl()"
                         ></div>
+                        <div id="share-url-list"></div>
                     </div>
                 </div>
             </div>
@@ -2015,15 +2200,29 @@
             >
                 ▤ Open as text
             </div>
-            <div class="ctx-sep"></div>
-            <div class="ctx-item" onclick="ctxAction('download')">
+            <div class="ctx-sep" id="ctx-sep-1"></div>
+            <div
+                class="ctx-item"
+                id="ctx-download"
+                onclick="ctxAction('download')"
+            >
                 ⬇ Download
             </div>
-            <div class="ctx-item" onclick="ctxAction('share')">⬡ Share…</div>
-            <div class="ctx-item" onclick="ctxAction('copy')">⎘ Copy to…</div>
-            <div class="ctx-item" onclick="ctxAction('rename')">✎ Rename…</div>
-            <div class="ctx-sep"></div>
-            <div class="ctx-item danger" onclick="ctxAction('delete')">
+            <div class="ctx-item" id="ctx-share" onclick="ctxAction('share')">
+                ⬡ Share…
+            </div>
+            <div class="ctx-item" id="ctx-copy" onclick="ctxAction('copy')">
+                ⎘ Copy to…
+            </div>
+            <div class="ctx-item" id="ctx-rename" onclick="ctxAction('rename')">
+                ✎ Rename…
+            </div>
+            <div class="ctx-sep" id="ctx-sep-2"></div>
+            <div
+                class="ctx-item danger"
+                id="ctx-delete"
+                onclick="ctxAction('delete')"
+            >
                 ✕ Delete
             </div>
         </div>
@@ -2034,12 +2233,17 @@
                 allSearchResults = [],
                 displayEntries = [],
                 selected = new Set();
+            let trashEntries = [],
+                isTrashMode = false,
+                lastClickedPath = null;
             let showHidden = localStorage.getItem("fb-show-hidden") === "true";
             let treeExpanded = new Set(),
                 treeCache = {};
             let renameFrom = null,
                 shareTarget = null,
                 copyFrom = null;
+            let shareTargets = [],
+                copyPaths = [];
             let viewMode = "list",
                 sortField = "name",
                 sortAsc = true;
@@ -2172,14 +2376,39 @@
             }
             async function navTo(path) {
                 if (isSearchMode) exitSearch();
+                isTrashMode = false;
+                document
+                    .getElementById("trash-bar")
+                    .classList.remove("visible");
+                document
+                    .getElementById("btn-trash")
+                    .classList.remove("active");
                 currentPath = path;
                 selected.clear();
+                lastClickedPath = null;
                 updateToolbar();
+                updateStatusSel();
                 await loadDir(path);
                 renderBreadcrumb(path);
                 await updateTree(path);
                 // Close sidebar on mobile after navigation
                 if (window.innerWidth <= 768) closeSidebar();
+            }
+            async function pruneSelection() {
+                if (!selected.size) return;
+                const valid = new Set(displayEntries.map((e) => e.path));
+                let changed = false;
+                for (const p of [...selected]) {
+                    if (!valid.has(p)) {
+                        selected.delete(p);
+                        changed = true;
+                    }
+                }
+                if (changed) {
+                    syncSelectionUI();
+                    updateToolbar();
+                    updateStatusSel();
+                }
             }
             async function loadDir(path) {
                 setStatus("Loading…");
@@ -2198,6 +2427,7 @@
                         applyHiddenFilter([...allEntries]),
                     );
                     renderView();
+                    pruneSelection();
                     setStatus(displayEntries.length + " items");
                 } catch (e) {
                     setStatus("Error: " + e.message);
@@ -2242,6 +2472,10 @@
                 showHidden = !showHidden;
                 localStorage.setItem("fb-show-hidden", showHidden);
                 updateHiddenToggleUI();
+                if (isTrashMode) {
+                    renderSidebarTree();
+                    return;
+                }
                 if (isSearchMode) {
                     displayEntries = sortEntries(
                         applyHiddenFilter([...allSearchResults]),
@@ -2272,10 +2506,21 @@
                 });
             }
             function renderView() {
+                if (isTrashMode) {
+                    renderTrash();
+                    return;
+                }
+                document
+                    .getElementById("trash-bar")
+                    .classList.remove("visible");
                 if (viewMode === "grid") renderGrid();
                 else renderTable();
             }
             function renderTable() {
+                document.getElementById("th-name").textContent = "Name";
+                document.getElementById("th-size").textContent = "Size";
+                document.getElementById("th-mtime").textContent = "Modified";
+                document.getElementById("th-ext").textContent = "Type";
                 const tbody = document.getElementById("file-tbody");
                 const empty = document.getElementById("file-empty");
                 const table = document.getElementById("file-table");
@@ -2286,6 +2531,7 @@
                         (isSearchMode ? "No results" : "Empty folder") +
                         "</p>";
                     empty.style.display = "";
+                    updateSelectAll();
                     return;
                 }
                 empty.style.display = "none";
@@ -2293,10 +2539,12 @@
                 tbody.innerHTML = displayEntries
                     .map((e) => {
                         const sel = selected.has(e.path) ? "selected" : "";
-                        return `<tr class="${sel}" data-path="${esc(e.path)}" onclick="rowClick(event,'${esc(e.path)}')" ondblclick="openEntry('${esc(e.path)}',${e.is_dir})" oncontextmenu="event.preventDefault();showCtxMenu(event,'${esc(e.path)}',${e.is_dir})"><td class="name-cell"><span class="file-icon">${fileIcon(e)}</span><span class="file-name ${e.is_dir ? "dir-name" : ""}">${esc(e.name)}</span></td><td class="size">${e.is_dir ? "—" : fmtSize(e.size)}</td><td class="date">${fmtDate(e.mtime)}</td><td class="ext-cell">${e.is_dir ? "DIR" : (e.ext || "").toUpperCase() || "—"}</td></tr>`;
+                        const checked = selected.has(e.path) ? "checked" : "";
+                        return `<tr class="${sel}" data-path="${esc(e.path)}" onclick="rowClick(event,'${esc(e.path)}')" ondblclick="openEntry('${esc(e.path)}',${e.is_dir})" oncontextmenu="event.preventDefault();showCtxMenu(event,'${esc(e.path)}',${e.is_dir})"><td class="td-check" onclick="event.stopPropagation()"><input type="checkbox" class="sel-check" ${checked} onclick="checkboxClick(event,'${esc(e.path)}')" aria-label="Select ${esc(e.name)}"></td><td class="name-cell"><span class="file-icon">${fileIcon(e)}</span><span class="file-name ${e.is_dir ? "dir-name" : ""}">${esc(e.name)}</span></td><td class="size">${e.is_dir ? "—" : fmtSize(e.size)}</td><td class="date">${fmtDate(e.mtime)}</td><td class="ext-cell">${e.is_dir ? "DIR" : (e.ext || "").toUpperCase() || "—"}</td></tr>`;
                     })
                     .join("");
                 document.getElementById("file-area").className = "";
+                updateSelectAll();
             }
             function renderGrid() {
                 const container = document.getElementById("grid-container");
@@ -2311,6 +2559,7 @@
                         (isSearchMode ? "No results" : "Empty folder") +
                         "</p>";
                     empty.style.display = "";
+                    updateSelectAll();
                     return;
                 }
                 empty.style.display = "none";
@@ -2318,14 +2567,16 @@
                 container.innerHTML = displayEntries
                     .map((e) => {
                         const sel = selected.has(e.path) ? "selected" : "";
+                        const checked = selected.has(e.path) ? "checked" : "";
                         const thumbOrIcon = IMAGE_EXTS.has(
                             (e.ext || "").toLowerCase(),
                         )
                             ? `<img class="grid-thumb" src="/api/filebrowser/thumb?path=${encodeURIComponent(e.path)}" loading="lazy" onerror="this.replaceWith(makeGridIcon('${esc(fileIcon(e))}'))">`
                             : `<div class="grid-icon">${fileIcon(e)}</div>`;
-                        return `<div class="grid-cell ${sel}" data-path="${esc(e.path)}" onclick="rowClick(event,'${esc(e.path)}')" ondblclick="openEntry('${esc(e.path)}',${e.is_dir})" oncontextmenu="event.preventDefault();showCtxMenu(event,'${esc(e.path)}',${e.is_dir})">${thumbOrIcon}<div class="grid-name ${e.is_dir ? "dir-name" : ""}">${esc(e.name)}</div><div class="grid-meta">${e.is_dir ? "folder" : fmtSize(e.size)}</div></div>`;
+                        return `<div class="grid-cell ${sel}" data-path="${esc(e.path)}" onclick="rowClick(event,'${esc(e.path)}')" ondblclick="openEntry('${esc(e.path)}',${e.is_dir})" oncontextmenu="event.preventDefault();showCtxMenu(event,'${esc(e.path)}',${e.is_dir})"><input type="checkbox" class="grid-check" ${checked} onclick="checkboxClick(event,'${esc(e.path)}')" aria-label="Select ${esc(e.name)}">${thumbOrIcon}<div class="grid-name ${e.is_dir ? "dir-name" : ""}">${esc(e.name)}</div><div class="grid-meta">${e.is_dir ? "folder" : fmtSize(e.size)}</div></div>`;
                     })
                     .join("");
+                updateSelectAll();
             }
             function makeGridIcon(iconChar) {
                 const d = document.createElement("div");
@@ -2345,45 +2596,194 @@
                 renderView();
             }
             function rowClick(event, path) {
-                if (event.shiftKey || event.ctrlKey || event.metaKey) {
+                if (isTrashMode) {
+                    trashRowClick(event, path);
+                    return;
+                }
+                if (event.shiftKey && lastClickedPath) {
+                    const paths = displayEntries.map((x) => x.path);
+                    const a = paths.indexOf(lastClickedPath);
+                    const b = paths.indexOf(path);
+                    if (a !== -1 && b !== -1) {
+                        const [lo, hi] =
+                            a < b ? [a, b] : [b, a];
+                        if (!event.ctrlKey && !event.metaKey)
+                            selected.clear();
+                        for (let i = lo; i <= hi; i++)
+                            selected.add(paths[i]);
+                    } else {
+                        selected.add(path);
+                    }
+                } else if (event.ctrlKey || event.metaKey) {
                     if (selected.has(path)) selected.delete(path);
                     else selected.add(path);
                 } else {
                     selected.clear();
                     selected.add(path);
                 }
+                lastClickedPath = path;
                 syncSelectionUI();
                 updateToolbar();
                 updateStatusSel();
+                updateSelectAll();
                 if (selected.size === 1) renderPropsPanel(path);
+            }
+            function checkboxClick(event, path) {
+                event.stopPropagation();
+                if (isTrashMode) {
+                    if (selected.has(path)) selected.delete(path);
+                    else selected.add(path);
+                    lastClickedPath = path;
+                    syncSelectionUI();
+                    updateToolbar();
+                    updateStatusSel();
+                    updateSelectAll();
+                    return;
+                }
+                if (selected.has(path)) selected.delete(path);
+                else selected.add(path);
+                lastClickedPath = path;
+                syncSelectionUI();
+                updateToolbar();
+                updateStatusSel();
+                updateSelectAll();
+                if (selected.size === 1) renderPropsPanel(path);
+            }
+            function toggleSelectAll(event) {
+                event.stopPropagation();
+                if (isTrashMode) {
+                    if (selected.size === trashEntries.length)
+                        selected.clear();
+                    else
+                        selected = new Set(
+                            trashEntries.map((e) => e.id),
+                        );
+                    lastClickedPath = null;
+                    syncSelectionUI();
+                    updateToolbar();
+                    updateStatusSel();
+                    updateSelectAll();
+                    return;
+                }
+                if (
+                    displayEntries.length &&
+                    selected.size === displayEntries.length
+                ) {
+                    selected.clear();
+                } else {
+                    selected = new Set(
+                        displayEntries.map((e) => e.path),
+                    );
+                }
+                lastClickedPath = null;
+                syncSelectionUI();
+                updateToolbar();
+                updateStatusSel();
+                updateSelectAll();
+            }
+            function updateSelectAll() {
+                const box = document.getElementById("sel-all");
+                if (!box) return;
+                const total = isTrashMode
+                    ? trashEntries.length
+                    : displayEntries.length;
+                if (!total) {
+                    box.checked = false;
+                    box.indeterminate = false;
+                    return;
+                }
+                if (selected.size === 0) {
+                    box.checked = false;
+                    box.indeterminate = false;
+                } else if (selected.size === total) {
+                    box.checked = true;
+                    box.indeterminate = false;
+                } else {
+                    box.checked = false;
+                    box.indeterminate = true;
+                }
+            }
+            function trashRowClick(event, path) {
+                if (event.shiftKey && lastClickedPath) {
+                    const ids = trashEntries.map((e) => e.id);
+                    const a = ids.indexOf(lastClickedPath);
+                    const b = ids.indexOf(path);
+                    if (a !== -1 && b !== -1) {
+                        const [lo, hi] =
+                            a < b ? [a, b] : [b, a];
+                        if (!event.ctrlKey && !event.metaKey)
+                            selected.clear();
+                        for (let i = lo; i <= hi; i++)
+                            selected.add(ids[i]);
+                    } else {
+                        selected.add(path);
+                    }
+                } else if (event.ctrlKey || event.metaKey) {
+                    if (selected.has(path)) selected.delete(path);
+                    else selected.add(path);
+                } else {
+                    selected.clear();
+                    selected.add(path);
+                }
+                lastClickedPath = path;
+                syncSelectionUI();
+                updateToolbar();
+                updateStatusSel();
+                updateSelectAll();
             }
             function syncSelectionUI() {
                 document.querySelectorAll("[data-path]").forEach((el) => {
-                    el.classList.toggle(
-                        "selected",
-                        selected.has(el.dataset.path),
+                    const isSel = selected.has(el.dataset.path);
+                    el.classList.toggle("selected", isSel);
+                    const box = el.querySelector(
+                        'input[type="checkbox"]',
                     );
+                    if (box && box.checked !== isSel) box.checked = isSel;
                 });
             }
             function updateToolbar() {
+                const trashBtn = document.getElementById("btn-trash");
+                if (trashBtn)
+                    trashBtn.classList.toggle("active", isTrashMode);
+                if (isTrashMode) {
+                    document.getElementById("btn-upload").disabled = true;
+                    document.getElementById("btn-mkdir").disabled = true;
+                    document.getElementById("btn-open").disabled = true;
+                    document.getElementById("btn-download").disabled = true;
+                    document.getElementById("btn-copy").disabled = true;
+                    document.getElementById("btn-share").disabled = true;
+                    document.getElementById("btn-delete").disabled = true;
+                    return;
+                }
+                document.getElementById("btn-upload").disabled = false;
+                document.getElementById("btn-mkdir").disabled = false;
                 const h = selected.size > 0;
                 const one = selected.size === 1;
-                const selEntry = one
-                    ? allEntries.find((e) => e.path === [...selected][0])
-                    : null;
-                document.getElementById("btn-open").disabled = !(
-                    one &&
-                    selEntry &&
-                    canPreview(selEntry)
-                );
+                document.getElementById("btn-open").disabled = !one;
                 document.getElementById("btn-download").disabled = !h;
-                document.getElementById("btn-copy").disabled = !one;
-                document.getElementById("btn-share").disabled = !one;
+                document.getElementById("btn-copy").disabled = !h;
+                document.getElementById("btn-share").disabled = !h;
                 document.getElementById("btn-delete").disabled = !h;
             }
             function updateStatusSel() {
-                document.getElementById("status-sel").textContent =
-                    selected.size > 0 ? selected.size + " selected" : "";
+                const el = document.getElementById("status-sel");
+                if (isTrashMode) {
+                    el.textContent =
+                        selected.size > 0
+                            ? selected.size +
+                              " of " +
+                              trashEntries.length +
+                              " selected"
+                            : trashEntries.length + " in trash";
+                    return;
+                }
+                el.textContent =
+                    selected.size > 0
+                        ? selected.size +
+                          " of " +
+                          displayEntries.length +
+                          " selected"
+                        : "";
             }
             function canPreview(e) {
                 return !e.is_dir;
@@ -2639,6 +3039,18 @@
             }
             async function doSearch(q) {
                 if (!q) return;
+                if (isTrashMode) {
+                    isTrashMode = false;
+                    document
+                        .getElementById("trash-bar")
+                        .classList.remove("visible");
+                    document
+                        .getElementById("btn-trash")
+                        .classList.remove("active");
+                    selected.clear();
+                    lastClickedPath = null;
+                    renderBreadcrumb(currentPath);
+                }
                 isSearchMode = true;
                 document
                     .getElementById("search-spinner")
@@ -2682,6 +3094,10 @@
                 isSearchMode = false;
                 allSearchResults = [];
                 document.getElementById("hdr").classList.remove("search-mode");
+                if (isTrashMode) {
+                    renderView();
+                    return;
+                }
                 displayEntries = sortEntries(
                     applyHiddenFilter([...allEntries]),
                 );
@@ -2690,6 +3106,10 @@
             }
             function renderBreadcrumb(path) {
                 const bc = document.getElementById("breadcrumb");
+                if (isTrashMode) {
+                    bc.innerHTML = `<span class="crumb" onclick="navTo('')">home</span><span class="crumb-sep">/</span><span class="crumb last">Trash</span>`;
+                    return;
+                }
                 const parts = path ? path.split("/") : [];
                 let html = `<span class="crumb ${parts.length === 0 ? "last" : ""}" onclick="navTo('')">home</span>`;
                 let built = "";
@@ -2902,34 +3322,116 @@
                     "/api/filebrowser/download?path=" +
                     encodeURIComponent(path);
             }
+            async function downloadZip(paths) {
+                setStatus("Preparing zip (" + paths.length + " items)…");
+                try {
+                    const r = await fetch("/api/filebrowser/download-zip", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ paths }),
+                    });
+                    if (!r.ok) {
+                        const d = await r.json().catch(() => ({}));
+                        setStatus(
+                            "Download failed: " + (d.error || r.status),
+                        );
+                        return;
+                    }
+                    const blob = await r.blob();
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download =
+                        paths.length === 1
+                            ? paths[0].split("/").pop() + ".zip"
+                            : "multi-download.zip";
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                    setTimeout(() => URL.revokeObjectURL(url), 5000);
+                    setStatus("Download started.");
+                } catch (e) {
+                    setStatus("Download error: " + e.message);
+                }
+            }
             function downloadSelected() {
-                selected.forEach((p) => downloadFile(p));
+                const paths = [...selected];
+                if (!paths.length) return;
+                if (paths.length === 1) {
+                    const p = paths[0];
+                    const e =
+                        allEntries.find((x) => x.path === p) ||
+                        displayEntries.find((x) => x.path === p);
+                    if (e && !e.is_dir) {
+                        downloadFile(p);
+                        return;
+                    }
+                }
+                downloadZip(paths);
             }
             async function deleteSingle(path) {
-                if (!confirm('Delete "' + path + '"?')) return;
+                if (!confirm('Move "' + path + '" to trash?')) return;
                 await doDelete([path]);
             }
             async function deleteSelected() {
                 const paths = [...selected];
                 if (!paths.length) return;
-                if (!confirm("Delete " + paths.length + " item(s)?")) return;
+                if (
+                    !confirm(
+                        "Move " +
+                            paths.length +
+                            " item(s) to trash? You can restore them from Trash.",
+                    )
+                )
+                    return;
                 await doDelete(paths);
             }
             async function doDelete(paths) {
-                for (const p of paths) {
-                    try {
-                        const r = await fetch(
-                            "/api/filebrowser/delete?path=" +
-                                encodeURIComponent(p),
-                            { method: "DELETE" },
+                if (!paths.length) return;
+                try {
+                    const r = await fetch("/api/filebrowser/batch-delete", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ paths }),
+                    });
+                    const d = await r.json().catch(() => ({}));
+                    if (!r.ok) {
+                        // Fall back to one-by-one so older servers still work.
+                        let failed = 0;
+                        for (const p of paths) {
+                            try {
+                                const r2 = await fetch(
+                                    "/api/filebrowser/delete?path=" +
+                                        encodeURIComponent(p),
+                                    { method: "DELETE" },
+                                );
+                                if (!r2.ok) failed++;
+                            } catch (_) {
+                                failed++;
+                            }
+                        }
+                        if (failed)
+                            setStatus(
+                                "Delete finished with " + failed + " error(s).",
+                            );
+                    } else if (d.failed && d.failed.length) {
+                        setStatus(
+                            "Moved " +
+                                (d.deleted || 0) +
+                                " to trash, " +
+                                d.failed.length +
+                                " failed.",
                         );
-                        const d = await r.json();
-                        if (!r.ok) setStatus("Delete failed: " + d.error);
-                    } catch (e) {
-                        setStatus("Delete error: " + e.message);
+                    } else {
+                        setStatus(
+                            "Moved " + (d.deleted || paths.length) + " to trash.",
+                        );
                     }
+                } catch (e) {
+                    setStatus("Delete error: " + e.message);
                 }
-                selected.clear();
+                for (const p of paths) selected.delete(p);
+                lastClickedPath = null;
                 await refresh();
             }
             function startRename(path, currentName) {
@@ -2974,21 +3476,48 @@
                 renameFrom = null;
             }
             function openCopyModal() {
-                if (selected.size !== 1) return;
-                copyFrom = [...selected][0];
-                document.getElementById("copy-from").value = copyFrom;
-                const name = copyFrom.split("/").pop() || copyFrom;
-                const ext = name.includes(".")
-                    ? "." + name.split(".").pop()
-                    : "";
-                const base = ext
-                    ? name.slice(0, name.length - ext.length)
-                    : name;
-                const dir = copyFrom.includes("/")
-                    ? copyFrom.substring(0, copyFrom.lastIndexOf("/"))
-                    : "";
-                document.getElementById("copy-to").value =
-                    (dir ? dir + "/" : "") + base + "_copy" + ext;
+                if (!selected.size) return;
+                copyPaths = [...selected];
+                copyFrom = copyPaths.length === 1 ? copyPaths[0] : null;
+                const title = document.getElementById("copy-title");
+                const label = document.getElementById("copy-to-label");
+                const hint = document.getElementById("copy-hint");
+                const fromInput = document.getElementById("copy-from");
+                const toInput = document.getElementById("copy-to");
+                if (copyPaths.length === 1) {
+                    const src = copyPaths[0];
+                    fromInput.value = src;
+                    title.textContent = "⎘ Copy to…";
+                    label.textContent = "Destination path (relative)";
+                    hint.textContent = "";
+                    const name = src.split("/").pop() || src;
+                    const ext = name.includes(".")
+                        ? "." + name.split(".").pop()
+                        : "";
+                    const base = ext
+                        ? name.slice(0, name.length - ext.length)
+                        : name;
+                    const dir = src.includes("/")
+                        ? src.substring(0, src.lastIndexOf("/"))
+                        : "";
+                    toInput.value =
+                        (dir ? dir + "/" : "") + base + "_copy" + ext;
+                    toInput.placeholder = "folder/newname.txt";
+                } else {
+                    fromInput.value =
+                        copyPaths.length +
+                        " items: " +
+                        copyPaths.slice(0, 3).join(", ") +
+                        (copyPaths.length > 3 ? "…" : "");
+                    title.textContent =
+                        "⎘ Copy " + copyPaths.length + " items to…";
+                    label.textContent =
+                        "Destination folder (relative, empty = current folder)";
+                    hint.textContent =
+                        "Each item keeps its own name inside the folder you pick. Nothing is overwritten.";
+                    toInput.value = currentPath;
+                    toInput.placeholder = "folder/subfolder (empty = here)";
+                }
                 openModal("modal-copy");
                 setTimeout(
                     () => document.getElementById("copy-to").focus(),
@@ -2997,67 +3526,168 @@
             }
             async function doCopy() {
                 const to = document.getElementById("copy-to").value.trim();
-                if (!to || !copyFrom) return;
                 closeModal("modal-copy");
                 try {
-                    const r = await fetch("/api/filebrowser/copy", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ from: copyFrom, to }),
-                    });
-                    const d = await r.json();
-                    if (!r.ok) {
-                        setStatus("Copy failed: " + (d.error || r.status));
-                        return;
+                    if (copyPaths.length > 1) {
+                        const r = await fetch("/api/filebrowser/batch-copy", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({
+                                paths: copyPaths,
+                                dest_dir: to,
+                            }),
+                        });
+                        const d = await r.json().catch(() => ({}));
+                        if (!r.ok) {
+                            setStatus(
+                                "Copy failed: " + (d.error || r.status),
+                            );
+                            return;
+                        }
+                        const ok = (d.copied || []).length;
+                        const bad = (d.failed || []).length;
+                        await refresh();
+                        setStatus(
+                            bad
+                                ? "Copied " + ok + ", " + bad + " failed."
+                                : "Copied " + ok + " item(s).",
+                        );
+                    } else {
+                        if (!to || !copyFrom) return;
+                        const r = await fetch("/api/filebrowser/copy", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ from: copyFrom, to }),
+                        });
+                        const d = await r.json();
+                        if (!r.ok) {
+                            setStatus(
+                                "Copy failed: " + (d.error || r.status),
+                            );
+                            return;
+                        }
+                        await refresh();
+                        setStatus("Copied to " + to);
                     }
-                    await refresh();
-                    setStatus("Copied to " + to);
                 } catch (e) {
                     setStatus("Copy error: " + e.message);
                 }
                 copyFrom = null;
+                copyPaths = [];
             }
             function quickShare(path) {
                 selected.clear();
                 selected.add(path);
+                lastClickedPath = path;
                 syncSelectionUI();
                 updateToolbar();
+                updateStatusSel();
+                updateSelectAll();
                 openShareModal();
             }
             function openShareModal() {
-                if (selected.size !== 1) return;
-                shareTarget = [...selected][0];
+                if (!selected.size) return;
+                shareTargets = [...selected];
+                shareTarget = shareTargets.length === 1 ? shareTargets[0] : null;
+                const title = document.getElementById("share-title");
+                title.textContent =
+                    shareTargets.length === 1
+                        ? "⬡ Share File"
+                        : "⬡ Share " + shareTargets.length + " items";
+                document.getElementById("share-sources").textContent =
+                    shareTargets.length === 1
+                        ? shareTargets[0]
+                        : shareTargets.slice(0, 4).join(", ") +
+                          (shareTargets.length > 4
+                              ? " and " +
+                                (shareTargets.length - 4) +
+                                " more — one link per item"
+                              : " — one link per item");
                 document.getElementById("share-password").value = "";
                 document.getElementById("share-expires").value = "";
                 document.getElementById("share-result").style.display = "none";
+                document.getElementById("share-url-display").textContent = "";
+                document.getElementById("share-url-display").style.display =
+                    "";
+                document.getElementById("share-url-list").innerHTML = "";
                 openModal("modal-share");
             }
             async function doShare() {
-                if (!shareTarget) return;
+                if (!shareTargets.length) return;
                 const password =
                     document.getElementById("share-password").value;
                 const expires_hours =
                     document.getElementById("share-expires").value;
                 try {
-                    const body = { path: shareTarget };
-                    if (password) body.password = password;
-                    if (expires_hours)
-                        body.expires_hours = parseInt(expires_hours);
-                    const r = await fetch("/api/filebrowser/share", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify(body),
-                    });
-                    const d = await r.json();
-                    if (!r.ok) {
-                        setStatus("Share failed: " + d.error);
-                        return;
+                    if (shareTargets.length === 1) {
+                        const body = { path: shareTargets[0] };
+                        if (password) body.password = password;
+                        if (expires_hours)
+                            body.expires_hours = parseInt(expires_hours);
+                        const r = await fetch("/api/filebrowser/share", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify(body),
+                        });
+                        const d = await r.json();
+                        if (!r.ok) {
+                            setStatus("Share failed: " + d.error);
+                            return;
+                        }
+                        const url = location.origin + d.url;
+                        document.getElementById(
+                            "share-url-display",
+                        ).textContent = url;
+                        document.getElementById(
+                            "share-url-display",
+                        ).style.display = "";
+                        document.getElementById("share-url-list").innerHTML =
+                            "";
+                        document.getElementById("share-result").style.display =
+                            "block";
+                    } else {
+                        const body = { paths: shareTargets };
+                        if (password) body.password = password;
+                        if (expires_hours)
+                            body.expires_hours = parseInt(expires_hours);
+                        const r = await fetch(
+                            "/api/filebrowser/batch-share",
+                            {
+                                method: "POST",
+                                headers: {
+                                    "Content-Type": "application/json",
+                                },
+                                body: JSON.stringify(body),
+                            },
+                        );
+                        const d = await r.json().catch(() => ({}));
+                        if (!r.ok) {
+                            setStatus(
+                                "Share failed: " + (d.error || r.status),
+                            );
+                            return;
+                        }
+                        const shares = d.shares || [];
+                        const failed = d.failed || [];
+                        document.getElementById(
+                            "share-url-display",
+                        ).style.display = "none";
+                        document.getElementById("share-url-list").innerHTML =
+                            shares
+                                .map(
+                                    (s) =>
+                                        `<div class="share-link-item" onclick="navigator.clipboard.writeText('${location.origin}${s.url}').then(()=>setStatus('Copied!'))"><div class="share-link-path">${esc(s.path)}</div>${location.origin}${esc(s.url)}</div>`,
+                                )
+                                .join("") +
+                            (failed.length
+                                ? `<div style="color:var(--warn);font-size:.72rem;margin-top:.4rem">${failed.length} item(s) could not be shared.</div>`
+                                : "");
+                        document.getElementById("share-result").style.display =
+                            "block";
+                        setStatus(
+                            "Created " + shares.length + " share link(s).",
+                        );
                     }
-                    const url = location.origin + d.url;
-                    document.getElementById("share-url-display").textContent =
-                        url;
-                    document.getElementById("share-result").style.display =
-                        "block";
                 } catch (e) {
                     setStatus("Error: " + e.message);
                 }
@@ -3153,20 +3783,36 @@
                         refresh();
                         return;
                     }
-                    if (selected.size === 1) {
-                        const path = [...selected][0];
-                        const entry =
-                            allEntries.find((x) => x.path === path) ||
-                            displayEntries.find((x) => x.path === path);
-                        if (e.key === "Enter") {
-                            openEntry(path, entry && entry.is_dir);
+                    if (isTrashMode) {
+                        if (
+                            (e.key === "Delete" ||
+                                e.key === "Backspace") &&
+                            selected.size
+                        ) {
+                            purgeSelectedTrash();
                             return;
                         }
-                        if (e.key === "F2") {
-                            const n = entry ? entry.name : "";
-                            startRename(path, n);
+                        if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                            e.preventDefault();
+                            if (!trashEntries.length) return;
+                            const ids = trashEntries.map((x) => x.id);
+                            const cur = [...selected][0];
+                            let idx = cur ? ids.indexOf(cur) : -1;
+                            idx =
+                                e.key === "ArrowDown"
+                                    ? Math.min(idx + 1, ids.length - 1)
+                                    : Math.max(idx - 1, 0);
+                            selected.clear();
+                            selected.add(ids[idx]);
+                            lastClickedPath = ids[idx];
+                            syncSelectionUI();
+                            updateToolbar();
+                            updateStatusSel();
                             return;
                         }
+                        return;
+                    }
+                    if (selected.size >= 1) {
                         if (e.key === "Delete" || e.key === "Backspace") {
                             deleteSelected();
                             return;
@@ -3181,6 +3827,21 @@
                         }
                         if (e.key === "c" || e.key === "C") {
                             openCopyModal();
+                            return;
+                        }
+                    }
+                    if (selected.size === 1) {
+                        const path = [...selected][0];
+                        const entry =
+                            allEntries.find((x) => x.path === path) ||
+                            displayEntries.find((x) => x.path === path);
+                        if (e.key === "Enter") {
+                            openEntry(path, entry && entry.is_dir);
+                            return;
+                        }
+                        if (e.key === "F2") {
+                            const n = entry ? entry.name : "";
+                            startRename(path, n);
                             return;
                         }
                         if (e.key === "i" || e.key === "I") {
@@ -3216,9 +3877,11 @@
                                 : Math.max(idx - 1, 0);
                         selected.clear();
                         selected.add(paths[idx]);
+                        lastClickedPath = paths[idx];
                         syncSelectionUI();
                         updateToolbar();
                         updateStatusSel();
+                        updateSelectAll();
                         renderPropsPanel(paths[idx]);
                         const row = document.querySelector(
                             `[data-path="${CSS.escape(paths[idx])}"]`,
@@ -3229,13 +3892,294 @@
                 });
             }
             async function refresh() {
-                selected.clear();
-                updateToolbar();
+                if (isTrashMode) {
+                    await loadTrash();
+                    return;
+                }
                 delete treeCache[currentPath];
                 await loadDir(currentPath);
                 await ensureTreeLoaded(currentPath);
                 renderSidebarTree();
                 setStatus(displayEntries.length + " items");
+            }
+            async function showTrash() {
+                if (isSearchMode) {
+                    isSearchMode = false;
+                    allSearchResults = [];
+                    document
+                        .getElementById("hdr")
+                        .classList.remove("search-mode");
+                    document.getElementById("search-box").value = "";
+                }
+                isTrashMode = true;
+                selected.clear();
+                lastClickedPath = null;
+                updateToolbar();
+                updateStatusSel();
+                renderBreadcrumb("");
+                await loadTrash();
+                if (window.innerWidth <= 768) closeSidebar();
+            }
+            async function loadTrash() {
+                setStatus("Loading trash…");
+                try {
+                    const r = await fetch("/api/filebrowser/trash");
+                    if (!r.ok) {
+                        const d = await r.json().catch(() => ({}));
+                        setStatus(
+                            "Could not load trash: " +
+                                (d.error || r.status),
+                        );
+                        return;
+                    }
+                    const d = await r.json();
+                    trashEntries = (d.entries || []).sort(
+                        (a, b) =>
+                            (b.deleted_at_ms || 0) - (a.deleted_at_ms || 0),
+                    );
+                    const valid = new Set(
+                        trashEntries.map((e) => e.id),
+                    );
+                    for (const id of [...selected]) {
+                        if (!valid.has(id)) selected.delete(id);
+                    }
+                    renderTrash();
+                    updateToolbar();
+                    updateStatusSel();
+                    updateSelectAll();
+                    setStatus(
+                        trashEntries.length
+                            ? trashEntries.length + " item(s) in trash"
+                            : "Trash is empty",
+                    );
+                } catch (e) {
+                    setStatus("Could not load trash: " + e.message);
+                }
+            }
+            function renderTrash() {
+                const tbody = document.getElementById("file-tbody");
+                const empty = document.getElementById("file-empty");
+                const table = document.getElementById("file-table");
+                const container =
+                    document.getElementById("grid-container");
+                container.innerHTML = "";
+                container.style.display = "none";
+                document.getElementById("file-area").className = "";
+                document
+                    .getElementById("trash-bar")
+                    .classList.add("visible");
+                document
+                    .getElementById("btn-trash")
+                    .classList.add("active");
+                document.getElementById("th-name").textContent = "Name";
+                document.getElementById("th-size").textContent = "Size";
+                document.getElementById("th-mtime").textContent = "Deleted";
+                document.getElementById("th-ext").textContent = "Was in";
+                renderBreadcrumb("");
+                const count = document.getElementById("trash-count");
+                count.textContent = trashEntries.length
+                    ? trashEntries.length + " item(s) in trash."
+                    : "Trash is empty.";
+                if (!trashEntries.length) {
+                    table.style.display = "none";
+                    empty.innerHTML =
+                        '<div class="icon">🗑</div><p>Trash is empty. Deleted files will show up here so you can bring them back.</p>';
+                    empty.style.display = "";
+                    updateSelectAll();
+                    return;
+                }
+                empty.style.display = "none";
+                table.style.display = "";
+                tbody.innerHTML = trashEntries
+                    .map((e) => {
+                        const sel = selected.has(e.id) ? "selected" : "";
+                        const checked = selected.has(e.id) ? "checked" : "";
+                        const base = String(
+                            e.original_path || "",
+                        )
+                            .split("/")
+                            .pop();
+                        const dir = String(e.original_path || "").includes(
+                            "/",
+                        )
+                            ? String(e.original_path).substring(
+                                  0,
+                                  String(e.original_path).lastIndexOf("/"),
+                              )
+                            : "";
+                        return `<tr class="${sel}" data-path="${esc(e.id)}" onclick="rowClick(event,'${esc(e.id)}')" ondblclick="restoreTrash('${esc(e.id)}')" oncontextmenu="event.preventDefault();trashCtxMenu(event,'${esc(e.id)}')"><td class="td-check" onclick="event.stopPropagation()"><input type="checkbox" class="sel-check" ${checked} onclick="checkboxClick(event,'${esc(e.id)}')" aria-label="Select ${esc(base)}"></td><td class="name-cell"><span class="file-icon">${e.is_dir ? "📁" : "▤"}</span><span class="file-name ${e.is_dir ? "dir-name" : ""}">${esc(base || e.id)}</span></td><td class="size">${e.is_dir ? "—" : fmtSize(e.size)}</td><td class="date">${fmtDate((e.deleted_at_ms || 0) / 1000)}</td><td class="ext-cell" style="text-transform:none">${esc(dir || "—")}</td></tr>`;
+                    })
+                    .join("");
+                updateSelectAll();
+            }
+            function trashEntryById(id) {
+                return trashEntries.find((e) => e.id === id);
+            }
+            async function restoreTrash(id) {
+                const entry = trashEntryById(id);
+                const original = entry ? String(entry.original_path) : id;
+                const dest = prompt(
+                    "Restore to (you can change the location):",
+                    original,
+                );
+                if (dest === null) return;
+                const trimmed = dest.trim();
+                if (!trimmed) return;
+                await doRestoreTrash(id, trimmed);
+            }
+            async function doRestoreTrash(id, dest) {
+                try {
+                    const r = await fetch(
+                        "/api/filebrowser/trash/" +
+                            encodeURIComponent(id) +
+                            "/restore",
+                        {
+                            method: "POST",
+                            headers: {
+                                "Content-Type": "application/json",
+                            },
+                            body: JSON.stringify({ dest }),
+                        },
+                    );
+                    const d = await r.json().catch(() => ({}));
+                    if (r.status === 409) {
+                        const retry = prompt(
+                            "That location already exists. Nothing was overwritten. Enter a different restore location:",
+                            dest + ".restored",
+                        );
+                        if (retry && retry.trim())
+                            await doRestoreTrash(id, retry.trim());
+                        return;
+                    }
+                    if (!r.ok) {
+                        setStatus(
+                            "Restore failed: " + (d.error || r.status),
+                        );
+                        return;
+                    }
+                    selected.delete(id);
+                    setStatus("Restored to " + (d.path || dest));
+                    await loadTrash();
+                    delete treeCache[currentPath];
+                    await loadDir(currentPath);
+                } catch (e) {
+                    setStatus("Restore error: " + e.message);
+                }
+            }
+            async function purgeTrashEntry(id) {
+                const entry = trashEntryById(id);
+                const name = entry ? String(entry.original_path) : id;
+                if (
+                    !confirm(
+                        'Delete "' +
+                            name +
+                            '" forever? This also clears its leftover sync record, so other devices will not bring it back.',
+                    )
+                )
+                    return;
+                try {
+                    const r = await fetch(
+                        "/api/filebrowser/trash/" +
+                            encodeURIComponent(id),
+                        { method: "DELETE" },
+                    );
+                    const d = await r.json().catch(() => ({}));
+                    if (!r.ok) {
+                        setStatus(
+                            "Delete failed: " + (d.error || r.status),
+                        );
+                        return;
+                    }
+                    selected.delete(id);
+                    await loadTrash();
+                } catch (e) {
+                    setStatus("Delete error: " + e.message);
+                }
+            }
+            async function purgeSelectedTrash() {
+                const ids = [...selected];
+                if (!ids.length) return;
+                if (
+                    !confirm(
+                        "Delete " +
+                            ids.length +
+                            " item(s) forever? This also clears their leftover sync records.",
+                    )
+                )
+                    return;
+                let failed = 0;
+                for (const id of ids) {
+                    try {
+                        const r = await fetch(
+                            "/api/filebrowser/trash/" +
+                                encodeURIComponent(id),
+                            { method: "DELETE" },
+                        );
+                        if (r.ok) selected.delete(id);
+                        else failed++;
+                    } catch (_) {
+                        failed++;
+                    }
+                }
+                await loadTrash();
+                setStatus(
+                    failed
+                        ? "Deleted with " + failed + " error(s)."
+                        : "Deleted forever.",
+                );
+            }
+            async function emptyTrash() {
+                if (!trashEntries.length) return;
+                if (
+                    !confirm(
+                        "Empty trash? All " +
+                            trashEntries.length +
+                            " item(s) will be deleted forever, and their leftover sync records will be cleared.",
+                    )
+                )
+                    return;
+                try {
+                    const r = await fetch("/api/filebrowser/trash", {
+                        method: "DELETE",
+                    });
+                    const d = await r.json().catch(() => ({}));
+                    if (!r.ok) {
+                        setStatus(
+                            "Empty failed: " + (d.error || r.status),
+                        );
+                        return;
+                    }
+                    selected.clear();
+                    await loadTrash();
+                    setStatus(
+                        "Emptied trash (" + (d.purged || 0) + " item(s)).",
+                    );
+                } catch (e) {
+                    setStatus("Empty error: " + e.message);
+                }
+            }
+            async function purgeExpiredTrash() {
+                try {
+                    const r = await fetch(
+                        "/api/filebrowser/trash/purge-expired",
+                        { method: "POST" },
+                    );
+                    const d = await r.json().catch(() => ({}));
+                    if (!r.ok) {
+                        setStatus(
+                            "Clean-up failed: " + (d.error || r.status),
+                        );
+                        return;
+                    }
+                    await loadTrash();
+                    setStatus(
+                        (d.purged || 0)
+                            ? "Removed " + d.purged + " expired item(s)."
+                            : "Nothing past its keep time.",
+                    );
+                } catch (e) {
+                    setStatus("Clean-up error: " + e.message);
+                }
             }
             function openModal(id) {
                 document.getElementById(id).classList.add("open");
@@ -3349,13 +4293,70 @@
             }
             let ctxPath = null,
                 ctxIsDir = false;
-            function showCtxMenu(event, path, isDir) {
-                if (!selected.has(path)) {
+            function trashCtxMenu(event, id) {
+                if (!selected.has(id)) {
                     selected.clear();
-                    selected.add(path);
+                    selected.add(id);
+                    lastClickedPath = id;
                     syncSelectionUI();
                     updateToolbar();
                     updateStatusSel();
+                    updateSelectAll();
+                }
+                ctxPath = id;
+                ctxIsDir = false;
+                const menu = document.getElementById("ctx-menu");
+                document.getElementById("ctx-open").hidden = true;
+                document.getElementById("ctx-open-text").hidden = true;
+                document.getElementById("ctx-share").hidden = true;
+                document.getElementById("ctx-copy").hidden = true;
+                document.getElementById("ctx-rename").hidden = true;
+                document.getElementById("ctx-sep-1").hidden = true;
+                const dl = document.getElementById("ctx-download");
+                dl.hidden = false;
+                dl.textContent = "↩ Restore…";
+                const del = document.getElementById("ctx-delete");
+                del.hidden = false;
+                del.textContent = "✕ Delete forever";
+                document.getElementById("ctx-sep-2").hidden = false;
+                document.getElementById("ctx-open").hidden = true;
+                document.getElementById("ctx-open-text").hidden = true;
+                menu.classList.add("open");
+                const mw = menu.offsetWidth || 182,
+                    mh = menu.offsetHeight || 220;
+                let x = event.clientX,
+                    y = event.clientY;
+                if (x + mw > window.innerWidth - 4)
+                    x = window.innerWidth - mw - 4;
+                if (y + mh > window.innerHeight - 4)
+                    y = window.innerHeight - mh - 4;
+                menu.style.left = x + "px";
+                menu.style.top = y + "px";
+            }
+            function showCtxMenu(event, path, isDir) {
+                if (isTrashMode) {
+                    trashCtxMenu(event, path);
+                    return;
+                }
+                const dl = document.getElementById("ctx-download");
+                dl.hidden = false;
+                dl.textContent = "⬇ Download";
+                document.getElementById("ctx-share").hidden = false;
+                document.getElementById("ctx-copy").hidden = false;
+                document.getElementById("ctx-rename").hidden = false;
+                document.getElementById("ctx-sep-1").hidden = false;
+                const del = document.getElementById("ctx-delete");
+                del.hidden = false;
+                del.textContent = "✕ Delete";
+                document.getElementById("ctx-sep-2").hidden = false;
+                if (!selected.has(path)) {
+                    selected.clear();
+                    selected.add(path);
+                    lastClickedPath = path;
+                    syncSelectionUI();
+                    updateToolbar();
+                    updateStatusSel();
+                    updateSelectAll();
                 }
                 if (selected.size === 1) renderPropsPanel(path);
                 ctxPath = path;
@@ -3381,8 +4382,32 @@
             function ctxAction(action) {
                 hideCtxMenu();
                 if (!ctxPath) return;
+                if (isTrashMode) {
+                    const id = ctxPath;
+                    const entry = trashEntryById(id);
+                    switch (action) {
+                        case "open":
+                        case "download":
+                            restoreTrash(id);
+                            break;
+                        case "share":
+                        case "copy":
+                        case "rename":
+                        case "open-text":
+                            restoreTrash(id);
+                            break;
+                        case "delete":
+                            if (selected.size > 1 && selected.has(id))
+                                purgeSelectedTrash();
+                            else purgeTrashEntry(id);
+                            break;
+                    }
+                    return;
+                }
                 const path = ctxPath,
                     isDir = ctxIsDir;
+                const useSelection =
+                    selected.size > 1 && selected.has(path);
                 const entry =
                     allEntries.find((x) => x.path === path) ||
                     displayEntries.find((x) => x.path === path);
@@ -3394,18 +4419,31 @@
                         openEditor(path, true);
                         break;
                     case "download":
-                        downloadFile(path);
+                        if (useSelection) downloadSelected();
+                        else downloadFile(path);
                         break;
                     case "share":
-                        selected.clear();
-                        selected.add(path);
-                        syncSelectionUI();
+                        if (!useSelection) {
+                            selected.clear();
+                            selected.add(path);
+                            lastClickedPath = path;
+                            syncSelectionUI();
+                            updateToolbar();
+                            updateStatusSel();
+                            updateSelectAll();
+                        }
                         openShareModal();
                         break;
                     case "copy":
-                        selected.clear();
-                        selected.add(path);
-                        syncSelectionUI();
+                        if (!useSelection) {
+                            selected.clear();
+                            selected.add(path);
+                            lastClickedPath = path;
+                            syncSelectionUI();
+                            updateToolbar();
+                            updateStatusSel();
+                            updateSelectAll();
+                        }
                         openCopyModal();
                         break;
                     case "rename":
@@ -3415,7 +4453,8 @@
                         );
                         break;
                     case "delete":
-                        deleteSingle(path);
+                        if (useSelection) deleteSelected();
+                        else deleteSingle(path);
                         break;
                 }
             }

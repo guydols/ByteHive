@@ -344,6 +344,20 @@ impl SyncEngine {
     }
 
     pub fn restore_trash_entry(&self, id: &str) -> Result<(), String> {
+        self.restore_trash_entry_with_dest(id, None)
+            .map(|_| ())
+    }
+
+    /// Restore a trash entry, optionally to a different root-relative
+    /// destination. Refuses with an `already exists` error (callers map to
+    /// 409) when the destination exists. On success clears the tombstones
+    /// covering the entry's *original* prefix (exact + children) and
+    /// returns the final destination path.
+    pub fn restore_trash_entry_with_dest(
+        &self,
+        id: &str,
+        dest: Option<&Path>,
+    ) -> Result<PathBuf, String> {
         // Capture the original path first so a successful restore can lift
         // the tombstones covering that prefix (otherwise the next send
         // would veto the restored file as a resurrection).
@@ -353,32 +367,92 @@ impl SyncEngine {
             .iter()
             .find(|e| e.id == id)
             .map(|e| e.original_path.clone());
-        let result = self.trash_manager.restore_entry(id);
+        let dest_rel = self
+            .trash_manager
+            .restore_entry_with_dest(id, dest)
+            .map_err(|e| e.to_string())?;
+        if let Some(prefix) = original {
+            self.clear_ledger_prefix(&prefix);
+        }
+        Ok(dest_rel)
+    }
+
+    /// Remove ledger tombstones covered by `prefix` (exact + component-wise
+    /// children) and persist. Shared by restore and all purge paths.
+    fn clear_ledger_prefix(&self, prefix: &Path) {
+        let to_clear: Vec<PathBuf> = self
+            .ledger
+            .read()
+            .iter()
+            .filter(|(k, _)| *k == &prefix || k.strip_prefix(prefix).is_ok())
+            .map(|(k, _)| k.clone())
+            .collect();
+        self.clear_tombstones(&to_clear);
+    }
+
+    pub fn purge_trash_entry(&self, id: &str) -> Result<(), String> {
+        let prefix: Option<PathBuf> = self
+            .trash_manager
+            .list_trash()
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.original_path.clone());
+        let result = self.trash_manager.purge_entry(id);
         if result.is_ok() {
-            if let Some(prefix) = original {
-                let to_clear: Vec<PathBuf> = self
-                    .ledger
-                    .read()
-                    .iter()
-                    .filter(|(k, _)| *k == &prefix || k.strip_prefix(&prefix).is_ok())
-                    .map(|(k, _)| k.clone())
-                    .collect();
-                self.clear_tombstones(&to_clear);
+            if let Some(p) = prefix {
+                self.clear_ledger_prefix(&p);
             }
         }
         result
     }
 
-    pub fn purge_trash_entry(&self, id: &str) -> Result<(), String> {
-        self.trash_manager.purge_entry(id)
-    }
-
     pub fn purge_expired_trash(&self) -> usize {
-        self.trash_manager.purge_expired()
+        // Snapshot the prefixes that are about to expire so only their
+        // tombstones are lifted (not live entries' tombstones).
+        let prefixes: Vec<PathBuf> = {
+            let entries = self.trash_manager.list_trash();
+            // Mirror TrashManager::purge_expired cutoff without duplicating
+            // removal: collect candidates by the same rule.
+            entries
+                .into_iter()
+                .filter(|e| {
+                    // TrashManager returns 0 unless expiry is Some(>0); when
+                    // disabled there is nothing to clear either.
+                    match self.trash_manager.expiry_days {
+                        Some(d) if d > 0 => {
+                            let now = crate::ledger::now_ms();
+                            let cutoff = now.saturating_sub(d * 24 * 3600 * 1000);
+                            e.deleted_at_ms < cutoff
+                        }
+                        _ => false,
+                    }
+                })
+                .map(|e| e.original_path)
+                .collect()
+        };
+        let count = self.trash_manager.purge_expired();
+        if count > 0 {
+            for p in &prefixes {
+                self.clear_ledger_prefix(p);
+            }
+        }
+        count
     }
 
     pub fn empty_trash(&self) -> usize {
-        self.trash_manager.empty()
+        let prefixes: Vec<PathBuf> = self
+            .trash_manager
+            .list_trash()
+            .into_iter()
+            .map(|e| e.original_path)
+            .collect();
+        let count = self.trash_manager.empty();
+        if count > 0 {
+            for p in &prefixes {
+                self.clear_ledger_prefix(p);
+            }
+        }
+        count
     }
 
     pub fn scan(&self) -> std::io::Result<Manifest> {
@@ -1561,5 +1635,125 @@ impl SyncEngine {
                 set.remove(p);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod trash_tests {
+    use super::*;
+    use crate::exclusions::{ExclusionConfig, Exclusions};
+
+    fn test_engine_with_expiry(expiry: Option<u64>) -> (tempfile::TempDir, SyncEngine) {
+        let dir = tempfile::tempdir().unwrap();
+        let ex = Arc::new(Exclusions::compile(&ExclusionConfig::default()));
+        let eng = SyncEngine::new_configured(
+            dir.path().to_path_buf(),
+            "test-node".to_string(),
+            ex,
+            SyncEngineConfig {
+                trash_expiry_days: expiry,
+                full_scan_interval_secs: None,
+            },
+        );
+        (dir, eng)
+    }
+
+    #[test]
+    fn restore_to_new_place_with_overwrite_guard() {
+        let (dir, eng) = test_engine_with_expiry(None);
+        std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+        eng.scan().unwrap();
+        let t = crate::ledger::now_ms() + 5_000;
+        eng.apply_deletes(&[PathBuf::from("a.txt")], t, "test-node")
+            .unwrap();
+        assert!(!dir.path().join("a.txt").exists());
+        assert!(eng.ledger.read().contains(Path::new("a.txt")));
+
+        let id = eng.list_trash()[0].id.clone();
+        let dest = eng
+            .restore_trash_entry_with_dest(&id, Some(Path::new("restored/b.txt")))
+            .expect("restore to new place");
+        assert_eq!(dest, PathBuf::from("restored/b.txt"));
+        assert_eq!(
+            std::fs::read(dir.path().join("restored/b.txt")).unwrap(),
+            b"hello"
+        );
+        assert!(!dir.path().join("a.txt").exists());
+        // Original-prefix tombstone lifted on restore.
+        assert!(!eng.ledger.read().contains(Path::new("a.txt")));
+        assert!(crate::ledger::DeletionLedger::load(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn restore_to_existing_dest_is_refused() {
+        let (dir, eng) = test_engine_with_expiry(None);
+        std::fs::write(dir.path().join("a.txt"), b"aaa").unwrap();
+        std::fs::write(dir.path().join("taken.txt"), b"taken").unwrap();
+        eng.scan().unwrap();
+        let t = crate::ledger::now_ms() + 5_000;
+        eng.apply_deletes(&[PathBuf::from("a.txt")], t, "test-node")
+            .unwrap();
+        let id = eng.list_trash()[0].id.clone();
+        let err = eng
+            .restore_trash_entry_with_dest(&id, Some(Path::new("taken.txt")))
+            .expect_err("existing dest must be refused");
+        assert!(
+            err.contains("already exists"),
+            "overwrite guard message, got: {err}"
+        );
+        // Entry still in trash; nothing overwritten.
+        assert_eq!(eng.list_trash().len(), 1);
+        assert_eq!(
+            std::fs::read(dir.path().join("taken.txt")).unwrap(),
+            b"taken"
+        );
+    }
+
+    #[test]
+    fn purge_clears_tombstone_exact_and_children() {
+        let (dir, eng) = test_engine_with_expiry(None);
+        std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+        std::fs::write(dir.path().join("docs/a.txt"), b"a").unwrap();
+        eng.scan().unwrap();
+        let t = crate::ledger::now_ms() + 5_000;
+        eng.apply_deletes(&[PathBuf::from("docs")], t, "test-node")
+            .unwrap();
+        // Child tombstone recorded separately (e.g. prior delete) must also
+        // lift when the covering trash entry is purged.
+        eng.record_delete(
+            PathBuf::from("docs/a.txt"),
+            t,
+            "test-node",
+            None,
+            None,
+        );
+        assert!(eng.ledger.read().contains(Path::new("docs")));
+        assert!(eng.ledger.read().contains(Path::new("docs/a.txt")));
+
+        let id = eng.list_trash()[0].id.clone();
+        eng.purge_trash_entry(&id).unwrap();
+        assert!(eng.list_trash().is_empty());
+        assert!(eng.ledger.read().is_empty());
+        assert!(crate::ledger::DeletionLedger::load(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn empty_trash_clears_all_covering_tombstones() {
+        let (dir, eng) = test_engine_with_expiry(None);
+        std::fs::write(dir.path().join("x.txt"), b"x").unwrap();
+        std::fs::write(dir.path().join("y.txt"), b"y").unwrap();
+        eng.scan().unwrap();
+        let t = crate::ledger::now_ms() + 5_000;
+        eng.apply_deletes(
+            &[PathBuf::from("x.txt"), PathBuf::from("y.txt")],
+            t,
+            "test-node",
+        )
+        .unwrap();
+        assert_eq!(eng.ledger.read().len(), 2);
+        let n = eng.empty_trash();
+        assert_eq!(n, 2);
+        assert!(eng.ledger.read().is_empty());
+        assert!(crate::ledger::DeletionLedger::load(dir.path()).is_empty());
     }
 }

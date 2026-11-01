@@ -5,3 +5,4 @@ pub mod log_panel;
 pub mod side_panel;
 pub mod stats_panel;
 pub mod status_panel;
+pub mod trash;

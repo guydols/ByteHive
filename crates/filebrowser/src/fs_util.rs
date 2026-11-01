@@ -120,6 +120,10 @@ pub fn zip_directory(abs: &Path, _rel: &str) -> HttpResponse {
         ) {
             if let Ok(rd) = std::fs::read_dir(cur) {
                 for entry in rd.flatten() {
+                    // Never bundle the internal sync folder.
+                    if entry.file_name().to_string_lossy() == ".bh_filesync" {
+                        continue;
+                    }
                     let path = entry.path();
                     let rel = path.strip_prefix(base).unwrap_or(&path);
                     let rel_str = rel.to_string_lossy().replace('\\', "/");
@@ -157,6 +161,109 @@ pub fn zip_directory(abs: &Path, _rel: &str) -> HttpResponse {
         },
         body: buf.into_inner(),
     }
+}
+
+/// Zip several root-relative paths into one archive.
+///
+/// Each entry keeps its relative path as the name inside the zip, so two
+/// files with the same base name in different folders do not collide.
+/// Directories are added recursively under their own relative path.
+/// The internal `.bh_filesync` folder is always skipped.
+///
+/// Returns `Err(message)` when the selection is empty, too large, or any
+/// entry is missing — callers map this to a 400 response.
+pub fn zip_paths(root: &Path, rels: &[String]) -> Result<HttpResponse, String> {
+    use std::io::Cursor;
+
+    if rels.is_empty() {
+        return Err("no paths selected".into());
+    }
+    if rels.len() > 500 {
+        return Err("too many paths selected (max 500)".into());
+    }
+
+    let mut resolved: Vec<(PathBuf, String)> = Vec::with_capacity(rels.len());
+    for rel in rels {
+        let abs = resolve(root, rel)?;
+        if !abs.exists() {
+            return Err(format!("not found: {rel}"));
+        }
+        if rel == ".bh_filesync" || rel.starts_with(".bh_filesync/") {
+            return Err("cannot download the internal sync folder".into());
+        }
+        resolved.push((abs, rel.clone()));
+    }
+
+    let mut buf = Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut buf);
+        let opts: zip::write::SimpleFileOptions =
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+
+        fn add_file(
+            zip: &mut zip::ZipWriter<&mut Cursor<Vec<u8>>>,
+            abs: &Path,
+            arcname: &str,
+            opts: zip::write::SimpleFileOptions,
+        ) {
+            if let Ok(bytes) = std::fs::read(abs) {
+                if zip.start_file(arcname, opts).is_ok() {
+                    let _ = zip.write_all(&bytes);
+                }
+            }
+        }
+
+        fn add_dir_recursive(
+            zip: &mut zip::ZipWriter<&mut Cursor<Vec<u8>>>,
+            abs_dir: &Path,
+            prefix: &str,
+            opts: zip::write::SimpleFileOptions,
+        ) {
+            let Ok(rd) = std::fs::read_dir(abs_dir) else {
+                return;
+            };
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name == ".bh_filesync" {
+                    continue;
+                }
+                let path = entry.path();
+                let arcname = format!("{prefix}/{name}");
+                if path.is_dir() {
+                    let _ = zip.add_directory(format!("{arcname}/"), opts);
+                    add_dir_recursive(&mut *zip, &path, &arcname, opts);
+                } else {
+                    add_file(&mut *zip, &path, &arcname, opts);
+                }
+            }
+        }
+
+        for (abs, rel) in &resolved {
+            let arcname = rel.replace('\\', "/");
+            if abs.is_dir() {
+                let _ = zip.add_directory(format!("{arcname}/"), opts);
+                add_dir_recursive(&mut zip, abs, &arcname, opts);
+            } else {
+                add_file(&mut zip, abs, &arcname, opts);
+            }
+        }
+        zip.finish().map_err(|e| e.to_string())?;
+    }
+
+    Ok(HttpResponse {
+        status: 200,
+        content_type: "application/zip".into(),
+        headers: {
+            let mut h = HashMap::new();
+            h.insert(
+                "content-disposition".into(),
+                "attachment; filename=\"multi-download.zip\"".to_string(),
+            );
+            h
+        },
+        body: buf.into_inner(),
+    })
 }
 
 pub fn extension(name: &str) -> &str {

@@ -180,6 +180,12 @@ impl App for FileBrowserApp {
             ("GET", "/status") => Some(self.handle_status()),
             ("GET", "/ls") => Some(self.handle_ls(req)),
             ("GET", "/download") => Some(self.handle_download(req)),
+            ("POST", "/download-zip") => {
+                if is_readonly {
+                    return Some(HttpResponse::unauthorized());
+                }
+                Some(self.handle_download_zip(req))
+            }
             ("POST", "/upload") => {
                 if is_readonly {
                     return Some(HttpResponse::unauthorized());
@@ -198,6 +204,12 @@ impl App for FileBrowserApp {
                 }
                 Some(self.handle_delete(req))
             }
+            ("POST", "/batch-delete") => {
+                if is_readonly {
+                    return Some(HttpResponse::unauthorized());
+                }
+                Some(self.handle_batch_delete(req, &user))
+            }
             ("POST", "/rename") => {
                 if is_readonly {
                     return Some(HttpResponse::unauthorized());
@@ -209,6 +221,12 @@ impl App for FileBrowserApp {
                     return Some(HttpResponse::unauthorized());
                 }
                 Some(self.handle_create_share(req, &user))
+            }
+            ("POST", "/batch-share") => {
+                if is_readonly {
+                    return Some(HttpResponse::unauthorized());
+                }
+                Some(self.handle_batch_share(req, &user))
             }
             ("GET", "/shares") => Some(self.handle_list_shares(&role)),
             ("DELETE", "/share") => {
@@ -231,6 +249,12 @@ impl App for FileBrowserApp {
                 }
                 Some(self.handle_copy(req))
             }
+            ("POST", "/batch-copy") => {
+                if is_readonly {
+                    return Some(HttpResponse::unauthorized());
+                }
+                Some(self.handle_batch_copy(req))
+            }
             ("GET", "/search") => Some(self.handle_search(req)),
             ("GET", "/thumb") => Some(self.handle_thumb(req)),
             ("GET", "/detect") => Some(self.handle_detect(req)),
@@ -242,7 +266,7 @@ impl App for FileBrowserApp {
                 let id = sub
                     .trim_start_matches("/trash/")
                     .trim_end_matches("/restore");
-                Some(self.handle_trash_restore(id))
+                Some(self.handle_trash_restore(id, req))
             }
             ("DELETE", sub) if sub.starts_with("/trash/") => {
                 if is_readonly {

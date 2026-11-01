@@ -90,6 +90,9 @@ struct DashboardState {
     active_tab: SideTab,
     had_conflicts: bool,
     last_tree_refresh: Instant,
+    trash_dests: HashMap<String, String>,
+    trash_error: Option<String>,
+    trash_info: Option<String>,
 }
 
 enum Screen {
@@ -136,6 +139,16 @@ pub enum Message {
     KeepLocalVersion(usize),
     KeepRemoteVersion(usize),
 
+    // Trash
+    RefreshTrash,
+    TrashDestInput { id: String, value: String },
+    RestoreTrash { id: String, dest: Option<PathBuf> },
+    PickRestoreDest(String),
+    RestoreDestPicked { id: String, dest: Option<PathBuf> },
+    PurgeTrash(String),
+    EmptyTrash,
+    PurgeExpiredTrash,
+
     // Window management
     CaptureWindowId(window::Id),
     HideWindow(window::Id),
@@ -162,6 +175,9 @@ impl FileSyncGui {
                     active_tab: SideTab::Stats,
                     had_conflicts: false,
                     last_tree_refresh: Instant::now(),
+                    trash_dests: HashMap::new(),
+                    trash_error: None,
+                    trash_info: None,
                 })
             }
             _ => Screen::Setup(SetupState::default()),
@@ -319,6 +335,9 @@ impl FileSyncGui {
                         active_tab: SideTab::Stats,
                         had_conflicts: false,
                         last_tree_refresh: Instant::now(),
+                        trash_dests: HashMap::new(),
+                        trash_error: None,
+                        trash_info: None,
                     });
                 }
                 Task::none()
@@ -336,10 +355,12 @@ impl FileSyncGui {
                 }
 
                 if let Screen::Dashboard(d) = &mut self.screen {
+                    d.manager.refresh_trash();
                     d.state
                         .write()
                         .end_sync_activity_if_quiet(std::time::Duration::from_millis(1500));
                     d.snapshot = d.state.read().clone();
+                    prune_trash_dests(d);
                     let now_has_conflicts = !d.snapshot.conflicts.is_empty();
                     if now_has_conflicts && !d.had_conflicts {
                         d.active_tab = SideTab::Conflicts;
@@ -425,6 +446,144 @@ impl FileSyncGui {
                         s.log_event(format!("Conflict #{id} resolved: kept remote version"));
                     }
                     d.snapshot = d.state.read().clone();
+                }
+                Task::none()
+            }
+
+            // Trash messages
+            Message::RefreshTrash => {
+                if let Screen::Dashboard(d) = &mut self.screen {
+                    d.manager.refresh_trash();
+                    d.snapshot = d.state.read().clone();
+                    prune_trash_dests(d);
+                    d.trash_info = Some("Trash list refreshed.".to_string());
+                }
+                Task::none()
+            }
+
+            Message::TrashDestInput { id, value } => {
+                if let Screen::Dashboard(d) = &mut self.screen {
+                    d.trash_dests.insert(id, value);
+                }
+                Task::none()
+            }
+
+            Message::RestoreTrash { id, dest } => {
+                if let Screen::Dashboard(d) = &mut self.screen {
+                    let dest_override = dest.or_else(|| dest_input_override(d, &id));
+                    do_restore(d, &id, dest_override);
+                }
+                Task::none()
+            }
+
+            Message::PickRestoreDest(id) => {
+                let is_dir = match &self.screen {
+                    Screen::Dashboard(d) => d
+                        .snapshot
+                        .trash
+                        .iter()
+                        .find(|t| t.id == id)
+                        .map(|t| t.is_dir)
+                        .unwrap_or(false),
+                    _ => false,
+                };
+                let dialog_title = "Choose where to restore".to_string();
+                Task::perform(
+                    async move {
+                        if is_dir {
+                            rfd::AsyncFileDialog::new()
+                                .set_title(&dialog_title)
+                                .pick_folder()
+                                .await
+                                .map(|h| h.path().to_path_buf())
+                        } else {
+                            rfd::AsyncFileDialog::new()
+                                .set_title(&dialog_title)
+                                .save_file()
+                                .await
+                                .map(|h| h.path().to_path_buf())
+                        }
+                    },
+                    move |picked| Message::RestoreDestPicked { id: id.clone(), dest: picked },
+                )
+            }
+
+            Message::RestoreDestPicked { id, dest } => {
+                if let Screen::Dashboard(d) = &mut self.screen {
+                    let picked = match dest {
+                        Some(p) => p,
+                        None => return Task::none(),
+                    };
+                    match absolute_to_sync_relative(&picked, &d.config.sync_root) {
+                        Some(rel) => {
+                            // Remember the choice in the editable field too.
+                            d.trash_dests
+                                .insert(id.clone(), rel.to_string_lossy().into_owned());
+                            do_restore(d, &id, Some(rel));
+                        }
+                        None => {
+                            d.trash_error = Some(
+                                "Please pick a place inside the sync folder.".to_string(),
+                            );
+                            d.trash_info = None;
+                        }
+                    }
+                }
+                Task::none()
+            }
+
+            Message::PurgeTrash(id) => {
+                if let Screen::Dashboard(d) = &mut self.screen {
+                    match d.manager.purge_trash_entry(&id) {
+                        Ok(()) => {
+                            d.snapshot = d.state.read().clone();
+                            prune_trash_dests(d);
+                            d.trash_error = None;
+                            d.trash_info = Some(
+                                "Permanently deleted. Related sync history was cleared."
+                                    .to_string(),
+                            );
+                        }
+                        Err(e) => {
+                            d.trash_error = Some(format!("Could not delete: {e}"));
+                            d.trash_info = None;
+                        }
+                    }
+                }
+                Task::none()
+            }
+
+            Message::EmptyTrash => {
+                if let Screen::Dashboard(d) = &mut self.screen {
+                    let count = d.manager.empty_trash();
+                    d.snapshot = d.state.read().clone();
+                    prune_trash_dests(d);
+                    d.trash_error = None;
+                    if count == 0 {
+                        d.trash_info = Some("Trash is already empty.".to_string());
+                    } else {
+                        d.trash_info = Some(format!(
+                            "Emptied trash ({count} item(s)). Related sync history was cleared."
+                        ));
+                    }
+                }
+                Task::none()
+            }
+
+            Message::PurgeExpiredTrash => {
+                if let Screen::Dashboard(d) = &mut self.screen {
+                    let count = d.manager.purge_expired_trash();
+                    d.snapshot = d.state.read().clone();
+                    prune_trash_dests(d);
+                    d.trash_error = None;
+                    if count == 0 {
+                        d.trash_info =
+                            Some("No expired items to remove.".to_string());
+                    } else {
+                        d.trash_info = Some(format!(
+                            "Removed {count} expired item(s). Related sync history was cleared."
+                        ));
+                    }
                 }
                 Task::none()
             }
@@ -828,7 +987,15 @@ fn view_dashboard(d: &DashboardState) -> Element<'_, Message> {
 /// File tree (left, 3 parts) + side panel with tabs (right, 2 parts).
 fn main_content(d: &DashboardState) -> Element<'_, Message> {
     let tree = components::file_tree::view(&d.file_tree);
-    let side = components::side_panel::view(&d.snapshot, &d.active_tab);
+    let trash_error = d.trash_error.as_deref();
+    let trash_info = d.trash_info.as_deref();
+    let side = components::side_panel::view(
+        &d.snapshot,
+        &d.active_tab,
+        &d.trash_dests,
+        trash_error,
+        trash_info,
+    );
 
     row![
         container(tree)
@@ -843,6 +1010,90 @@ fn main_content(d: &DashboardState) -> Element<'_, Message> {
     .spacing(0)
     .height(Length::Fill)
     .into()
+}
+
+/// Drop cached dest-field edits for trash entries that are no longer listed.
+fn prune_trash_dests(d: &mut DashboardState) {
+    let live: std::collections::HashSet<&str> =
+        d.snapshot.trash.iter().map(|t| t.id.as_str()).collect();
+    d.trash_dests.retain(|id, _| live.contains(id.as_str()));
+}
+
+/// Resolve the editable dest field into an engine override. Returns `None`
+/// when the field is empty or still equals the original path (restore in
+/// place); otherwise the trimmed relative path the user typed.
+fn dest_input_override(d: &DashboardState, id: &str) -> Option<PathBuf> {
+    let typed = d.trash_dests.get(id)?;
+    let trimmed = typed.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let original = d
+        .snapshot
+        .trash
+        .iter()
+        .find(|t| t.id == id)
+        .map(|t| t.original_path.as_str())?;
+    if trimmed == original {
+        None
+    } else {
+        Some(PathBuf::from(trimmed))
+    }
+}
+
+/// Run a restore through the manager and surface the result in the Trash
+/// tab. The overwrite guard (`already exists` / 409) never overwrites —
+/// it shows a plain message asking the user to pick a different place.
+fn do_restore(d: &mut DashboardState, id: &str, dest_override: Option<PathBuf>) {
+    let dest_ref = dest_override.as_deref();
+    match d.manager.restore_trash_entry(id, dest_ref) {
+        Ok(final_dest) => {
+            d.snapshot = d.state.read().clone();
+            prune_trash_dests(d);
+            d.trash_error = None;
+            d.trash_info = Some(format!(
+                "Restored to {}.",
+                final_dest.to_string_lossy()
+            ));
+        }
+        Err(e) => {
+            let lower = e.to_lowercase();
+            if lower.contains("already exists") || lower.contains("exists") {
+                d.trash_error = Some(format!(
+                    "That place already has a file or folder ({e}). Nothing was overwritten — pick a different place."
+                ));
+            } else if lower.contains("not found") || lower.contains("no trash entry") {
+                d.manager.refresh_trash();
+                d.snapshot = d.state.read().clone();
+                prune_trash_dests(d);
+                d.trash_error = Some(format!("That item is no longer in the trash ({e})."));
+            } else {
+                d.trash_error = Some(format!("Could not restore: {e}"));
+            }
+            d.trash_info = None;
+        }
+    }
+}
+
+/// Turn an absolute dialog pick into a sync-root-relative restore target.
+/// Returns `None` when the pick is outside the sync folder.
+fn absolute_to_sync_relative(picked: &std::path::Path, sync_root: &std::path::Path) -> Option<PathBuf> {
+    match picked.strip_prefix(sync_root) {
+        Ok(rel) if !rel.as_os_str().is_empty() => Some(rel.to_path_buf()),
+        _ => {
+            // A bare file name picked outside the sync folder can still be
+            // restored at the top level by name.
+            if picked.is_absolute() {
+                return None;
+            }
+            let rel = picked.to_path_buf();
+            if rel.as_os_str().is_empty() {
+                None
+            } else {
+                Some(rel)
+            }
+        }
+    }
 }
 
 fn toggle_expanded(nodes: &mut Vec<FileNode>, id: usize) {

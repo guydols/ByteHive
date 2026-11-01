@@ -17,7 +17,7 @@ pub use config::{AppConfig, FrameworkConfig};
 pub use error::CoreError;
 pub use http::{ApiServer, HttpRequest, HttpResponse};
 pub use registry::{AppInfo, AppRegistry, AppStatus};
-pub use trash::{TrashEntry, TrashManager};
+pub use trash::{TrashEntry, TrashManager, TrashRestoreError, clear_ledger_covering};
 pub use users::{
     ApiKey, ApiKeyInfo, AuthContext, AuthMethod, Group, Session, UserEntry, UserInfo, UserStore,
     GROUP_ADMIN, GROUP_USER,
