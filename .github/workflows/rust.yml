@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install system packages
-        run: sudo apt-get update && sudo apt-get install -y libglib2.0-dev libatk1.0-dev libpango1.0-dev libgdk-pixbuf2.0-dev libgtk-3-dev libxdo-dev
+        run: sudo apt-get update && sudo apt-get install -y libglib2.0-dev libatk1.0-dev libpango1.0-dev libgdk-pixbuf-2.0-0 libgtk-3-dev libxdo-dev
 
       - name: Build
         run: cargo build --verbose
@@ -37,7 +37,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install system packages
-        run: sudo apt-get update && sudo apt-get install -y libglib2.0-dev libatk1.0-dev libpango1.0-dev libgdk-pixbuf2.0-dev libgtk-3-dev libxdo-dev
+        run: sudo apt-get update && sudo apt-get install -y libglib2.0-dev libatk1.0-dev libpango1.0-dev libgdk-pixbuf-2.0-0 libgtk-3-dev libxdo-dev
 
       - name: Install cargo-tarpaulin
         uses: taiki-e/install-action@v2
