@@ -100,6 +100,18 @@ pub struct Conflict {
     pub kind: ConflictKind,
 }
 
+/// A deleted file or folder waiting in the trash. Mirrors the fields the
+/// Trash tab needs from `bytehive_core::TrashEntry` without pulling the
+/// core type into shared UI state.
+#[derive(Debug, Clone)]
+pub struct TrashItem {
+    pub id: String,
+    pub original_path: String,
+    pub size: u64,
+    pub deleted_at_ms: u64,
+    pub is_dir: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct FileNode {
     pub id: usize,
@@ -180,6 +192,7 @@ fn flatten_recursive(nodes: &[FileNode], depth: usize, out: &mut Vec<FlatNode>) 
 pub enum SideTab {
     Stats,
     Conflicts,
+    Trash,
 }
 
 #[derive(Debug, Clone)]
@@ -204,6 +217,8 @@ pub struct SyncSnapshot {
 
     pub conflicts: Vec<Conflict>,
 
+    pub trash: Vec<TrashItem>,
+
     pub last_connected: Option<Instant>,
     pub log: EventLog,
 }
@@ -222,6 +237,7 @@ impl Default for SyncSnapshot {
             transfer_total: 0,
             last_activity: None,
             conflicts: Vec::new(),
+            trash: Vec::new(),
             last_connected: None,
             log: EventLog::new(),
         }
