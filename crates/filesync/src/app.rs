@@ -506,8 +506,25 @@ impl App for FileSyncApp {
                 let id = sub
                     .trim_start_matches("/trash/")
                     .trim_end_matches("/restore");
-                match state.engine.restore_trash_entry(id) {
-                    Ok(()) => Some(HttpResponse::ok_json(json!({ "ok": true }))),
+                let dest: Option<PathBuf> = req
+                    .json()
+                    .ok()
+                    .and_then(|v: serde_json::Value| {
+                        v.get("dest")
+                            .and_then(|d| d.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(PathBuf::from)
+                    });
+                match state
+                    .engine
+                    .restore_trash_entry_with_dest(id, dest.as_deref())
+                {
+                    Ok(restored) => {
+                        Some(HttpResponse::ok_json(json!({ "ok": true, "path": restored })))
+                    }
+                    Err(e) if e.contains("already exists") => {
+                        Some(HttpResponse::conflict(e))
+                    }
                     Err(e) => Some(HttpResponse::bad_request(e)),
                 }
             }

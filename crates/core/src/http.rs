@@ -115,6 +115,15 @@ impl HttpResponse {
             body: serde_json::to_vec(&body).unwrap_or_default(),
         }
     }
+    pub fn conflict(msg: impl Into<String>) -> Self {
+        let body = json!({ "error": msg.into() });
+        Self {
+            status: 409,
+            content_type: "application/json".into(),
+            headers: HashMap::new(),
+            body: serde_json::to_vec(&body).unwrap_or_default(),
+        }
+    }
     pub fn internal_error(msg: impl Into<String>) -> Self {
         let body = json!({ "error": msg.into() });
         Self {
