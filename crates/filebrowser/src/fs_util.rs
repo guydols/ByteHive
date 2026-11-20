@@ -58,6 +58,8 @@ pub fn search_dir(base: &Path, cur: &Path, query: &str, max: usize, results: &mu
     if results.len() >= max {
         return;
     }
+    // Pre-reserve for the caller's `max` budget so recursive pushes don't reallocate.
+    results.reserve(max.saturating_sub(results.len()));
     let Ok(rd) = std::fs::read_dir(cur) else {
         return;
     };
@@ -152,7 +154,7 @@ pub fn zip_directory(abs: &Path, _rel: &str) -> HttpResponse {
         status: 200,
         content_type: "application/zip".into(),
         headers: {
-            let mut h = HashMap::new();
+            let mut h = HashMap::with_capacity(1);
             h.insert(
                 "content-disposition".into(),
                 format!("attachment; filename=\"{name}.zip\""),
@@ -255,7 +257,7 @@ pub fn zip_paths(root: &Path, rels: &[String]) -> Result<HttpResponse, String> {
         status: 200,
         content_type: "application/zip".into(),
         headers: {
-            let mut h = HashMap::new();
+            let mut h = HashMap::with_capacity(1);
             h.insert(
                 "content-disposition".into(),
                 "attachment; filename=\"multi-download.zip\"".to_string(),
@@ -278,7 +280,7 @@ pub fn mime_for_file(path: &str) -> &'static str {
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
-        .to_lowercase()
+        .to_ascii_lowercase()
         .as_str()
     {
         "pdf" => "application/pdf",

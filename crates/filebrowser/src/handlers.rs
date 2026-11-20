@@ -48,7 +48,7 @@ impl FileBrowserApp {
             return HttpResponse::bad_request(format!("not a directory: {rel}"));
         }
 
-        let mut entries: Vec<Value> = Vec::new();
+        let mut entries: Vec<Value> = Vec::with_capacity(32);
         match std::fs::read_dir(&abs) {
             Err(e) => return HttpResponse::internal_error(e.to_string()),
             Ok(rd) => {
@@ -130,7 +130,7 @@ impl FileBrowserApp {
                     status: 200,
                     content_type: ct.to_string(),
                     headers: {
-                        let mut h = HashMap::new();
+                        let mut h = HashMap::with_capacity(1);
                         h.insert(
                             "content-disposition".into(),
                             format!("attachment; filename=\"{}\"", name),
@@ -587,7 +587,7 @@ impl FileBrowserApp {
                         status: 200,
                         content_type: ct.to_string(),
                         headers: {
-                            let mut h = HashMap::new();
+                            let mut h = HashMap::with_capacity(1);
                             h.insert(
                                 "content-disposition".into(),
                                 format!("attachment; filename=\"{}\"", name),
@@ -633,7 +633,7 @@ impl FileBrowserApp {
                     status: 200,
                     content_type: ct.to_string(),
                     headers: {
-                        let mut h = HashMap::new();
+                        let mut h = HashMap::with_capacity(2);
                         h.insert(
                             "content-disposition".into(),
                             format!("inline; filename=\"{}\"", name),
@@ -826,6 +826,7 @@ impl FileBrowserApp {
         // {paths: [...], dest_dir: "folder"} to copy everything into one folder.
         let mut jobs: Vec<(String, String)> = Vec::new();
         if let Some(copies) = body.get("copies").and_then(|c| c.as_array()) {
+            jobs.reserve(copies.len());
             for c in copies {
                 let from = c.get("from").and_then(|v| v.as_str()).unwrap_or("");
                 let to = c.get("to").and_then(|v| v.as_str()).unwrap_or("");
@@ -874,6 +875,7 @@ impl FileBrowserApp {
                     return HttpResponse::internal_error(e.to_string());
                 }
             }
+            jobs.reserve(paths.len());
             for p in paths {
                 let base = p
                     .rsplit('/')
@@ -974,7 +976,7 @@ impl FileBrowserApp {
             return HttpResponse::bad_request("path must be a directory");
         }
 
-        let mut results: Vec<Value> = Vec::new();
+        let mut results: Vec<Value> = Vec::with_capacity(max_results);
         search_dir(&base, &base, &query, max_results, &mut results);
 
         HttpResponse::ok_json(json!({

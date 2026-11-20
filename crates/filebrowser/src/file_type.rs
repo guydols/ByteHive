@@ -6,7 +6,7 @@ pub fn is_text_file(path: &str) -> bool {
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
-            .to_lowercase()
+            .to_ascii_lowercase()
             .as_str(),
         "txt"
             | "md"
@@ -120,7 +120,7 @@ pub fn monaco_language(path: &str) -> &'static str {
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
-        .to_lowercase()
+        .to_ascii_lowercase()
         .as_str()
     {
         "rs" => "rust",
