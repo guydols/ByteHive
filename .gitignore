@@ -4,3 +4,5 @@ target/*
 tarpaulin-report.html
 TODO.md
 bench_output/
+rapx-logs/20261111-231356/
+run-rapx.sh
