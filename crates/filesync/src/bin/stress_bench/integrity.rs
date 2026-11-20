@@ -11,7 +11,8 @@ const STABLE_POLLS_REQUIRED: usize = 4;
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 fn hash_directory(root: &Path) -> HashMap<PathBuf, [u8; 32]> {
-    let mut map = HashMap::new();
+    // One entry per file; 1024 avoids early reallocs on small trees.
+    let mut map = HashMap::with_capacity(1024);
     let walker = walkdir::WalkDir::new(root)
         .into_iter()
         .filter_map(|e| e.ok());

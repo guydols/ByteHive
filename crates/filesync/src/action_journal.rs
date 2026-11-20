@@ -96,11 +96,14 @@ pub struct ActionJournal {
 }
 
 fn under(index: &BTreeMap<PathBuf, BTreeSet<u64>>, prefix: &Path) -> Vec<u64> {
-    index
+    let mut out = Vec::new();
+    for (_, seqs) in index
         .range(prefix.to_path_buf()..)
         .take_while(|(k, _)| k.starts_with(prefix))
-        .flat_map(|(_, seqs)| seqs.iter().copied())
-        .collect()
+    {
+        out.extend(seqs.iter().copied());
+    }
+    out
 }
 
 fn exact(index: &BTreeMap<PathBuf, BTreeSet<u64>>, path: &Path) -> Vec<u64> {

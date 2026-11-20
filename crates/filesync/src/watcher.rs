@@ -95,7 +95,7 @@ pub fn start_watcher(
         | WatchMask::MOVED_TO;
 
     let mut inotify = Inotify::init()?;
-    let mut wd_map: HashMap<WatchDescriptor, PathBuf> = HashMap::new();
+    let mut wd_map: HashMap<WatchDescriptor, PathBuf> = HashMap::with_capacity(64);
 
     for entry in WalkDir::new(&root).into_iter().filter_map(Result::ok) {
         if entry.file_type().is_dir() {
@@ -114,7 +114,8 @@ pub fn start_watcher(
         .name("inotify-watcher".into())
         .spawn(move || {
             let mut buffer = vec![0u8; 65536];
-            let mut pending_moves: HashMap<u32, (PathBuf, Instant)> = HashMap::new();
+            let mut pending_moves: HashMap<u32, (PathBuf, Instant)> =
+                HashMap::with_capacity(8);
             // Long enough to keep MOVED_FROM/MOVED_TO pairs together under
             // load so a slow move isn't split into Delete + Create.
             const ORPHAN_TIMEOUT: Duration = Duration::from_millis(2000);

@@ -15,7 +15,10 @@ pub struct Exclusions {
 
 impl Exclusions {
     pub fn compile(cfg: &ExclusionConfig) -> Self {
-        let mut compiled = Vec::new();
+        // 2 builtins + user patterns + user regexes: exact final size.
+        let mut compiled = Vec::with_capacity(
+            2 + cfg.exclude_patterns.len() + cfg.exclude_regex.len(),
+        );
 
         for pat in &[
             crate::protocol::BH_DIR,

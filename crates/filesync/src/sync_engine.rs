@@ -642,8 +642,8 @@ impl SyncEngine {
         if n == 0 {
             return 0;
         }
-        let mut alive: Vec<(PathBuf, u64)> = Vec::new();
-        let mut remote: HashMap<PathBuf, Tombstone> = HashMap::new();
+        let mut alive: Vec<(PathBuf, u64)> = Vec::with_capacity(n);
+        let mut remote: HashMap<PathBuf, Tombstone> = HashMap::with_capacity(n);
         for d in dtos {
             if d.alive {
                 alive.push((d.path, d.deleted_at_ms));
@@ -1066,7 +1066,8 @@ impl SyncEngine {
             LargeFileAssembly {
                 tmp_path,
                 total_chunks,
-                received: HashSet::new(),
+                // Chunk indices are 0..total_chunks; exact final size.
+                received: HashSet::with_capacity(total_chunks as usize),
                 expected_hash: metadata.hash,
                 dst,
                 file_size: metadata.size,
@@ -1473,10 +1474,12 @@ impl SyncEngine {
         deleted_at_ms: u64,
         deleter: &str,
     ) -> std::io::Result<usize> {
-        let mut removed = Vec::new();
+        let mut removed = Vec::with_capacity(paths.len() * 2);
         let mut count = 0usize;
         // Stage tombstone data in memory; persist once at the end.
-        let mut tombstones: Vec<(PathBuf, Option<String>, Option<u64>)> = Vec::new();
+        // One entry per input path at most.
+        let mut tombstones: Vec<(PathBuf, Option<String>, Option<u64>)> =
+            Vec::with_capacity(paths.len());
 
         for rel in paths {
             if !safe_relative(rel) {
@@ -1488,7 +1491,10 @@ impl SyncEngine {
             // so delete-suppression covers the whole subtree recursively.
             let subtree: Vec<PathBuf> = {
                 let m = self.manifest.read();
-                let mut v = vec![rel.clone()];
+                // Single-file deletes are the common case; 8 avoids the
+                // first reallocs without over-reserving huge manifests.
+                let mut v = Vec::with_capacity(8);
+                v.push(rel.clone());
                 for k in m.files.keys() {
                     if k != rel {
                         if let Ok(stripped) = k.strip_prefix(rel) {

@@ -224,7 +224,7 @@ impl PendingChanges {
 
     pub fn take_stable_changes(&mut self, engine: &SyncEngine) -> Vec<PathBuf> {
         let paths: Vec<PathBuf> = self.changes.drain().collect();
-        let mut stable = Vec::new();
+        let mut stable = Vec::with_capacity(paths.len());
         for path in paths {
             if engine.is_file_stable(&path) {
                 stable.push(path.clone());
@@ -264,6 +264,8 @@ impl PendingChanges {
             // that are still live in the manifest or rename-suppressed.
             let manifest = engine.get_manifest();
             let mut kept: Vec<PathBuf> = paths.drain(..original_count).collect();
+            // Extras are at most the appended ancestor paths.
+            kept.reserve(paths.len());
             for extra in paths {
                 if manifest.files.contains_key(&extra) {
                     continue;
@@ -293,7 +295,8 @@ impl PendingChanges {
 }
 
 pub fn expand_deleted_ancestors(root: &Path, paths: &mut Vec<PathBuf>) {
-    let mut extra = HashSet::new();
+    // Each path contributes at most its ancestor depth (typically < 8).
+    let mut extra = HashSet::with_capacity(paths.len() * 4);
     for p in paths.iter() {
         let mut cur: &Path = p.as_ref();
         while let Some(parent) = cur.parent() {

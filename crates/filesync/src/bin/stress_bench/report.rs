@@ -762,7 +762,10 @@ renderLogs();
         }
 
         // Build (timestamp, json-string) pairs then sort numerically by time
-        let mut entries: Vec<(f64, String)> = Vec::new();
+        // One entry per event plus all server/client log lines.
+        let mut entries: Vec<(f64, String)> = Vec::with_capacity(
+            self.events.len() + self.server_logs.len() + self.client_logs.len(),
+        );
         for ev in &self.events {
             let (level, msg) = match &ev.kind {
                 EventKind::PhaseStart(n) => ("INFO", format!("Phase started: {n}")),
@@ -895,7 +898,8 @@ renderLogs();
 
         // Build per-thread series: for each thread name, for each time point,
         // look up the cpu_percent (0 if the thread wasn't present in that sample).
-        let mut series_parts: Vec<String> = Vec::new();
+        // One series string per thread name.
+        let mut series_parts: Vec<String> = Vec::with_capacity(names.len());
         for name in &names {
             let values: Vec<String> = samples
                 .iter()
@@ -1056,7 +1060,8 @@ renderLogs();
     }
 
     fn phases_to_json(&self) -> String {
-        let mut phases = Vec::new();
+        // At most one phase object per PhaseEnd event.
+        let mut phases = Vec::with_capacity(self.events.len());
         let mut open: Option<(String, f64)> = None;
 
         for event in &self.events {
@@ -1084,7 +1089,8 @@ renderLogs();
 
     /// Serialize events into a JSON array so the tooltip JS can look them up.
     fn events_to_json(&self) -> String {
-        let mut items = Vec::new();
+        // One JSON item per event.
+        let mut items = Vec::with_capacity(self.events.len());
         for event in &self.events {
             let text = match &event.kind {
                 EventKind::PhaseStart(name) => format!("Phase started: {name}"),

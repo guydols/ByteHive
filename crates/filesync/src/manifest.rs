@@ -280,8 +280,10 @@ pub fn build_manifest(
     drop(work_rx);
     drop(res_tx);
 
-    let mut files_map: HashMap<PathBuf, FileMetadata> = HashMap::new();
     let mut updated = cache.cloned().unwrap_or_default();
+    // Prior-scan entry count is the best estimate for this scan's size.
+    let mut files_map: HashMap<PathBuf, FileMetadata> =
+        HashMap::with_capacity(updated.len().max(1024));
     let mut dirs = 0usize;
     for outcome in res_rx {
         if outcome.meta.is_dir {
@@ -452,8 +454,9 @@ pub fn filter_resurrected(
 }
 
 pub fn diff_manifests(old: &Manifest, new: &Manifest) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    let mut changed = Vec::new();
-    let mut deleted = Vec::new();
+    // Upper bounds: every new entry could be changed, every old one deleted.
+    let mut changed = Vec::with_capacity(new.files.len());
+    let mut deleted = Vec::with_capacity(old.files.len());
 
     for (path, new_meta) in &new.files {
         match old.files.get(path) {
