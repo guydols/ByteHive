@@ -160,10 +160,11 @@ impl TrashManager {
             .unwrap_or_default()
             .as_millis() as u64;
 
+        let trash_rel_path = PathBuf::from(&id).join(rel);
         let entry = TrashEntry {
-            id: id.clone(),
+            id,
             original_path: rel.to_path_buf(),
-            trash_rel_path: PathBuf::from(&id).join(rel),
+            trash_rel_path,
             deleted_at_ms: unix_ms,
             size,
             is_dir,

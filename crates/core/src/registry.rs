@@ -220,7 +220,7 @@ impl AppRegistry {
 
         let ctx = AppContext {
             bus: Arc::clone(&self.bus),
-            config: config.clone(),
+            config,
             shutdown: stop_rx,
             auth_service: Arc::clone(&self.user_store),
             config_path: self.config_path.clone(),

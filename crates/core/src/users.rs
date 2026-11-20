@@ -183,6 +183,8 @@ impl UserStore {
         raw_config: String,
     ) -> Arc<Self> {
         let mut groups = groups;
+        // At most the two built-in groups (admin, user) are appended below.
+        groups.reserve(2);
         for (name, desc) in [
             (
                 GROUP_ADMIN,
