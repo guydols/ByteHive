@@ -94,7 +94,7 @@ impl BenchServer {
                 .spawn(move || {
                     use std::io::BufRead;
                     let reader = std::io::BufReader::new(stderr_handle);
-                    let mut lines: Vec<super::types::LogLine> = Vec::new();
+                    let mut lines: Vec<super::types::LogLine> = Vec::with_capacity(1024);
                     for raw in reader.lines() {
                         match raw {
                             Ok(line) => {
@@ -136,7 +136,7 @@ impl BenchServer {
                 .spawn(move || {
                     use std::io::BufRead;
                     let reader = std::io::BufReader::new(stdout_handle);
-                    let mut lines: Vec<super::types::LogLine> = Vec::new();
+                    let mut lines: Vec<super::types::LogLine> = Vec::with_capacity(1024);
                     for raw in reader.lines() {
                         match raw {
                             Ok(line) => {
@@ -327,7 +327,7 @@ impl BenchClient {
                 .spawn(move || {
                     use std::io::BufRead;
                     let reader = std::io::BufReader::new(stderr_handle);
-                    let mut lines: Vec<super::types::LogLine> = Vec::new();
+                    let mut lines: Vec<super::types::LogLine> = Vec::with_capacity(1024);
                     for raw in reader.lines() {
                         match raw {
                             Ok(line) => {
@@ -369,7 +369,7 @@ impl BenchClient {
                 .spawn(move || {
                     use std::io::BufRead;
                     let reader = std::io::BufReader::new(stdout_handle);
-                    let mut lines: Vec<super::types::LogLine> = Vec::new();
+                    let mut lines: Vec<super::types::LogLine> = Vec::with_capacity(1024);
                     for raw in reader.lines() {
                         match raw {
                             Ok(line) => {

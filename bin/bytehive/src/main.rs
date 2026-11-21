@@ -85,7 +85,7 @@ fn main() {
         Ok(_) => log::debug!("bus logger started"),
         Err(e) => log::warn!("bus logger not started: {e}"),
     }
-    if let Err(e) = logging::spawn_cleanup(log_root.clone(), &cfg.logging) {
+    if let Err(e) = logging::spawn_cleanup(log_root, &cfg.logging) {
         log::warn!("log cleanup not started: {e}");
     }
 

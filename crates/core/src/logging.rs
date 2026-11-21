@@ -575,7 +575,9 @@ fn remove_entry(path: &Path) -> bool {
 /// Active files (`server.log`, `bus.jsonl`, anything not rotated) are never
 /// deleted. `now` is injected for testing.
 pub fn cleanup(root: &Path, policy: &RetentionPolicy, now: SystemTime) -> CleanupReport {
-    let mut entries = Vec::new();
+    // Typical layout: server/ + bus/ subdirs with 2 active files plus up to
+    // 2 * max_files rotated copies (default max_files = 5, so ~12 entries).
+    let mut entries = Vec::with_capacity(16);
     collect(root, 0, now, &mut entries);
     let mut report = CleanupReport::default();
 
@@ -604,12 +606,12 @@ pub fn cleanup(root: &Path, policy: &RetentionPolicy, now: SystemTime) -> Cleanu
                     .cmp(&b.mtime)
                     .then_with(|| b.rotated.cmp(&a.rotated))
             });
-            let mut doomed: Vec<(PathBuf, u64)> = Vec::new();
+            let mut doomed: Vec<(&Path, u64)> = Vec::with_capacity(candidates.len());
             for c in candidates {
                 if total <= cap {
                     break;
                 }
-                doomed.push((c.path.clone(), c.size));
+                doomed.push((&c.path, c.size));
                 total = total.saturating_sub(c.size);
             }
             for (path, size) in doomed {

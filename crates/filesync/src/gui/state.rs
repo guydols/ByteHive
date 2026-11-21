@@ -165,7 +165,8 @@ pub struct FlatNode {
 
 /// Recursively flattens the tree into render rows, respecting expansion state.
 pub fn flatten_tree(nodes: &[FileNode]) -> Vec<FlatNode> {
-    let mut out = Vec::new();
+    // At least one row per top-level node; recursion appends children.
+    let mut out = Vec::with_capacity(nodes.len());
     flatten_recursive(nodes, 0, &mut out);
     out
 }

@@ -1483,7 +1483,8 @@ fn compute_deletes_to_push(
     remote: &Manifest,
     ledger: &DeletionLedger,
 ) -> Vec<(PathBuf, u64, String)> {
-    let mut out: Vec<(PathBuf, u64, String)> = Vec::new();
+    // At most one entry per tombstone.
+    let mut out: Vec<(PathBuf, u64, String)> = Vec::with_capacity(ledger.len());
     for (path, tomb) in ledger.iter() {
         if local.files.contains_key(path) {
             continue;

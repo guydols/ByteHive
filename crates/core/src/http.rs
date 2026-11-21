@@ -177,13 +177,20 @@ impl ApiServer {
     }
 
     pub fn start(self) -> Result<std::thread::JoinHandle<()>, std::io::Error> {
-        let addr = self.addr.clone();
+        let Self {
+            addr,
+            registry,
+            bus,
+            auth,
+            users,
+            web_root,
+        } = self;
         let state = ApiState {
-            registry: self.registry,
-            bus: self.bus,
-            auth: self.auth,
-            users: self.users,
-            web_root: self.web_root,
+            registry,
+            bus,
+            auth,
+            users,
+            web_root,
         };
         std::thread::Builder::new()
             .name("http-api".into())
@@ -1080,7 +1087,7 @@ pub fn urlencoded(s: &str) -> String {
 }
 
 pub fn mime_for_path(path: &str) -> &'static str {
-    let path_lower = path.to_lowercase();
+    let path_lower = path.to_ascii_lowercase();
 
     if path_lower.ends_with(".html") || path_lower.ends_with(".htm") {
         "text/html; charset=utf-8"

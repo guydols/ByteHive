@@ -169,7 +169,8 @@ fn list_tids(pid: u32) -> Vec<u32> {
         Ok(entries) => entries,
         Err(_) => return Vec::new(),
     };
-    let mut tids = Vec::new();
+    // Thread count is small (tens); pre-size to avoid reallocs.
+    let mut tids = Vec::with_capacity(32);
     for entry in entries {
         if let Ok(entry) = entry {
             if let Some(name) = entry.file_name().to_str() {

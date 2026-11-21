@@ -1330,7 +1330,8 @@ pub fn drain_action_journal(
 
     while i < pending.len() {
         let chunk_start = i;
-        let mut wires: Vec<Wire> = Vec::new();
+        // At most DRAIN_CHUNK_MAX_ENTRIES wires per chunk.
+        let mut wires: Vec<Wire> = Vec::with_capacity(DRAIN_CHUNK_MAX_ENTRIES);
         let mut count = 0usize;
         let mut bytes = 0u64;
         let mut upto: Option<u64> = None;
@@ -1362,8 +1363,10 @@ pub fn drain_action_journal(
         }
 
         if let Some(upto) = upto {
-            let mut run: Vec<PathBuf> = Vec::new();
-            let mut stamps: HashMap<PathBuf, u64> = HashMap::new();
+            // `wires` is moved below; its length bounds both collections.
+            let wire_count = wires.len();
+            let mut run: Vec<PathBuf> = Vec::with_capacity(wire_count);
+            let mut stamps: HashMap<PathBuf, u64> = HashMap::with_capacity(wire_count);
             for wire in wires {
                 match wire {
                     Wire::Upsert {
@@ -1593,7 +1596,8 @@ fn compute_deletes_to_push(
     remote: &Manifest,
     ledger: &DeletionLedger,
 ) -> Vec<(PathBuf, u64, String)> {
-    let mut out: Vec<(PathBuf, u64, String)> = Vec::new();
+    // At most one entry per tombstone.
+    let mut out: Vec<(PathBuf, u64, String)> = Vec::with_capacity(ledger.len());
     for (path, tomb) in ledger.iter() {
         if local.files.contains_key(path) {
             continue;
